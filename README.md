@@ -1,5 +1,5 @@
 # Poly-RAG
-Poly-RAG is Yet another LLM project that is ALL YOU NEED.
+Poly-RAG is Yet another IS-ALL-YOU-NEED-LLM project that you don't need... yet.
 
 
 Pienza 1.0's origin and framing
