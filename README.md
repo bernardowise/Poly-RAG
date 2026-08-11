@@ -96,3 +96,9 @@ Reusing prior work — skills, commands, and hooks already developed during Pien
 Exploring frontier frameworks beyond just Claude Code — including LangChain and LlamaIndex — to compare approaches to agent orchestration, retrieval, and tool use.
 
 This reflects a broader maturity point: having gone through Pienza already, the goal now isn't just to build another data science project, but to design the foundations — the agentic architecture itself — well enough that the project can keep growing and scaling, rather than plateauing the way Pienza did.
+
+
+
+Why "Polymarket Agents" Doesn't Replace Poly-RAG???
+ 
+Existing frameworks like Polymarket Agents focus on live execution and real-time execution loops (programmatic trading, querying current order books, immediate automated workflows). They are built to act now.Your project is built to answer: "What happened, why did it happen, and how did the market react over time?"FeatureExisting Polymarket FrameworksYour Poly-RAG ProjectPrimary GoalAutomated programmatic trading & live state querying.Historical context reconstruction & longitudinal reasoning.Data PhilosophyReal-time stateless API polling.Proprietary, stateful time-series data storage.The "Moat"Execution speed and API connectivity.Self-collected historical correlation (Odds + News + Sentiment).Core LLM ActionTool-calling for immediate market actions.RAG over an unstructured/structured temporal database.A general-purpose LLM or a standard trading agent cannot look back and explain how a sudden Reddit sentiment spike on a Tuesday correlated with an odds drop on Thursday because that historical intersection isn't preserved in a single, open API. 
