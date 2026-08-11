@@ -1,0 +1,29 @@
+{
+  "hooks": {
+    "FileChanged": [
+      {
+        "matchers": [
+          ".claude/claude_docs/memory_mirror/**",
+          "/home/codespace/.claude/projects/-workspaces-Poly-RAG/memory/**"
+        ],
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/scripts/sync_memory.sh"
+          }
+        ]
+      },
+      {
+        "matchers": [
+          ".claude/settings.json"
+        ],
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/scripts/update_hooks_docs.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

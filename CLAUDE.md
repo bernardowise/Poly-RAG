@@ -45,3 +45,17 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 - Prefer Lambda + event-driven patterns over always-on services
 - Follow Chip Huyen's *AI Engineering* architecture patterns as primary reference
 - Explore LangChain and LlamaIndex alongside Claude Code for agent orchestration comparisons
+
+## Git & Commit Rules
+
+**Never commit on your behalf.** When you request a commit, I will provide the commit message only, following conventional commits format (feat, docs, fix, chore, etc.). You decide when and whether to run the actual commit.
+
+Example: if you say "gimme msg", I respond with:
+```
+docs: Add CLAUDE.md with project context
+
+Covers architecture philosophy, AWS stack rationale, budget constraint,
+and agentic-first design principles.
+```
+
+You then run `git add` and `git commit -m "..."` yourself.
