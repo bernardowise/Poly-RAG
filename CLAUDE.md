@@ -21,7 +21,7 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | Cloud | AWS | Deliberately unfamiliar — building proficiency in the production AI ecosystem |
 | Compute | Lambda, Kinesis | Pay-per-use, fits $5/month hard budget cap |
 | Storage | S3, DynamoDB | No idle cost |
-| LLM | Bedrock | On-demand only (not on every data pull) |
+| LLM | Bedrock, Claude Sonnet 5 (`anthropic.claude-sonnet-5`) | Used in both ingestion (trial, see Development Conventions) and the Day 5 synthesis agent for now, to keep cost/latency comparisons consistent across the pipeline. Auth via IAM (boto3 bedrock-runtime client using the same credentials as S3/DynamoDB) — no separate Anthropic API key needed. Model choice may become user-selectable (multimodal options) in a later iteration — not part of the current MVP. |
 | Data sources | Polymarket Gamma API, news RSS (10 feeds), Bluesky AT Protocol | All free |
 
 **Budget constraint: spend as if it were real money, not free credits.** The AWS account carries ~$120 in promotional credits ($100 signup + $20 for completing a Budgets activity), but this is a discipline exercise, not a spending allowance — design and operate as if every dollar were out of pocket. Avoid always-on compute (EC2, MSK/Kafka) and frequent Bedrock calls. Batch writes where possible (S3 free tier caps at 2,000 PUT requests/month — request count matters more than payload size).
@@ -39,16 +39,17 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 
 ## Out of Scope
 
-- Real-time charting or visualization dashboards
+- Real-time charting or visualization dashboards **as a user-facing product feature** — Poly-RAG is an AI/RAG assistant, not a Looker/Tableau-style analytics tool for end users. This does NOT rule out internal engineering observability (e.g. an architecture-decisions metrics table for cost/latency/benefit tracking, queried via CLI/notebook, not built as a polished dashboard) — that's tooling to evaluate our own decisions, not a product feature.
 - Training predictive models (that was Pienza 1.0)
 - GCP (even though it's familiar — the point is to learn AWS)
 
 ## Development Conventions
 
-- LLM calls are on-demand only (triggered by user queries, not data ingestion jobs)
+- LLM calls in ingestion are being trialed (2026-08-13), not dogmatically banned. Original rule was "on-demand only, not on every data pull" under the $5 hard-cap regime — now operating with a $120 promotional credit buffer and "spend deliberately, not miserly" philosophy. Currently trialing Bedrock summarization/entity-extraction at ingestion time for all 3 sources (News, Bluesky, Polymarket) for 3-4 days, measuring actual cost/latency/benefit via the architecture-decisions metrics table before deciding whether to keep, scope down, or revert to on-demand-only. See architecture_decisions.md (once created) for the measured tradeoff.
 - Prefer Lambda + event-driven patterns over always-on services
-- Follow Chip Huyen's *AI Engineering* architecture patterns as primary reference
+- Follow Chip Huyen's *AI Engineering* architecture patterns as primary reference (compute budget / FLOPs tradeoffs to be tackled later, per the book's framing)
 - Explore LangChain and LlamaIndex alongside Claude Code for agent orchestration comparisons
+- Architectural decisions with real cost/latency/benefit tradeoffs (e.g. LLM-in-ingestion vs on-demand-only) should be measured, not guessed — instrument with real Bedrock calls and CloudWatch timing, not estimates, and record the outcome as an ADR (Architecture Decision Record).
 
 ## Git & Commit Rules
 
