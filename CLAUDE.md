@@ -48,14 +48,12 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 
 ## Git & Commit Rules
 
-**Never commit on your behalf.** When you request a commit, I will provide the commit message only, following conventional commits format (feat, docs, fix, chore, etc.). You decide when and whether to run the actual commit.
+**Never commit on your behalf.** When you request a commit, I will provide the commit message only. You decide when and whether to run the actual commit.
 
-Example: if you say "gimme msg", I respond with:
-```
-docs: Add CLAUDE.md with project context
-
-Covers architecture philosophy, AWS stack rationale, budget constraint,
-and agentic-first design principles.
-```
+Commit message format is canon, defined in `.claude/commands/commit-msg.md` (invoke with `/commit-msg`):
+- Format: `type(scope): short summary`, blank line, bullets with `-`
+- ZERO quotes of any kind (no single, double, typographic, or backticks), no emoji, plain ASCII only
+- Hard limit of 500 characters total (subject + body)
+- NEVER run `git commit` — only deliver the message text and stop
 
 You then run `git add` and `git commit -m "..."` yourself.
