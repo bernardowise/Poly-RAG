@@ -4,6 +4,43 @@ Track known limitations, architectural compromises, and planned refactors that m
 
 ---
 
+## Reddit Dropped as Data Source — Replaced by Bluesky
+
+**Issue (resolved 2026-08-13):** Reddit's OAuth2 app registration form failed silently
+(reset after reCAPTCHA + submit, no error). Root cause confirmed by reading Reddit's
+"Responsible Builder Policy" directly: it explicitly states data obtained via their API
+"must not" be used for "commercial and non-commercial mining, scraping, or using data for
+purposes like ads targeting or **to train machine learning or AI models**" — this is a
+deliberate policy restriction, not a bug or account issue. The classic `/prefs/apps`
+registration path also appears to be getting deprecated in favor of Devvit (Reddit's
+in-platform app framework, not suited for external data extraction).
+
+**Decision:** Reddit is dropped entirely as a data source rather than pursued via formal
+written approval (too slow for the sprint timeline, and the use case — feeding a RAG
+pipeline — squarely falls under what the policy prohibits). Also evaluated and rejected:
+
+- **X (Twitter):** no viable free read tier for new developers (pay-per-use only, ~$0.005/read,
+  budget-incompatible at meaningful volume) AND explicit contractual ban on RAG/model-training
+  use in the Developer Agreement — disqualified on both cost and policy grounds.
+- **Truth Social:** no public developer API exists at any price for individuals (their 2026
+  "Truth API" targets institutional financial clients only); ToS broadly prohibits any
+  automated scraping. No legitimate access path.
+
+**Replacement: Bluesky (AT Protocol).** Uses `app.bsky.feed.searchPosts` against the public
+`public.api.bsky.app` endpoint — REST/JSON, no auth required, keyword search built in
+(`q=<term>` param), rate limit 3000 req/5min (generous for a 12h cadence). No explicit
+ToS restriction on third-party AI/RAG use (contrast with X). Architecturally compatible
+with the serverless Lambda pattern — critically, uses the REST search endpoint, NOT the
+firehose/Jetstream (which requires a persistent WebSocket connection and would be
+incompatible with short, scheduled Lambda invocations under the budget cap).
+
+**Lesson for future source evaluation:** always check a platform's ToS/developer policy
+for AI/ML-training restrictions before investing implementation time — Reddit and X both
+have explicit bans that would have blocked this project regardless of technical feasibility
+or payment. This is now a standing check for any future data source candidate.
+
+---
+
 ## Budget Constraint → Always-On Compute Avoidance
 
 **Issue:** $5/month hard cap forces event-driven architecture (Lambda, Kinesis) over conventional approaches.
