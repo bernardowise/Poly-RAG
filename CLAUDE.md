@@ -24,7 +24,9 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | LLM | Bedrock | On-demand only (not on every data pull) |
 | Data sources | Polymarket Gamma API, news RSS/free tier, Reddit API | All free |
 
-**Budget constraint: ~$5/month hard cap.** Avoid always-on compute (EC2, MSK/Kafka) and frequent Bedrock calls.
+**Budget constraint: spend as if it were real money, not free credits.** The AWS account carries ~$120 in promotional credits ($100 signup + $20 for completing a Budgets activity), but this is a discipline exercise, not a spending allowance — design and operate as if every dollar were out of pocket. Avoid always-on compute (EC2, MSK/Kafka) and frequent Bedrock calls. Batch writes where possible (S3 free tier caps at 2,000 PUT requests/month — request count matters more than payload size).
+
+**Guardrail:** AWS Budgets is configured with alerts at $1 (20%) and $5 (100%) against a $5/month budget. A Budget Action should additionally attach a Deny IAM policy at a higher threshold (~$10) to halt active spend (Bedrock InvokeModel, Lambda Invoke, S3/DynamoDB writes) automatically — never rely on manual monitoring alone to prevent runaway cost.
 
 ## Data Collection
 
