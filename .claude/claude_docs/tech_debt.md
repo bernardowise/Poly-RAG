@@ -26,18 +26,30 @@ pipeline — squarely falls under what the policy prohibits). Also evaluated and
   "Truth API" targets institutional financial clients only); ToS broadly prohibits any
   automated scraping. No legitimate access path.
 
-**Replacement: Bluesky (AT Protocol).** Uses `app.bsky.feed.searchPosts` against the public
-`public.api.bsky.app` endpoint — REST/JSON, no auth required, keyword search built in
-(`q=<term>` param), rate limit 3000 req/5min (generous for a 12h cadence). No explicit
-ToS restriction on third-party AI/RAG use (contrast with X). Architecturally compatible
-with the serverless Lambda pattern — critically, uses the REST search endpoint, NOT the
-firehose/Jetstream (which requires a persistent WebSocket connection and would be
-incompatible with short, scheduled Lambda invocations under the budget cap).
+**Replacement: Bluesky (AT Protocol).** Uses `app.bsky.feed.searchPosts` — REST/JSON,
+keyword search built in (`q=<term>` param). No explicit ToS restriction on third-party
+AI/RAG use (contrast with X). Architecturally compatible with the serverless Lambda
+pattern — critically, uses the REST search endpoint, NOT the firehose/Jetstream (which
+requires a persistent WebSocket connection and would be incompatible with short,
+scheduled Lambda invocations under the budget cap).
+
+**Correction (2026-08-14):** initial research said `searchPosts` was public/no-auth via
+`public.api.bsky.app`. Confirmed false by direct reproduction — that endpoint returns
+403 on `searchPosts` specifically (other read endpoints like `getProfile` remain open
+there), even with a valid Bearer token. The actual working setup: authenticate via
+`com.atproto.server.createSession` against `bsky.social` (the PDS) using an app
+password (bsky.app -> Settings -> App Passwords, not the account password), then call
+`searchPosts` against `bsky.social` as well — not `public.api.bsky.app`. Lambda
+re-authenticates once per invocation rather than persisting/refreshing the short-lived
+JWT, which is simpler and correct at a 12h cadence. Credentials stored as Lambda
+environment variables (BLUESKY_HANDLE, BLUESKY_APP_PASSWORD), never in code or git.
 
 **Lesson for future source evaluation:** always check a platform's ToS/developer policy
 for AI/ML-training restrictions before investing implementation time — Reddit and X both
 have explicit bans that would have blocked this project regardless of technical feasibility
-or payment. This is now a standing check for any future data source candidate.
+or payment. This is now a standing check for any future data source candidate. Also:
+verify auth requirements empirically (curl/direct test) rather than trusting docs/research
+alone — platforms tighten previously-open endpoints without much notice.
 
 ---
 
