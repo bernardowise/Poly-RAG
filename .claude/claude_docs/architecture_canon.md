@@ -15,6 +15,12 @@ Tres Lambdas independientes, no un orquestador unico -- una falla en una fuente 
 tumba las otras dos, y los reintentos no desperdician PUT requests de las fuentes
 que si funcionaron.
 
+**Metadata de linaje (agregado 2026-08-14):** cada JSON escrito a S3 lleva un bloque
+`metadata` con `schema_version`, `lambda_name`, `lambda_request_id` (para rastrear el
+archivo de vuelta a su ejecucion exacta en CloudWatch Logs), `llm_used` + `llm_model_id`,
+`latency_ms`, y `estimated_cost_usd` -- permite auditar linaje/costo de un archivo
+individual sin tener que cruzar con la tabla DynamoDB de metricas.
+
 ### 1. Polymarket (`poly-rag-ingest-polymarket`)
 - **API:** Gamma API (`gamma-api.polymarket.com`), REST/JSON, sin auth
 - **Filtro:** `active=true`, top 100 ordenado por volumen
@@ -188,6 +194,30 @@ independientes, no una sola regla compartida -- consistente con el principio de
 3 Lambdas aisladas). Cada regla tiene su propio `lambda:InvokeFunction` permission
 scoped por `SourceArn`, y su propio target -- pausar/ajustar una fuente no afecta
 a las otras dos.
+
+---
+
+## Infrastructure as Code (Terraform)
+
+**Estado:** toda la infraestructura de arriba (S3, DynamoDB, IAM, las 3 Lambdas,
+EventBridge) esta importada a Terraform (`terraform/`) desde 2026-08-14 -- `terraform
+plan` confirma "No changes, infrastructure matches configuration" contra el estado
+real de AWS. Nada se destruyo/recreo durante el import; se adopto lo que ya existia.
+
+- **Provider:** `hashicorp/aws` ~> 5.0, region us-east-1
+- **Estructura:** `providers.tf`, `s3.tf`, `dynamodb.tf`, `iam_ingest_lambda.tf`,
+  `lambdas.tf`, `eventbridge.tf` -- un archivo por dominio de recurso
+- **State file:** `terraform.tfstate` gitignored (contiene ARNs/IDs de cuenta) --
+  vive solo local, no versionado. Nota tech-debt: sin backend remoto (S3+DynamoDB
+  lock) todavia, aceptable para un solo desarrollador, revisar si esto se vuelve
+  colaborativo
+- **Secrets:** las credenciales de Bluesky (`BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD`)
+  NO estan en el codigo Terraform ni en el state -- se gestionan manualmente via CLI,
+  con `lifecycle { ignore_changes }` en el recurso Lambda para que Terraform no
+  intente sobreescribirlas a vacio en cada apply
+- **De aqui en adelante:** cambios de infraestructura (nueva Lambda, ajustar cron,
+  nuevos permisos IAM) se hacen editando `.tf` + `terraform apply`, no mas comandos
+  sueltos de `aws` CLI para crear/modificar recursos
 
 ---
 

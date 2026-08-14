@@ -176,12 +176,22 @@ def lambda_handler(event, context):
         llm_latency_ms = llm_enrichment["latency_ms"]
 
     now = datetime.now(timezone.utc)
+    total_latency_ms = fetch_latency_ms + llm_latency_ms
     payload = {
         "source": "polymarket",
         "ingested_at": now.isoformat(),
         "market_count": len(tagged_markets),
         "markets": tagged_markets,
         "llm_summary": llm_enrichment["summary"] if llm_enrichment else None,
+        "metadata": {
+            "schema_version": "v1",
+            "lambda_name": context.function_name,
+            "lambda_request_id": context.aws_request_id,
+            "llm_used": USE_LLM_ENRICHMENT,
+            "llm_model_id": BEDROCK_MODEL_ID if USE_LLM_ENRICHMENT else None,
+            "latency_ms": total_latency_ms,
+            "estimated_cost_usd": estimate_cost_usd(tokens_in, tokens_out),
+        },
     }
 
     s3_key = f"polymarket/{now.strftime('%Y-%m-%d')}/{now.strftime('%H')}.json"
@@ -197,7 +207,7 @@ def lambda_handler(event, context):
         llm_used=USE_LLM_ENRICHMENT,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
-        latency_ms=fetch_latency_ms + llm_latency_ms,
+        latency_ms=total_latency_ms,
         items_processed=len(tagged_markets),
     )
 
