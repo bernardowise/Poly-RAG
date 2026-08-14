@@ -21,7 +21,7 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | Cloud | AWS | Deliberately unfamiliar — building proficiency in the production AI ecosystem |
 | Compute | Lambda, Kinesis | Pay-per-use, fits $5/month hard budget cap |
 | Storage | S3, DynamoDB | No idle cost |
-| LLM | Bedrock, Claude Sonnet 5 (`anthropic.claude-sonnet-5`) | Used in both ingestion (trial, see Development Conventions) and the Day 5 synthesis agent for now, to keep cost/latency comparisons consistent across the pipeline. Auth via IAM (boto3 bedrock-runtime client using the same credentials as S3/DynamoDB) — no separate Anthropic API key needed. Model choice may become user-selectable (multimodal options) in a later iteration — not part of the current MVP. |
+| LLM | Bedrock, Claude Sonnet 4.5 (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`, inference profile) | Used in both ingestion (trial, see Development Conventions) and the Day 5 synthesis agent for now, to keep cost/latency comparisons consistent across the pipeline. Auth via IAM (boto3 bedrock-runtime client using the same credentials as S3/DynamoDB) — no separate Anthropic API key needed. Sonnet 5 not yet available without AWS Sales contact; Sonnet 4.5 requires the `us.` inference-profile prefix, not the bare model ID. Model choice may become user-selectable (multimodal options) in a later iteration — not part of the current MVP. |
 | Data sources | Polymarket Gamma API, news RSS (10 feeds), Bluesky AT Protocol | All free |
 
 **Budget constraint: spend as if it were real money, not free credits.** The AWS account carries ~$120 in promotional credits ($100 signup + $20 for completing a Budgets activity), but this is a discipline exercise, not a spending allowance — design and operate as if every dollar were out of pocket. Avoid always-on compute (EC2, MSK/Kafka) and frequent Bedrock calls. Batch writes where possible (S3 free tier caps at 2,000 PUT requests/month — request count matters more than payload size).
@@ -35,7 +35,7 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 - Bluesky (AT Protocol): sentiment analysis, topic extraction, entity recognition. Uses `app.bsky.feed.searchPosts` (public REST/JSON, no auth) — not the firehose/Jetstream, which requires a persistent connection incompatible with the serverless/budget model.
 - Reddit was evaluated and dropped (see tech_debt.md) — Reddit's Responsible Builder Policy explicitly prohibits using API data to train/feed AI or ML models, and app registration was blocked accordingly.
 - Cadence: every 12 hours across all 3 sources, 3 independent Lambdas (not one orchestrator) so a failure in one source doesn't block the others or waste PUT requests on retries. Reassess cadence after 3-7 days of observed cost.
-- Markets/articles are curated into 3 verticals (Macro/Central Banks, Geopolitics/Elections, Regulatory/Tech) via keyword filtering at ingestion — see infra_design.md for the full taxonomy. Pop-culture/entertainment markets are out of scope: poor RAG material, resolution depends on gossip rather than structured, correlatable text.
+- Markets/articles are curated into 3 verticals (Macro/Central Banks, Geopolitics/Elections, Regulatory/Tech) via keyword filtering at ingestion — see architecture_canon.md for the full taxonomy. Pop-culture/entertainment markets are out of scope: poor RAG material, resolution depends on gossip rather than structured, correlatable text.
 
 ## Out of Scope
 
@@ -45,11 +45,24 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 
 ## Development Conventions
 
-- LLM calls in ingestion are being trialed (2026-08-13), not dogmatically banned. Original rule was "on-demand only, not on every data pull" under the $5 hard-cap regime — now operating with a $120 promotional credit buffer and "spend deliberately, not miserly" philosophy. Currently trialing Bedrock summarization/entity-extraction at ingestion time for all 3 sources (News, Bluesky, Polymarket) for 3-4 days, measuring actual cost/latency/benefit via the architecture-decisions metrics table before deciding whether to keep, scope down, or revert to on-demand-only. See architecture_decisions.md (once created) for the measured tradeoff.
+- LLM calls in ingestion are being trialed (2026-08-13), not dogmatically banned. Original rule was "on-demand only, not on every data pull" under the $5 hard-cap regime — now operating with a $120 promotional credit buffer and "spend deliberately, not miserly" philosophy. Currently trialing Bedrock summarization/entity-extraction at ingestion time for all 3 sources (News, Bluesky, Polymarket) for 3-4 days, measuring actual cost/latency/benefit via the architecture-decisions metrics table before deciding whether to keep, scope down, or revert to on-demand-only. See architecture_canon.md for the measured tradeoff.
 - Prefer Lambda + event-driven patterns over always-on services
 - Follow Chip Huyen's *AI Engineering* architecture patterns as primary reference (compute budget / FLOPs tradeoffs to be tackled later, per the book's framing)
 - Explore LangChain and LlamaIndex alongside Claude Code for agent orchestration comparisons
 - Architectural decisions with real cost/latency/benefit tradeoffs (e.g. LLM-in-ingestion vs on-demand-only) should be measured, not guessed — instrument with real Bedrock calls and CloudWatch timing, not estimates, and record the outcome as an ADR (Architecture Decision Record).
+
+## Documentation Map (`.claude/claude_docs/`)
+
+| File | Purpose |
+|---|---|
+| `architecture_canon.md` | **Current-state snapshot** of Poly-RAG's architecture (data sources, vertical taxonomy, LLM enrichment trial, AWS infrastructure inventory). Overwritten/updated in place as the architecture evolves — not a changelog. Start here to understand what's actually built right now. |
+| `tech_debt.md` | **Open items** — known limitations, rejected alternatives (Reddit/X/Truth Social), and unresolved tradeoffs, each with Issue/Debt/Mitigation/Revisit structure. Entries close or get superseded as they're resolved. |
+| `session_ledger.md` | **Chronological log** of work sessions, most recent first, added via `/end`. Immutable history — what happened and when, never edited after the fact. |
+| `knowledge.md` | **Concept archive** — technical explanations (RAG, NLP, LLM deployment, AWS/GCP mappings, etc.) surfaced during sessions, added via `/knowledge` or proactively when a new concept comes up. |
+| `hooks.md` | Documents this repo's Claude Code hooks (auto-updated when `.claude/settings.json` changes — see the hook itself). |
+| `infra_design.md` | Claude Code environment design **for this repo** — hooks, skills, agents, MCP, memory conventions. About the dev environment, not about Poly-RAG's product architecture (that's `architecture_canon.md`). |
+| `memory_mirror/` | Git-tracked mirror of Claude Code's internal memory store, kept in sync via hooks (union sync, no deletions). |
+| `gerdau/` | Interview-prep sprint materials — gitignored, never tracked in version control. |
 
 ## Git & Commit Rules
 

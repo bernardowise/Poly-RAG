@@ -2,6 +2,17 @@
 
 Log of work sessions, most recent first. Each entry added by /end.
 
+## 2026-08-14
+
+- Dia 2 del sprint completado: 3 Lambdas de ingestion desplegadas y verificadas con datos reales (Polymarket, News, Bluesky), cada una escribiendo a S3 y registrando metricas de costo/latencia en DynamoDB (tabla poly-rag-architecture-metrics)
+- Decision de alcance ajustada en vivo: 3 Lambdas independientes (no orquestador unico) para aislar fallos y proteger el limite de PUT requests en reintentos
+- Reddit descartado como fuente (su Responsible Builder Policy prohibe explicitamente usar datos para IA/ML); X y Truth Social tambien evaluados y descartados; reemplazados por Bluesky (AT Protocol)
+- Bug real encontrado y corregido en produccion: searchPosts de Bluesky requiere auth contra bsky.social (el PDS), no public.api.bsky.app como indicaba la investigacion inicial -- corregido tras 403s reales
+- Filtro de verticales (Macro/Geopolitica/Regulatorio-Tech) definido con keywords especificas, mas exclusion explicita de mercados deportivos tras detectar falsos positivos por matching de substring (ej. sec matcheando dentro de second)
+- Decision arquitectonica: LLM (Bedrock/Claude Sonnet 4.5) trial en ingestion para las 3 fuentes, midiendo costo/latencia real por 3-4 dias antes de decidir si se mantiene -- una sola llamada batched por corrida, no una por item, para controlar costo
+- Costo real medido: ~0.018 USD por ciclo completo de las 3 fuentes (~1.10 USD/mes proyectado a cadencia de 12h), dentro del presupuesto
+- Bloqueos resueltos en el camino: Sonnet 5 no disponible (se uso 4.5 via inference profile), suscripcion AWS Marketplace con delay de propagacion en cuenta nueva
+
 ## 2026-08-13
 
 - Sprint de entrevista (gerdau/sprint_plan.md) Dia 1 cerrado: cuenta AWS creada desde cero, MFA en root, budget de $5/mes con alertas 20%/100%, usuario IAM admin (dejando de usar root), AWS CLI v2 instalada y configurada
