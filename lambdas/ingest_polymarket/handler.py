@@ -1,15 +1,24 @@
 """
 Poly-RAG ingestion Lambda: Polymarket Gamma API.
 
-Fetches active markets, tags them by vertical (Macro/Geopolitics/Regulatory-Tech)
-via keyword match, optionally enriches with a Bedrock/Claude summary (Opcion 1
-trial per CLAUDE.md Development Conventions), writes a single batched JSON to S3,
-and records cost/latency metrics to DynamoDB for the architecture-decisions trial.
+Redesigned 2026-08-15 (see tech_debt.md, "Ingestion Redesign" entry). Replaces
+static keyword-vertical tagging with an LLM verifiability filter: a market is
+ingested only if its outcome resolves against a citable public record, not
+human judgment over ambiguous evidence. The same LLM call also produces a
+single combined search_query per market (not isolated keywords -- terms that
+only carry meaning together, e.g. a name plus a date, must stay combined),
+which News/Bluesky will read from the registry to drive their own searches
+(no more static VERTICAL_KEYWORDS dict).
+
+Pulls the top 500 active markets by volume24hr each cycle, diffs against the
+market registry (DynamoDB) to find genuinely new ids, and only runs the LLM
+pass on those -- steady-state cost scales with new-id arrival rate, not with
+the candidate pool size. Ids previously tracked as open that no longer appear
+in the pull are checked individually against the Gamma API for resolution.
 """
 
 import json
 import os
-import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,108 +28,161 @@ import urllib.request
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
+REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
 
-POLYMARKET_API_URL = "https://gamma-api.polymarket.com/markets?limit=100&active=true&order=volume&ascending=false"
-
-VERTICAL_KEYWORDS = {
-    "macro": [
-        "fed", "federal reserve", "interest rate", "inflation", "cpi",
-        "unemployment", "recession", "gdp", "trump", "truth social",
-    ],
-    "geopolitics": [
-        "election", "president", "war", "ceasefire", "sanctions", "tariff",
-        "nato", "invasion", "trump", "putin", "xi", "ukraine", "taiwan", "china",
-    ],
-    "regulatory_tech": [
-        "fda", "antitrust", "lawsuit", "sec", "regulation", "approval", "ban",
-        "ai regulation", "google", "apple", "meta", "openai", "anthropic", "spacex",
-    ],
-}
-
-# Sports markets dominate Polymarket by volume and generate false-vertical-positive
-# matches (e.g. "SEC" matching mid-word inside a soccer resolution-rules paragraph,
-# or team names accidentally containing a country/company keyword). Excluded outright
-# before vertical tagging runs, regardless of any keyword match.
-SPORTS_EXCLUSION_PATTERNS = [
-    r"\bvs\.?\b", r"\bfc\b", r"\bnfl\b", r"\bnba\b", r"\bnhl\b", r"\bmlb\b",
-    r"\bmls\b", r"\bo/u\b", r"\bover/under\b", r"\b\d+(st|nd|rd|th) half\b",
-    r"\bexact score\b", r"\btotal corners\b", r"\bboth teams to score\b",
-    r"\bcomeback player\b", r"\bmvp\b", r"\bbo\d\b", r"\bregular season\b",
-]
-_SPORTS_RE = re.compile("|".join(SPORTS_EXCLUSION_PATTERNS), re.IGNORECASE)
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CANDIDATE_POOL_SIZE = 500
+PAGE_SIZE = 100
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
 
 
-def fetch_markets():
-    req = urllib.request.Request(
-        POLYMARKET_API_URL,
-        headers={"User-Agent": "poly-rag-ingestion/1.0"},
-    )
+def fetch_top_markets_by_volume24hr(limit=CANDIDATE_POOL_SIZE):
+    """Paginates the Gamma API (hard 100-per-page cap) to build the top-N
+    candidate pool ordered by volume24hr, deduping by id across pages."""
+    markets = {}
+    offset = 0
+    while len(markets) < limit:
+        url = f"{GAMMA_MARKETS_URL}?limit={PAGE_SIZE}&offset={offset}&active=true&order=volume24hr&ascending=false"
+        req = urllib.request.Request(url, headers={"User-Agent": "poly-rag-ingestion/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            page = json.loads(response.read().decode())
+        if not page:
+            break
+        for m in page:
+            markets[m.get("id")] = m
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return list(markets.values())[:limit]
+
+
+def fetch_market_by_id(market_id):
+    url = f"{GAMMA_MARKETS_URL}/{market_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "poly-rag-ingestion/1.0"})
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode())
 
 
-def is_sports_market(question):
-    # Checked against the question only, not description -- descriptions are long
-    # rules paragraphs prone to incidental word matches (e.g. team names, "second half").
-    return bool(_SPORTS_RE.search(question))
+def get_known_ids(table):
+    """Scans the registry for id -> status. Table is small enough for a full
+    scan at this stage; revisit if the registry grows large enough to matter."""
+    known = {}
+    resp = table.scan(ProjectionExpression="market_id, #s", ExpressionAttributeNames={"#s": "status"})
+    for item in resp.get("Items", []):
+        known[item["market_id"]] = item["status"]
+    while "LastEvaluatedKey" in resp:
+        resp = table.scan(
+            ProjectionExpression="market_id, #s",
+            ExpressionAttributeNames={"#s": "status"},
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        for item in resp.get("Items", []):
+            known[item["market_id"]] = item["status"]
+    return known
 
 
-def tag_verticals(question, description):
-    if is_sports_market(question):
-        return []
-
-    text = f"{question} {description}".lower()
-    matched = []
-    for vertical, keywords in VERTICAL_KEYWORDS.items():
-        for kw in keywords:
-            # Word-boundary match: "sec" must not match inside "second".
-            pattern = r"\b" + re.escape(kw) + r"\b"
-            if re.search(pattern, text):
-                matched.append(vertical)
-                break
-    return matched
+BATCH_SIZE = 20
 
 
-def enrich_with_bedrock(markets_batch):
-    """
-    Single Bedrock call summarizing the whole batch (not one call per market) --
-    keeps token cost bounded regardless of how many markets came back.
-    """
-    questions = "\n".join(f"- {m['question']}" for m in markets_batch[:20])
-    prompt = (
-        "Below are prediction market questions from Polymarket. In 3-5 bullet "
-        "points, summarize the dominant themes and any notable probability "
-        "extremes (very high or very low confidence outcomes) worth flagging "
-        "for a research analyst.\n\n" + questions
+def _classify_batch(batch):
+    listing = "\n".join(
+        f'{i+1}. id={m["id"]} question="{m.get("question", "")}"'
+        for i, m in enumerate(batch)
     )
+    prompt = (
+        "For each numbered prediction market below, judge whether its outcome "
+        "will be objectively verifiable against a citable public record (e.g. an "
+        "official statement, certified vote count, regulatory filing, market price) "
+        "versus resolved by human/oracle judgment over ambiguous social evidence "
+        "(e.g. celebrity rumors, disputed claims with no official record).\n\n"
+        "Also produce TWO search representations, because downstream consumers match "
+        "text differently:\n"
+        "1. search_query: a single combined free-text search string, for a search API "
+        "that accepts natural-language queries (e.g. social media search). Keep terms "
+        "that only make sense together combined in one string. Good: \"Elon Musk "
+        "Twitter posting frequency August 2026\".\n"
+        "2. news_match_terms: a short list of 1-3 DISTINCTIVE terms/phrases, for "
+        "matching against already-downloaded article text via AND logic (every term "
+        "must appear in the SAME article to count as a match -- this is substring "
+        "matching, not a search engine, so terms must be specific enough that their "
+        "co-occurrence is meaningful, not generic words that appear everywhere). "
+        "Prefer multi-word phrases over single common words. Example for the Fed "
+        "rate market: [\"Federal Reserve\", \"September 2026\"] -- NOT [\"Fed\", "
+        "\"rate\", \"2026\"], which would false-match unrelated articles.\n\n"
+        f"{listing}\n\n"
+        "Respond with ONLY a JSON array, one object per market, no other text:\n"
+        '[{"id": "...", "is_verifiable": true|false, "search_query": "...", '
+        '"news_match_terms": ["...", "..."]}]'
+    )
+
+    print(f"[classify_batch] prompt sent ({len(batch)} markets):\n{prompt}")
 
     start = time.time()
     response = bedrock.invoke_model(
         modelId=BEDROCK_MODEL_ID,
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
+            "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}],
         }),
     )
     latency_ms = int((time.time() - start) * 1000)
 
     body = json.loads(response["body"].read())
-    summary_text = body["content"][0]["text"]
+    raw_text = body["content"][0]["text"].strip()
     usage = body.get("usage", {})
 
-    return {
-        "summary": summary_text,
-        "tokens_in": usage.get("input_tokens", 0),
-        "tokens_out": usage.get("output_tokens", 0),
-        "latency_ms": latency_ms,
+    print(f"[classify_batch] raw response:\n{raw_text}")
+
+    try:
+        classifications = json.loads(raw_text)
+    except json.JSONDecodeError:
+        start_idx = raw_text.find("[")
+        end_idx = raw_text.rfind("]")
+        classifications = json.loads(raw_text[start_idx:end_idx + 1])
+
+    return classifications, usage, latency_ms, raw_text
+
+
+def classify_new_markets(candidates):
+    """Batched Bedrock calls (BATCH_SIZE markets per call): for each candidate
+    market, judge whether its outcome is objectively verifiable against a
+    citable public record (vs. resolved by human judgment over ambiguous
+    evidence), and produce a combined search_query to drive News/Bluesky
+    searches. Steady-state cycles only see a handful of new ids (one call);
+    the bootstrap cycle, seeing hundreds of new ids at once, needs multiple
+    batches to cover all of them.
+    """
+    if not candidates:
+        return {}, {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "raw_responses": []}
+
+    results = {}
+    total_tokens_in, total_tokens_out, total_latency_ms = 0, 0, 0
+    raw_responses = []
+
+    for i in range(0, len(candidates), BATCH_SIZE):
+        batch = candidates[i:i + BATCH_SIZE]
+        classifications, usage, latency_ms, raw_text = _classify_batch(batch)
+        for c in classifications:
+            if "id" in c:
+                results[c["id"]] = c
+        total_tokens_in += usage.get("input_tokens", 0)
+        total_tokens_out += usage.get("output_tokens", 0)
+        total_latency_ms += latency_ms
+        raw_responses.append(raw_text)
+
+    llm_meta = {
+        "tokens_in": total_tokens_in,
+        "tokens_out": total_tokens_out,
+        "latency_ms": total_latency_ms,
+        "raw_responses": raw_responses,
     }
+    return results, llm_meta
 
 
 def estimate_cost_usd(tokens_in, tokens_out):
@@ -144,53 +206,154 @@ def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_pro
     })
 
 
+def upsert_registry_entry(table, market, search_query, news_match_terms, now_iso):
+    table.put_item(Item={
+        "market_id": market["id"],
+        "question": market.get("question", ""),
+        "description": market.get("description", ""),
+        "end_date": market.get("endDate"),
+        "resolution_source": market.get("resolutionSource", ""),
+        "status": "open",
+        # Two derived search representations, because News and Bluesky match text
+        # differently -- see the redesign entry in tech_debt.md for the reasoning:
+        # - search_query: single combined free-text string, for Bluesky's
+        #   search-API-style searchPosts (accepts natural-language queries).
+        # - news_match_terms: short AND-matched term list, for substring matching
+        #   against already-downloaded RSS article text (News has no search API --
+        #   it greps its own downloaded text, so isolated common words would
+        #   false-match; every term must co-occur in the same article).
+        "search_query": search_query,
+        "news_match_terms": news_match_terms,
+        "first_seen": now_iso,
+        "last_updated": now_iso,
+        "resolution_date": None,
+        "final_outcome": None,
+    })
+
+
+def mark_registry_resolved(table, market_id, final_outcome, now_iso):
+    table.update_item(
+        Key={"market_id": market_id},
+        UpdateExpression="SET #s = :resolved, final_outcome = :outcome, resolution_date = :now, last_updated = :now",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":resolved": "resolved",
+            ":outcome": final_outcome,
+            ":now": now_iso,
+        },
+    )
+
+
+def append_odds_snapshot(market, now_iso):
+    """Read-modify-write the per-market odds time-series file in S3. One file
+    per market_id, one appended snapshot per cycle -- never overwritten."""
+    key = f"odds/{market['id']}.json"
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        history = json.loads(obj["Body"].read())
+    except s3.exceptions.ClientError as e:
+        # Missing key -- normally NoSuchKey (404), but S3 can also report a
+        # generic AccessDenied (403) for a nonexistent key when the caller
+        # lacks bucket-level ListBucket, so both are treated as "not found yet".
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code not in ("NoSuchKey", "AccessDenied", "404", "403"):
+            raise
+        history = {"market_id": market["id"], "snapshots": []}
+
+    history["snapshots"].append({
+        "timestamp": now_iso,
+        "outcomePrices": market.get("outcomePrices"),
+        "volume": market.get("volumeNum"),
+        "volume24hr": market.get("volume24hr"),
+        "liquidity": market.get("liquidityNum"),
+    })
+
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(history),
+        ContentType="application/json",
+    )
+
+
 def lambda_handler(event, context):
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    registry_table = dynamodb.Table(REGISTRY_TABLE)
+
     fetch_start = time.time()
-    raw_markets = fetch_markets()
+    candidates = fetch_top_markets_by_volume24hr()
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 
-    tagged_markets = []
-    for m in raw_markets:
-        verticals = tag_verticals(m.get("question", ""), m.get("description", ""))
-        if not verticals:
-            continue  # out of scope: no vertical match, drop (pop-culture/noise filter)
-        tagged_markets.append({
-            "id": m.get("id"),
-            "question": m.get("question"),
-            "outcomes": m.get("outcomes"),
-            "outcomePrices": m.get("outcomePrices"),
-            "volume": m.get("volumeNum"),
-            "volume24hr": m.get("volume24hr"),
-            "liquidity": m.get("liquidityNum"),
-            "endDate": m.get("endDate"),
-            "updatedAt": m.get("updatedAt"),
-            "verticals": verticals,
-        })
+    known_ids = get_known_ids(registry_table)
+    candidate_ids = {m["id"] for m in candidates}
+    new_candidates = [m for m in candidates if m["id"] not in known_ids]
 
-    llm_enrichment = None
     tokens_in, tokens_out, llm_latency_ms = 0, 0, 0
-    if USE_LLM_ENRICHMENT and tagged_markets:
-        llm_enrichment = enrich_with_bedrock(tagged_markets)
-        tokens_in = llm_enrichment["tokens_in"]
-        tokens_out = llm_enrichment["tokens_out"]
-        llm_latency_ms = llm_enrichment["latency_ms"]
+    llm_raw_responses = []
+    tracked_markets = []
+    if USE_LLM_ENRICHMENT and new_candidates:
+        classifications, llm_meta = classify_new_markets(new_candidates)
+        tokens_in = llm_meta["tokens_in"]
+        tokens_out = llm_meta["tokens_out"]
+        llm_latency_ms = llm_meta["latency_ms"]
+        llm_raw_responses = llm_meta["raw_responses"]
 
-    now = datetime.now(timezone.utc)
+        for m in new_candidates:
+            verdict = classifications.get(m["id"])
+            if not verdict or not verdict.get("is_verifiable"):
+                continue  # not objectively verifiable -- discard, never enters the registry
+            search_query = verdict.get("search_query", "")
+            news_match_terms = verdict.get("news_match_terms", [])
+            upsert_registry_entry(registry_table, m, search_query, news_match_terms, now_iso)
+            tracked_markets.append(m)
+
+    # Every candidate id already known and still open gets a fresh odds snapshot,
+    # regardless of whether it was newly classified this cycle.
+    already_tracked_open = [
+        m for m in candidates
+        if m["id"] in known_ids and known_ids[m["id"]] == "open"
+    ]
+    for m in already_tracked_open + tracked_markets:
+        append_odds_snapshot(m, now_iso)
+
+    # Ids that were open in the registry but no longer appear in today's top-N pull:
+    # query the Gamma API directly per id to check for resolution.
+    open_known_ids = {mid for mid, status in known_ids.items() if status == "open"}
+    dropped_ids = open_known_ids - candidate_ids
+    resolved_count = 0
+    for market_id in dropped_ids:
+        try:
+            detail = fetch_market_by_id(market_id)
+        except Exception:
+            continue  # transient API error -- leave status as-is, retry next cycle
+        if detail.get("closed"):
+            outcome_prices = detail.get("outcomePrices")
+            mark_registry_resolved(registry_table, market_id, outcome_prices, now_iso)
+            resolved_count += 1
+
     total_latency_ms = fetch_latency_ms + llm_latency_ms
     payload = {
         "source": "polymarket",
-        "ingested_at": now.isoformat(),
-        "market_count": len(tagged_markets),
-        "markets": tagged_markets,
-        "llm_summary": llm_enrichment["summary"] if llm_enrichment else None,
+        "ingested_at": now_iso,
+        "candidate_count": len(candidates),
+        "new_ids_this_cycle": len(new_candidates),
+        "newly_tracked_count": len(tracked_markets),
+        "odds_snapshots_written": len(already_tracked_open) + len(tracked_markets),
+        "resolved_this_cycle": resolved_count,
         "metadata": {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "lambda_name": context.function_name,
             "lambda_request_id": context.aws_request_id,
             "llm_used": USE_LLM_ENRICHMENT,
             "llm_model_id": BEDROCK_MODEL_ID if USE_LLM_ENRICHMENT else None,
             "latency_ms": total_latency_ms,
             "estimated_cost_usd": estimate_cost_usd(tokens_in, tokens_out),
+            # Bronze-layer audit trail: raw, unparsed LLM responses for the
+            # verifiability+keywords classification pass, one string per batch
+            # call. Lets us re-inspect exactly what the model said if the
+            # parsed registry entries ever look wrong.
+            "llm_raw_responses": llm_raw_responses,
         },
     }
 
@@ -208,14 +371,16 @@ def lambda_handler(event, context):
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         latency_ms=total_latency_ms,
-        items_processed=len(tagged_markets),
+        items_processed=len(candidates),
     )
 
     return {
         "statusCode": 200,
         "body": json.dumps({
             "s3_key": s3_key,
-            "market_count": len(tagged_markets),
+            "candidate_count": len(candidates),
+            "newly_tracked_count": len(tracked_markets),
+            "resolved_this_cycle": resolved_count,
             "llm_used": USE_LLM_ENRICHMENT,
         }),
     }

@@ -34,6 +34,16 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
   }
 
   statement {
+    # S3 needs ListBucket (bucket-level, not object-level) to correctly return
+    # a 404 for a missing key -- without it, GetObject on a nonexistent odds/
+    # snapshot file returns an opaque 403 AccessDenied instead of NoSuchKey,
+    # which broke the read-modify-write pattern in append_odds_snapshot.
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.poly_rag_data.arn]
+  }
+
+  statement {
     effect    = "Allow"
     actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.architecture_metrics.arn]

@@ -2,6 +2,19 @@
 
 Log of work sessions, most recent first. Each entry added by /end.
 
+## 2026-08-15
+
+- Bootstrap del pipeline rediseñado corrido y verificado: ingest_polymarket con top 500 candidatos por volume24hr, filtro LLM de verificabilidad, y registry poblado en DynamoDB (480 mercados trackeados, 480 archivos de odds en S3) -- verificado directamente contra las tablas reales tras dos bugs de despliegue encontrados y corregidos en el camino (timeout de Lambda insuficiente para el volumen de trabajo del bootstrap, y un AccessDenied de S3 causado por falta de permiso ListBucket a nivel bucket, no solo GetObject a nivel objeto)
+- Logging de auditoria agregado al paso LLM: prompt y respuesta cruda de cada batch van a CloudWatch, y las respuestas crudas (capa Bronze) se guardan tambien en el metadata del payload S3 -- para poder re-inspeccionar exactamente que dijo el modelo si algo se ve mal en el registry parseado
+- Revision de resultado del bootstrap detecto que ~96% de los candidatos pasaron el filtro de verificabilidad (no 2.4% como parecia inicialmente por una lectura enganosa del ultimo run aislado) -- confirma la hipotesis de que alto volumen en Polymarket ya correlaciona con mercados de resolucion clara
+- Bug de diseno real encontrado en las keywords generadas por el LLM: una lista de keywords sueltas (ej. "Elon Musk", "tweets", "August 2026") pierde señal si se buscan por separado -- termino identificado por el usuario, no how solo un capricho de estilo
+- Corregido a dos representaciones de busqueda distintas en el mismo llamado LLM (sin costo adicional de Bedrock), porque News y Bluesky matchean texto de formas distintas: search_query (string combinado, para el search API de Bluesky) y news_match_terms (lista corta de 1-3 frases distintivas con logica AND, para matching por substring contra el texto de RSS ya descargado por News, que no tiene API de busqueda)
+- Verificado con llamadas reales a Bedrock (fuera del handler, muestra de 20 mercados) antes de desplegar -- confirmado que ambos formatos salen bien calibrados (ej. Federal Reserve + September 2026 en vez de Fed/rate/2026 sueltos)
+- Reflexion de producto real: se discutio honestamente que tipo de analisis estadistico/predictivo es alcanzable con odds+news (lead-lag, calibracion de Polymarket via reliability diagram) vs. lo que NO lo es (prediccion causal validada, dado el volumen de datos de solo 2 meses) -- y para que le serviria el RAG a un trader real (agregacion + historial propio + alertas de divergencia, no "tips de inversion")
+- Corregida una limitacion mal planteada: el retrieval NO debe limitarse solo a items explicitamente linkeados por market_id -- toda noticia/post ya tiene timestamp de ingesta sin importar si matcheo keywords, asi que existe una segunda capa de retrieval por ventana temporal disponible ya (sin esperar a embeddings del Dia 4), como contexto secundario junto al linkeo de alta confianza
+- Anotado en tech_debt como consideracion futura: acceso web en vivo para el agente de sintesis (Dia 5) via tool-use de Claude -- explicitamente no aplica a las Lambdas de ingestion (rompe el modelo de costo batch), pero es candidato real para cuando el usuario pregunte algo mas reciente que el ultimo ciclo de ingestion
+- Pendiente para el siguiente bloque (dejado deliberadamente sin ejecutar para no gastar Bedrock de mas antes de dormir): limpiar los 480 registros del bootstrap viejo (schema con keywords obsoleto), re-correr el bootstrap con el prompt de dos formatos ya desplegado, luego migrar ingest_news e ingest_bluesky a leer del registry, reactivar el cron de 12h, construir el retrieval por ventana temporal, y actualizar architecture_canon.md con el diseno completo
+
 ## 2026-08-14
 
 - Dia 2 del sprint completado: 3 Lambdas de ingestion desplegadas y verificadas con datos reales (Polymarket, News, Bluesky), cada una escribiendo a S3 y registrando metricas de costo/latencia en DynamoDB (tabla poly-rag-architecture-metrics)

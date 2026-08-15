@@ -9,8 +9,13 @@ resource "aws_lambda_function" "ingest_polymarket" {
   role          = aws_iam_role.ingest_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  timeout       = 60
-  memory_size   = 256
+  # 600s (vs 60s for the other ingestion Lambdas): the redesigned pipeline
+  # paginates up to 500 candidates, runs up to ~25 sequential Bedrock batch
+  # calls for verifiability classification, and does a read-modify-write S3
+  # odds snapshot per tracked market -- the bootstrap cycle in particular
+  # needs real headroom the first time the registry is empty.
+  timeout     = 600
+  memory_size = 256
 
   filename         = data.archive_file.ingest_polymarket.output_path
   source_code_hash = data.archive_file.ingest_polymarket.output_base64sha256

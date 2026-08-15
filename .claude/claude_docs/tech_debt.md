@@ -352,13 +352,30 @@ text, from open to resolution.
   independent Lambdas (failure isolation) — explicitly rejected chaining Polymarket ->
   News/Bluesky invocation directly, since that would reintroduce the single-point-of-failure
   coupling the 3-Lambda split was designed to avoid.
-- **Keyword generation:** the LLM extracts 2-4 keywords/entities per market in the SAME
-  Bedrock call as the verifiability judgment — single structured (JSON) response returns both
-  `is_verifiable` and `keywords`, not two separate calls. Zero additional Bedrock cost for
-  this piece; keeps the "one batched call" cost discipline already applied to the existing
-  summarization trial. Rejected: cheap regex/NER extraction without an LLM call — less
-  precise (misses context/relationships an LLM would catch), and the LLM call already has to
-  happen for verifiability, so piggy-backing costs nothing extra.
+- **Keyword generation:** the LLM produces search terms per market in the SAME Bedrock call
+  as the verifiability judgment — single structured (JSON) response returns `is_verifiable`
+  plus search terms, not two separate calls. Zero additional Bedrock cost for this piece;
+  keeps the "one batched call" cost discipline already applied to the existing summarization
+  trial. Rejected: cheap regex/NER extraction without an LLM call — less precise (misses
+  context/relationships an LLM would catch), and the LLM call already has to happen for
+  verifiability, so piggy-backing costs nothing extra.
+- **Two search representations, not one (corrected 2026-08-15, same day):** an isolated-
+  keywords-list format was tried first and rejected — e.g. `["Elon Musk", "tweets", "August
+  2026"]` used as 3 independently-searched terms loses the connection between them (a search
+  for "August 2026" alone matches almost anything). The fix isn't a single combined string
+  either, because News and Bluesky match text through fundamentally different mechanisms:
+  - **`search_query`** (single combined free-text string, e.g. "Elon Musk Twitter posting
+    frequency August 2026"): for Bluesky's `searchPosts`, which accepts natural-language
+    search-engine-style queries.
+  - **`news_match_terms`** (short list of 1-3 distinctive multi-word phrases, e.g.
+    `["Federal Reserve", "September 2026"]`, not `["Fed", "rate", "2026"]`): for News, which
+    has no search API — it downloads full RSS article text and greps it, so matching needs
+    AND logic (every term must co-occur in the SAME article) against terms specific enough
+    that co-occurrence is meaningful, not generic words that appear everywhere.
+  Both are produced in the same LLM call as the verifiability judgment — still zero additional
+  Bedrock cost. Verified via a real Bedrock invoke-model test (2026-08-15, 20-market sample,
+  outside the Lambda) before wiring into the handler — see example outputs in the prompt
+  itself (`_classify_batch` in `lambdas/ingest_polymarket/handler.py`).
 - **Initial candidate N:** top 500 by `volume24hr` for the bootstrap run. Affordable per the
   cost-correction note above (steady-state cost scales with new-id arrival rate, not N).
 
@@ -378,3 +395,109 @@ by re-enabling the 12h EventBridge schedule once verified.
 
 **Revisit if:** Real new-ID arrival rate or per-market LLM cost, once measured, invalidates the
 "wider N is affordable because only new ids get classified" assumption above.
+
+---
+
+## Known Limitation: Explicit ID-Linkage Only Captures Direct Correlation
+
+**Issue (raised 2026-08-15, during bootstrap review):** The keyword-based linkage between
+market ids and News/Bluesky items (see "Ingestion Redesign" entry above) only links content
+that explicitly matches a market's extracted keywords. This is a structural limitation of any
+keyword-matching approach, not a bug to fix in the current design.
+
+**Concrete example:** a generic article about "crypto market sentiment souring" could move a
+Bitcoin-price market's odds without ever mentioning "Bitcoin" or the specific price threshold
+literally in a way keyword matching catches — it would never get linked to that market_id,
+even though it may be the real driver of the odds movement.
+
+**Why this can't be fully solved by better keywords:** even a well-designed keyword/query
+(see the "Elon Musk tweets" example — keywords need to work as a combined, reasoned search
+query, not isolated terms, which the redesign above addresses) only catches DIRECT mentions.
+Ambient/indirect correlation (sentiment shifts, related-but-not-explicitly-connected events)
+requires comparing the full ingested corpus against odds movement using semantic similarity
+(embeddings), not keyword presence.
+
+**Correction (2026-08-15, same day):** retrieval should NOT be limited to explicitly-linked
+items only — that throws away real signal for no good reason. Every News/Bluesky item already
+carries an ingestion timestamp regardless of whether it matched any market's keywords, so a
+second, cheap retrieval layer is available today, no embeddings required: a TIME-WINDOW query
+("everything ingested in the 12h window around when market X's odds moved") over the existing
+raw S3 storage. This is not the same fix as better keywords (which only improves the
+high-confidence layer) — it's an entirely separate, complementary retrieval path.
+
+**Corrected framing — retrieval has (at least) two layers, not one:**
+1. **High-confidence (explicit id-linkage, Silver):** "we know with certainty this item is
+   about this market" — shown first, treated as likely-causal.
+2. **Contextual/temporal (raw timestamp window, no linkage required):** "this happened in the
+   world while this market moved" — shown as supporting context, weaker/noisier signal, but
+   real and available immediately, not gated on Day 4 work.
+Within layer 2's (often large, noisy) time window, semantic similarity (embeddings, Day 4)
+becomes useful for RANKING relevance — not for discovering the window itself, which timestamp
+filtering already does for free.
+
+**Revisit if:** Implementing this — building the time-window retrieval query is not blocked on
+anything else in the current redesign and could be done alongside or right after News/Bluesky
+keyword-reading (tasks 3/4 in progress as of 2026-08-15).
+
+---
+
+## Future Consideration: Live Web Access for the Synthesis/RAG Agent
+
+**Issue (raised 2026-08-15):** Today's Bedrock usage (both the ingestion-time verifiability
+classifier and the planned Day 5 synthesis agent) is a closed model with no live internet
+access — it only knows what's explicitly placed in the prompt from Poly-RAG's own S3/DynamoDB
+storage, plus frozen training-time knowledge. This is a deliberate, correct constraint for the
+ingestion Lambdas (keeps cost/latency bounded, batch-shaped, and reproducible — see the
+verifiability-classifier design above). It becomes a real limitation for the Day 5 synthesis
+agent, whose whole point is answering user questions that may need context beyond what any
+12h ingestion cycle happened to capture.
+
+**Capability that exists but isn't used here:** Claude supports tool-use-based web browsing /
+"computer use" (agentic tool calls that let the model fetch live web content mid-conversation)
+via the Claude API / Agent SDK. Not wired into Poly-RAG today.
+
+**Why not adopted yet:** wiring this into the current ingestion Lambdas would break the
+batch cost/latency model this whole redesign is built on (single bounded Bedrock call per
+Lambda run, cost that scales with new-id arrival rate, not with open-ended browsing). This is
+a different architectural shape — synchronous, user-facing, unbounded-latency-tolerant — that
+belongs to the Day 5 synthesis agent, not to ingestion.
+
+**Likely real use case:** the Day 5 synthesis/RAG agent, when answering a live user question,
+could optionally reach beyond the ingested corpus (e.g. "what's the latest on X" when the most
+recent relevant ingestion cycle is 10h stale) via live web tool-use, clearly distinguished in
+the response from grounded-in-our-own-corpus answers.
+
+**Revisit if:** Day 5 synthesis agent work begins — evaluate whether user questions actually
+need live-web reach beyond the ingested corpus before adding the complexity/cost of tool-use
+web browsing, rather than assuming it's needed upfront.
+
+---
+
+## Future Consideration: Overnight/Unattended Agent Work (Cloud-Isolated Agents)
+
+**Issue (raised 2026-08-15, end of Day 3):** User asked whether Claude Code could keep
+executing pending ingestion-redesign work (bootstrap re-run, News/Bluesky migration) while
+the Codespace machine is powered off overnight. Answer today is no: Claude Code runs as a
+process inside this Codespace — powering off the machine stops the process entirely, there is
+no separate "Claude" running elsewhere that survives the host shutting down. This is directly
+relevant to the project's explicit "agentic-first from day one" architecture philosophy in
+CLAUDE.md, so it's recorded here rather than treated as a one-off answer.
+
+**What does exist for this pattern:** Claude Code supports launching agents with `isolation:
+"remote"`, which runs in a cloud environment separate from the local machine — this COULD
+survive a local machine being powered off, since the agent isn't tied to the Codespace's
+lifecycle.
+
+**Why not set up tonight:** running Poly-RAG's actual pending work (re-running the ingestion
+bootstrap, editing/deploying Lambdas via Terraform) in a remote environment requires that
+environment to have safe access to AWS credentials and the Databricks token currently sitting
+in the gitignored `.secrets` file — wiring that up safely is its own task, not something to
+improvise late at night right before the credentials would need to be trusted to a new
+environment. Deferred deliberately, not forgotten.
+
+**Revisit if:** The project reaches a point where genuinely unattended/overnight agent work
+(scheduled ingestion redesign steps, batch backfills, etc.) becomes valuable enough to justify
+setting up secure credential access in a remote-isolated agent environment — evaluate the
+`isolation: "remote"` Agent option and/or the `schedule` skill (cron-based cloud agents) at
+that point, rather than defaulting to "just leave the Codespace running overnight," which
+defeats the cost-discipline principle in CLAUDE.md if left unattended repeatedly.
