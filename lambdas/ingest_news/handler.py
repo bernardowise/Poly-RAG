@@ -33,6 +33,26 @@ extracted per market, trying more RSS results if earlier ones fail
 (network error, decode failure, dedup, or extraction failure) -- "top 5
 that actually scrape and aren't duplicates," not blindly the first 5
 positions.
+
+BATCHING (added 2026-08-16, see tech_debt.md "News Source Redesign" update):
+measured ~21s/market end-to-end (search+decode+extract), so all ~230 open
+markets (~80 minutes) cannot fit in one invocation under Lambda's 900s hard
+maximum. The Lambda processes markets[offset:offset+BATCH_SIZE] per
+invocation.
+
+PARALLEL FAN-OUT (revised 2026-08-16, same day as the sequential-chain
+first deploy): the first production run showed each batch taking ~13min,
+so a full 7-batch sequential chain would take ~1.5h. Switched from
+self-chaining (one invoke() per batch, next one only starts after the
+previous returns) to fan-out (all remaining batches invoked at once from
+a single dispatch point). Each batch writes to ITS OWN S3 key
+(news/.../HH_batch<offset>.json), not a shared cycle payload -- concurrent
+batches writing read-modify-write to the SAME key would race (last
+writer wins, earlier batches' articles silently lost). A merge step
+(merge_batch_payloads) combines the per-batch files into the final
+cycle payload once all batches are done; dedup safety still comes from
+poly-rag-processed-urls (per-URL atomic put, safe under concurrency
+regardless of batching strategy).
 """
 
 import json
@@ -59,9 +79,14 @@ GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 RESULTS_TARGET_PER_MARKET = 5
 RSS_FETCH_COUNT = 15  # over-fetch since some results will fail decode/extract/dedup
 
+# ~21s/market measured (search+decode+extract) -- 35 markets is ~735s, safely
+# under Lambda's 900s hard maximum with margin for Bedrock enrichment + S3 I/O.
+BATCH_SIZE = 35
+
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
+lambda_client = boto3.client("lambda")
 
 # trafilatura's default DOWNLOAD_TIMEOUT is 30s -- observed in production
 # (2026-08-15) causing 3 consecutive Lambda timeouts: a single slow/blocked
@@ -248,58 +273,144 @@ def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_pro
     })
 
 
+def get_cycle_prefix(cycle_started_at):
+    dt = datetime.fromisoformat(cycle_started_at)
+    return f"news/{dt.strftime('%Y-%m-%d')}/{dt.strftime('%H')}"
+
+
+def get_batch_s3_key(cycle_started_at, offset):
+    """Each batch owns its own S3 object -- required for safe parallel fan-out
+    (see module docstring). Merged into the final cycle key by merge_batch_payloads."""
+    return f"{get_cycle_prefix(cycle_started_at)}_batch{offset}.json"
+
+
+def get_final_cycle_s3_key(cycle_started_at):
+    return f"{get_cycle_prefix(cycle_started_at)}.json"
+
+
+DISPATCH_STAGGER_SECONDS = 3  # small gap between fanned-out invokes -- avoids
+# firing all remaining batches at the exact same instant against Google
+# News / outlet servers, without adding proxy/VPN infrastructure (considered
+# and rejected: no cheap way to rotate Lambda's egress IP per batch --
+# NAT Gateway is a fixed IP and breaks the budget on its own; third-party
+# rotating proxies add cost and a new external dependency for what's really
+# a request-concurrency concern, not an IP-identity one).
+
+
+def dispatch_remaining_batches(context, offsets, cycle_started_at):
+    """Fires every remaining batch as an independent async invocation
+    (fan-out), instead of chaining one invoke per batch. Each batch writes
+    to its own S3 key, so there's no shared-state race between them.
+    Staggered by DISPATCH_STAGGER_SECONDS to avoid a simultaneous burst
+    against the same outlets/Google -- this call itself only costs a few
+    seconds total (invoke() with InvocationType=Event returns immediately,
+    it doesn't wait for the batch to run), it doesn't block the dispatcher's
+    own batch-0 work from starting late."""
+    for i, offset in enumerate(offsets):
+        if i > 0:
+            time.sleep(DISPATCH_STAGGER_SECONDS)
+        lambda_client.invoke(
+            FunctionName=context.function_name,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "offset": offset,
+                "cycle_started_at": cycle_started_at,
+                "mode": "batch",
+            }),
+        )
+
+
+def merge_batch_payloads(cycle_started_at, total_markets, expected_offsets):
+    """Reads every batch's own S3 object and combines them into the final
+    cycle payload. Called by whichever batch invocation happens to be last
+    to finish (detected via S3 listing, not a fixed order -- batches run
+    in parallel so completion order isn't deterministic)."""
+    prefix = get_cycle_prefix(cycle_started_at)
+    articles = []
+    markets_failed = []
+    markets_processed = 0
+    llm_summaries = []
+
+    for offset in expected_offsets:
+        key = f"{prefix}_batch{offset}.json"
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        except s3.exceptions.ClientError:
+            return None  # not all batches have written yet
+        batch_payload = json.loads(obj["Body"].read())
+        articles.extend(batch_payload["articles"])
+        markets_failed.extend(batch_payload["markets_failed"])
+        markets_processed += batch_payload["markets_processed"]
+        if batch_payload.get("llm_summary"):
+            llm_summaries.append(batch_payload["llm_summary"])
+
+    return {
+        "source": "news",
+        "cycle_started_at": cycle_started_at,
+        "markets_queried": total_markets,
+        "markets_processed": markets_processed,
+        "markets_failed": markets_failed,
+        "articles": articles,
+        "llm_summary": " | ".join(llm_summaries) if llm_summaries else None,
+    }
+
+
 def lambda_handler(event, context):
     registry_table = dynamodb.Table(REGISTRY_TABLE)
     processed_urls_table = dynamodb.Table(PROCESSED_URLS_TABLE)
     open_markets = get_open_markets(registry_table)
+    total_markets = len(open_markets)
+    all_offsets = list(range(0, total_markets, BATCH_SIZE))
+
+    offset = event.get("offset", 0)
+    cycle_started_at = event.get("cycle_started_at") or datetime.now(timezone.utc).isoformat()
+    mode = event.get("mode")  # None on the dispatch/first invocation, "batch" on fanned-out workers
+    batch = open_markets[offset:offset + BATCH_SIZE]
+
+    # Dispatch step: only the very first invocation of a cycle (offset=0,
+    # no mode set) fans out the REMAINING batches before doing its own work.
+    # This runs once per cycle regardless of how many batches exist.
+    if mode is None and offset == 0:
+        remaining_offsets = [o for o in all_offsets if o != 0]
+        if remaining_offsets:
+            dispatch_remaining_batches(context, remaining_offsets, cycle_started_at)
 
     fetch_start = time.time()
-    all_articles = []
-    markets_failed = []
+    batch_articles = []
+    batch_markets_failed = []
 
-    for market_id, question in open_markets:
+    for market_id, question in batch:
         articles, error = process_market_news(market_id, question, processed_urls_table)
         if error:
-            markets_failed.append(error)
+            batch_markets_failed.append(error)
             continue
-        all_articles.extend(articles)
+        batch_articles.extend(articles)
 
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 
     llm_enrichment = None
     tokens_in, tokens_out, llm_latency_ms = 0, 0, 0
-    if USE_LLM_ENRICHMENT and all_articles:
-        llm_enrichment = enrich_with_bedrock(all_articles)
+    if USE_LLM_ENRICHMENT and batch_articles:
+        llm_enrichment = enrich_with_bedrock(batch_articles)
         tokens_in = llm_enrichment["tokens_in"]
         tokens_out = llm_enrichment["tokens_out"]
         llm_latency_ms = llm_enrichment["latency_ms"]
 
-    now = datetime.now(timezone.utc)
     total_latency_ms = fetch_latency_ms + llm_latency_ms
-    payload = {
+    batch_payload = {
         "source": "news",
-        "ingested_at": now.isoformat(),
-        "article_count": len(all_articles),
-        "markets_queried": len(open_markets),
-        "markets_failed": markets_failed,
-        "articles": all_articles,
+        "cycle_started_at": cycle_started_at,
+        "markets_processed": len(batch),
+        "markets_failed": batch_markets_failed,
+        "articles": batch_articles,
         "llm_summary": llm_enrichment["summary"] if llm_enrichment else None,
-        "metadata": {
-            "schema_version": "v3",
-            "lambda_name": context.function_name,
-            "lambda_request_id": context.aws_request_id,
-            "llm_used": USE_LLM_ENRICHMENT,
-            "llm_model_id": BEDROCK_MODEL_ID if USE_LLM_ENRICHMENT else None,
-            "latency_ms": total_latency_ms,
-            "estimated_cost_usd": estimate_cost_usd(tokens_in, tokens_out),
-        },
     }
 
-    s3_key = f"news/{now.strftime('%Y-%m-%d')}/{now.strftime('%H')}.json"
+    batch_key = get_batch_s3_key(cycle_started_at, offset)
     s3.put_object(
         Bucket=S3_BUCKET,
-        Key=s3_key,
-        Body=json.dumps(payload),
+        Key=batch_key,
+        Body=json.dumps(batch_payload),
         ContentType="application/json",
     )
 
@@ -309,16 +420,41 @@ def lambda_handler(event, context):
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         latency_ms=total_latency_ms,
-        items_processed=len(all_articles),
+        items_processed=len(batch_articles),
     )
+
+    # Whichever batch happens to finish last attempts the merge -- safe to
+    # attempt from multiple batches if they finish close together, since
+    # merge_batch_payloads just overwrites the same final key with the same
+    # result once every batch key exists (idempotent, not a race).
+    merged = merge_batch_payloads(cycle_started_at, total_markets, all_offsets)
+    cycle_complete = merged is not None
+    if merged is not None:
+        merged["ingested_at"] = datetime.now(timezone.utc).isoformat()
+        merged["metadata"] = {
+            "schema_version": "v3",
+            "lambda_name": context.function_name,
+            "lambda_request_id": context.aws_request_id,
+            "llm_used": USE_LLM_ENRICHMENT,
+            "llm_model_id": BEDROCK_MODEL_ID if USE_LLM_ENRICHMENT else None,
+            "cycle_complete": True,
+        }
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=get_final_cycle_s3_key(cycle_started_at),
+            Body=json.dumps(merged),
+            ContentType="application/json",
+        )
 
     return {
         "statusCode": 200,
         "body": json.dumps({
-            "s3_key": s3_key,
-            "article_count": len(all_articles),
-            "markets_queried": len(open_markets),
-            "markets_failed": len(markets_failed),
+            "batch_key": batch_key,
+            "batch_offset": offset,
+            "batch_size": len(batch),
+            "batch_article_count": len(batch_articles),
+            "markets_queried": total_markets,
+            "cycle_complete": cycle_complete,
             "llm_used": USE_LLM_ENRICHMENT,
         }),
     }

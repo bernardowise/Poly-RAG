@@ -63,10 +63,12 @@ resource "aws_lambda_function" "ingest_news" {
   role          = aws_iam_role.ingest_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  # 300s (up from 60s): per-market Google News search + URL decode + article
-  # extraction across up to ~230 open markets, sequential (see handler
-  # module docstring).
-  timeout     = 300
+  # 900s (Lambda's hard maximum): measured ~21s/market end-to-end (search +
+  # decode + extract). Each invocation only processes one BATCH_SIZE=35
+  # batch (~735s worst case) then self-invokes for the next batch (see
+  # handler module docstring) -- 900s gives margin over the 735s estimate
+  # for Bedrock enrichment + S3 I/O on top.
+  timeout     = 900
   memory_size = 512
 
   filename         = data.archive_file.ingest_news.output_path

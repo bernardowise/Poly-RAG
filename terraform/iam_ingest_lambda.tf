@@ -89,6 +89,16 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
     ]
     resources = ["*"]
   }
+
+  statement {
+    # ingest_news self-invokes to process the open-market registry in
+    # batches (see tech_debt.md "News Source Redesign" update -- ~228
+    # markets at ~21s each cannot fit in one invocation under Lambda's 900s
+    # hard maximum). Scoped to itself only, not "*".
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.ingest_news.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "ingest_lambda_permissions" {

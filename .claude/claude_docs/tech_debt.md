@@ -588,3 +588,75 @@ in the Lambda zip, not currently used by any handler) are the remaining implemen
 **Revisit if:** Google blocks/breaks the RSS endpoint in practice (see ToS exception note
 above), or extraction success rate turns out too low to be useful (not yet measured against
 the full market_id set).
+
+**Update (2026-08-16): implemented, and hit a real scale wall in production.** Deployed with
+trafilatura's DOWNLOAD_TIMEOUT lowered from its 30s default to 8s (production observed a
+single slow/blocked outlet, e.g. washingtonpost.com, eating a full 30s before failing, which
+compounds badly across ~230 markets x up to 5 candidates each). Even with the 8s fix, 3
+consecutive real invocations still hit the Lambda's 300s timeout, and worse -- each timeout's
+automatic retry restarted from market #1 with no memory of prior progress, re-processing (and
+re-failing against) the exact same blocked URLs each time.
+
+**Root cause, measured, not assumed:** timed 3 real markets end-to-end (search + decode +
+extract) locally against the real registry and real network: 23.7s, 24.1s, 14.9s -- averaging
+~21s/market. At that rate, 228 markets is ~4,800s (80 minutes) of sequential work, which
+cannot fit in a single invocation under ANY Lambda timeout setting, since AWS Lambda's hard
+maximum is 900s (15 min). This was a structural capacity problem, not a tuning problem --
+raising the timeout further was never going to fix it.
+
+**Fix: self-chaining batched invocations with an offset checkpoint.** At ~21s/market, roughly
+35-40 markets fit safely within one invocation's time budget. The Lambda processes a batch
+starting at an `offset` passed in via the invocation event payload (defaults to 0 if absent —
+first invocation of a cycle), and if `offset + batch_size < total_open_markets`, it invokes
+itself asynchronously (`lambda.invoke(InvocationType="Event")`) with the next offset before
+returning, chaining until the full registry is covered each cycle.
+
+**Explicitly chosen over a DynamoDB-persisted checkpoint:** the offset lives only in the
+invocation chain itself, not in a table — simpler, no new schema, but means a broken chain
+(one invocation crashes without invoking the next) silently stops progress for that cycle with
+no automatic recovery, rather than resuming from stored state on the next trigger. Accepted for
+now given the chain is short (roughly 6-7 hops at ~35/batch for 228 markets) and each cycle
+starts a fresh chain from offset 0 regardless of how far the prior cycle's chain got.
+
+**Revisit if:** the chain proves unreliable in practice (silent stalls), or the registry grows
+large enough that a persisted, resumable checkpoint becomes worth the added complexity.
+
+**Update (2026-08-16): sequential chain replaced by parallel fan-out, same day as first deploy.**
+The first production run of the batched design showed each batch taking ~10-13 minutes real
+wall-clock time, projecting to ~1.5h for the full 7-batch sequential chain -- too slow. Redesigned
+mid-run: instead of each batch invoking only the next one, the first invocation (offset=0) fans
+out ALL remaining batch offsets at once via async `lambda.invoke()` calls, staggered by
+`DISPATCH_STAGGER_SECONDS = 3` between each dispatch (small gap to avoid a simultaneous burst
+against the same outlets/Google, without adding proxy/VPN infrastructure -- considered and
+rejected: no cheap way to rotate Lambda's egress IP per batch, NAT Gateway is a fixed IP and
+breaks the budget on its own, third-party rotating proxies add cost and an external dependency
+for what's really a request-concurrency concern, not an IP-identity one).
+
+**Shared-state race fixed by giving each batch its own S3 key.** Concurrent batches all
+read-modify-writing the SAME cycle payload key would race (last writer wins, earlier batches'
+articles silently lost) -- this is exactly why the sequential design used one shared key safely
+(only ever one writer at a time) but parallel fan-out cannot. Fix: each batch writes to its own
+key (`news/.../HH_batch<offset>.json`); a merge step (`merge_batch_payloads`) combines all
+per-batch files into the final cycle payload once every expected batch key exists. Whichever
+batch happens to finish last attempts the merge -- safe to attempt from multiple batches since
+merge is idempotent (overwrites the same final key with the same result).
+
+**Real-world snag during the mid-flight redesign:** the first 3 batches (offsets 0, 35, 70) had
+already started/finished under the OLD sequential code before the new parallel code was deployed
+(Lambda lets in-flight invocations finish on the version they started with -- deploying new code
+doesn't kill or affect a running invocation). Those 3 wrote directly to the shared cycle key
+(old behavior), not to individual `_batch<offset>.json` files, so the automatic merge (which
+expects every offset's own file) could never find batch files for 0/35/70 and would have hung
+forever waiting for files that would never exist. Manually merged around this one time: pulled
+the old shared payload (already containing offsets 0/35/70's articles) plus the 4 new
+`_batch105/140/175/210.json` files, combined and deduped by URL, uploaded as the final
+`news/2026-08-15/22.json`. This only affected mid-deploy transition -- every future cycle
+starts clean under the new code (all batches write per-batch files, all get merged
+automatically), no code change needed for steady state.
+
+**Verified result:** 228/228 markets processed, `cycle_complete: true`, 887 articles (0 URL
+duplicates despite offset=105 running twice -- once from the old code's stale self-invoke that
+fired after deploy, once from a manual dispatch -- dedup via `poly-rag-processed-urls` held).
+Parallel batches completed in 294s-611s each vs. ~600-800s each when sequential -- real wall-clock
+savings from not waiting on one batch to fully finish before the next starts, even though each
+individual batch's own duration didn't change.

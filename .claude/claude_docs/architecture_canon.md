@@ -39,15 +39,71 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
   la corrida, no el payload completo de mercados -- ver seccion siguiente)
 
 ### 2. News (`poly-rag-ingest-news`)
-- **Fuentes:** 10 feeds RSS curados (BBC World/Business, CBC Business/TopStories,
-  NYT World/Opinion/Technology, CNN TopStories/World, France24 English)
-- **Formato:** XML, parseado con `xml.etree.ElementTree` (sin dependencias externas)
-- **Resiliencia:** fallo por-feed aislado -- si uno cae, los otros 9 siguen
-- **Tagging:** ya no es por vertical -- cada articulo se etiqueta con `market_ids`
-  (puede ser [], uno, o varios) via AND-match contra `news_match_terms` de cada
-  market abierto en el registry. Todos los articulos se conservan (linkeados o
-  no) -- ver "Market Registry + Ingestion Redesign"
-- **Output:** `s3://poly-rag-369970405415/news/YYYY-MM-DD/HH.json`
+- **Rediseno 2026-08-16 (ver tech_debt.md, "News Source Redesign"):** reemplaza
+  por completo los 10 feeds RSS curados. Los feeds fijos quedaron obsoletos tras
+  auditar el linkeo real (367 articulos, solo 3 linkeados) y confirmar que el
+  root cause no era el matching sino el vocabulario -- el LLM generaba terminos
+  formales de Polymarket ("Federal Reserve") en vez de vocabulario periodistico
+  real ("Fed"). La seccion "News Feed Inventory" mas abajo en este documento
+  describe el diseno VIEJO y ya no aplica -- pendiente de removerse.
+- **Fuente:** Google News RSS (`news.google.com/rss/search?q=<question>`), una
+  busqueda por cada market abierto en el registry, usando `question` TAL CUAL
+  como query (sin keywords generadas, sin LLM en este paso) -- delega el
+  problema de sinonimos/parafraseo al motor de relevancia de Google.
+- **Excepcion consciente de ToS:** el copyright de la respuesta de este endpoint
+  restringe uso a "personal feed reader... personal, non-commercial use" -- un
+  pipeline automatizado que alimenta un dataset almacenado esta fuera de ese
+  grant. Decision informada y explicita del usuario, documentada con el
+  paralelismo al caso Reddit en tech_debt.md.
+- **Pipeline de extraccion:** `googlenewsdecoder` resuelve el link ofuscado de
+  Google al URL real del articulo (sin headless browser); `trafilatura` extrae
+  el texto del cuerpo (`DOWNLOAD_TIMEOUT` bajado de 30s default a 8s tras medir
+  que un solo outlet bloqueado podia consumir 30s antes de fallar). Articulos
+  que fallan extraccion se DESCARTAN, no caen a fallback de titulo-only -- el
+  top 5 por market debe ser cobertura completa, no parcial.
+- **Dedup:** por URL exacta (no por similitud de evento), tabla DynamoDB
+  `poly-rag-processed-urls` (hash key `url`), sin TTL -- pay-per-request no
+  cobra por storage ocioso, y el contenido extraido vive permanente en S3 de
+  cualquier forma.
+- **Batching (fan-out paralelo, revisado 2026-08-16 mismo dia que el primer
+  deploy):** ~21s/market medido end-to-end (search + decode + extract) hace
+  que los ~228 markets del registry (~80 min secuenciales) no quepan en una
+  sola invocacion bajo el maximo duro de Lambda (900s). La Lambda procesa en
+  batches de 35 markets (`BATCH_SIZE`). El diseno original era self-chaining
+  (cada batch invoca solo al siguiente) pero la primera corrida real mostro
+  ~10-13 min por batch, proyectando ~1.5h para los 7 batches secuenciales --
+  demasiado lento. Cambiado a fan-out: la primera invocacion (offset=0)
+  dispara TODOS los batches restantes de una vez via `lambda.invoke()`
+  asincrono, escalonados `DISPATCH_STAGGER_SECONDS=3` entre cada uno (evita
+  un burst simultaneo contra los mismos outlets/Google, sin meter
+  infraestructura de proxy/VPN -- evaluado y descartado: no hay forma barata
+  de rotar la IP de salida de Lambda por batch, NAT Gateway es una IP fija y
+  rompe el budget por si solo, proxies rotativos de terceros agregan costo y
+  dependencia externa para lo que en realidad es un tema de concurrencia de
+  requests, no de identidad de IP). Cada batch escribe a su PROPIO S3 key
+  (`_batch<offset>.json`, no un key compartido -- escritura concurrente al
+  mismo key competiria y perderia datos del batch que no gano la carrera) y
+  un paso de merge (`merge_batch_payloads`, idempotente) combina todos los
+  archivos por-batch en el payload final una vez que todos existen. Sin
+  checkpoint persistido -- el offset vive solo en el payload de cada invoke.
+  Timeout 900s, memory 512MB, `lambda:InvokeFunction` scoped a su propio ARN.
+- **Tagging:** cada articulo se etiqueta con `market_ids` (puede ser [], uno, o
+  varios) segun a que busqueda de market perteneciera. Todos los articulos
+  extraidos exitosamente se conservan.
+- **Output:** `s3://poly-rag-369970405415/news/YYYY-MM-DD/HH.json`, schema
+  version v3 (payload de ciclo completo, merge de los `_batch<offset>.json`
+  intermedios una vez `cycle_complete: true`; los archivos intermedios se
+  borran despues del merge, no persisten)
+- **Verificado en produccion (2026-08-16):** primer ciclo completo end-to-end:
+  228/228 markets procesados, `cycle_complete: true`, 887 articulos, 0
+  duplicados de URL pese a que offset=105 corrio dos veces durante la
+  transicion de codigo secuencial a paralelo (dedup via
+  `poly-rag-processed-urls` sostuvo). Batches paralelos completaron en
+  294s-611s cada uno vs. ~600-800s secuenciales -- ahorro real de tiempo de
+  reloj por no esperar a que un batch termine del todo antes de arrancar el
+  siguiente. Ver tech_debt.md ("News Source Redesign" update) para la
+  narrativa completa, incluyendo el merge manual unico requerido por la
+  transicion mid-deploy (no aplica a corridas futuras).
 
 ### 3. Bluesky (`poly-rag-ingest-bluesky`)
 - **API:** AT Protocol, endpoint `app.bsky.feed.searchPosts`
