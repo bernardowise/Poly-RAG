@@ -30,10 +30,32 @@ resource "aws_lambda_function" "ingest_polymarket" {
   }
 }
 
+# ingest_news needs external dependencies (trafilatura, googlenewsdecoder --
+# see tech_debt.md "News Source Redesign") that aren't preinstalled in the
+# Lambda runtime like boto3 is, so its zip must include them. pip install
+# runs into a staging dir before archive_file zips it -- triggered on every
+# apply whose handler.py content changed (the hash keeps this from
+# re-running needlessly).
+resource "null_resource" "ingest_news_deps" {
+  triggers = {
+    handler_hash = filesha256("${path.module}/../lambdas/ingest_news/handler.py")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      rm -rf ${path.module}/build/ingest_news_pkg
+      mkdir -p ${path.module}/build/ingest_news_pkg
+      cp ${path.module}/../lambdas/ingest_news/handler.py ${path.module}/build/ingest_news_pkg/
+      pip install -q --target ${path.module}/build/ingest_news_pkg trafilatura googlenewsdecoder
+    EOT
+  }
+}
+
 data "archive_file" "ingest_news" {
   type        = "zip"
-  source_file = "${path.module}/../lambdas/ingest_news/handler.py"
+  source_dir  = "${path.module}/build/ingest_news_pkg"
   output_path = "${path.module}/build/ingest_news.zip"
+  depends_on  = [null_resource.ingest_news_deps]
 }
 
 resource "aws_lambda_function" "ingest_news" {
@@ -41,20 +63,27 @@ resource "aws_lambda_function" "ingest_news" {
   role          = aws_iam_role.ingest_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  timeout       = 60
-  memory_size   = 256
+  # 300s (up from 60s): per-market Google News search + URL decode + article
+  # extraction across up to ~230 open markets, sequential (see handler
+  # module docstring).
+  timeout     = 300
+  memory_size = 512
 
   filename         = data.archive_file.ingest_news.output_path
   source_code_hash = data.archive_file.ingest_news.output_base64sha256
 
   environment {
     variables = {
-      S3_BUCKET          = aws_s3_bucket.poly_rag_data.bucket
-      METRICS_TABLE      = aws_dynamodb_table.architecture_metrics.name
-      BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      USE_LLM_ENRICHMENT = "true"
+      S3_BUCKET            = aws_s3_bucket.poly_rag_data.bucket
+      METRICS_TABLE        = aws_dynamodb_table.architecture_metrics.name
+      REGISTRY_TABLE       = aws_dynamodb_table.market_registry.name
+      PROCESSED_URLS_TABLE = aws_dynamodb_table.processed_urls.name
+      BEDROCK_MODEL_ID     = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      USE_LLM_ENRICHMENT   = "true"
     }
   }
+
+  depends_on = [null_resource.ingest_news_deps]
 }
 
 data "archive_file" "ingest_bluesky" {
@@ -68,8 +97,12 @@ resource "aws_lambda_function" "ingest_bluesky" {
   role          = aws_iam_role.ingest_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  timeout       = 60
-  memory_size   = 256
+  # 600s (up from 60s): the redesigned pipeline queries searchPosts once per
+  # open market in the registry (full coverage, not a top-N subset -- see
+  # handler module docstring), which is 500+ sequential external HTTP calls
+  # per cycle instead of the old 3 fixed vertical queries.
+  timeout     = 600
+  memory_size = 256
 
   filename         = data.archive_file.ingest_bluesky.output_path
   source_code_hash = data.archive_file.ingest_bluesky.output_base64sha256
@@ -78,6 +111,7 @@ resource "aws_lambda_function" "ingest_bluesky" {
     variables = {
       S3_BUCKET          = aws_s3_bucket.poly_rag_data.bucket
       METRICS_TABLE      = aws_dynamodb_table.architecture_metrics.name
+      REGISTRY_TABLE     = aws_dynamodb_table.market_registry.name
       BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
       USE_LLM_ENRICHMENT = "true"
       # BLUESKY_HANDLE and BLUESKY_APP_PASSWORD are set manually via CLI/console,

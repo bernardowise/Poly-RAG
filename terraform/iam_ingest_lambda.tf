@@ -62,6 +62,15 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
   }
 
   statement {
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+    ]
+    resources = [aws_dynamodb_table.processed_urls.arn]
+  }
+
+  statement {
     effect  = "Allow"
     actions = ["bedrock:InvokeModel"]
     resources = [

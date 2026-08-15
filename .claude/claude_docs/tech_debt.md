@@ -501,3 +501,90 @@ setting up secure credential access in a remote-isolated agent environment — e
 `isolation: "remote"` Agent option and/or the `schedule` skill (cron-based cloud agents) at
 that point, rather than defaulting to "just leave the Codespace running overnight," which
 defeats the cost-discipline principle in CLAUDE.md if left unattended repeatedly.
+
+---
+
+## News Source Redesign: Google News RSS Replaces the 10 Curated Feeds (Conscious ToS Exception)
+
+**Issue (raised 2026-08-15):** Auditing real News linkage results (367 articles, only 3 linked
+to any tracked market via AND-match) revealed the root cause was NOT a broken matching
+mechanism — it was that the LLM-generated `news_match_terms` used Polymarket's formal contract
+language ("Federal Reserve", "President of Russia") instead of how journalism actually refers
+to these entities ("Fed", "Putin"). Confirmed empirically: searching the day's real articles
+for "federal reserve" (exact) returned 0 matches; "fed " returned 1; "putin" alone returned 2,
+but the market's required second AND term ("President of Russia") never appeared verbatim
+anywhere. Root cause: the classification prompt only receives a market's `question` field (one
+short formal sentence) as its only source text — with that narrow a "nanocorpus," the LLM has
+no way to infer real-world journalistic vocabulary, it can only paraphrase the formal wording
+it was given.
+
+**Decision:** replace the 10 fixed curated RSS feeds (BBC, CBC, NYT, CNN, France24) with
+targeted Google News RSS searches (`news.google.com/rss/search?q=<query>`), one per tracked
+market, using the market's own `question` text directly as the search query — Google's own
+search relevance engine handles the synonym/paraphrase problem instead of a hand-tuned
+AND-term list.
+
+**Conscious ToS exception (per CLAUDE.md's own "check ToS before investing implementation
+time" discipline, established after the Reddit rejection — see that entry above):** the
+endpoint's own response copyright is explicit: *"made available solely for the purpose of
+rendering Google News results within a personal feed reader for personal, non-commercial
+use. Any other use of the feed is expressly prohibited."* An automated, scheduled Lambda
+pipeline feeding a stored dataset does not fit "personal feed reader" — this is knowingly
+outside the license grant, unlike Bluesky (no prohibition existed) or GDELT (explicit
+unrestricted commercial/research grant, verified directly from gdeltproject.org/about.html).
+User made this choice explicitly and consciously after being shown the Reddit-parallel risk:
+undocumented endpoint, no API contract, could break/block without notice at any time. Revisit
+if the endpoint breaks or Google enforces the restriction in practice.
+
+**GDELT evaluated and available as a ToS-clean alternative, not chosen for now:** confirmed
+working (real recent articles returned, e.g. seendate 2026-07-30) and explicitly licensed
+("available for unlimited and unrestricted use for any academic, commercial, or governmental
+use of any kind without fee," gdeltproject.org/about.html Terms of Use) but has an aggressive
+rate limit (429 "one request per 5 seconds" that in practice held even after 20-40s waits
+during testing — possibly a shared-IP-range limit affecting the whole Codespace network path,
+not just per-caller) that would need real handling (backoff, or GDELT's own suggested ngrams
+bulk dataset for high-traffic use) before it's viable at ~200+ queries/cycle. Also
+investigated and ruled out: Brave Search API (ToS explicitly bans AI/RAG training use, same
+category of mistake as Reddit), Bing/Azure Search (fully retired Aug 2025), DuckDuckGo (no
+real search API, only unauthorized HTML scraping), Google Custom Search JSON API (closed to
+new signups since 2025), NewsAPI.org (free tier explicitly bans production use regardless of
+volume), SerpApi/Serper (Google-scraping-as-a-service, live but under contested litigation).
+
+**Content extraction pipeline (new complexity, not previously needed with plain RSS):**
+1. Google News RSS `<link>`/`<description>` fields only contain an obfuscated Google redirect
+   URL (`news.google.com/rss/articles/CBMi...`), not the real article URL or any article text
+   — confirmed via `curl -I -L`, the redirect resolves to a client-side JS splash page
+   (`content-length: 0`), not a simple HTTP 3xx to the real source.
+2. **`googlenewsdecoder`** (PyPI package) decodes the obfuscated URL to the real source URL
+   without needing a headless browser — verified working against a real link, resolved to the
+   actual `reuters.com` article URL.
+3. **`trafilatura`** (PyPI package) extracts clean article body text from the real URL's HTML.
+   Confirmed real-world limitation: large outlets (verified with Reuters) return `401` even
+   with a browser User-Agent — anti-scraping/paywall blocking, not a trafilatura bug. Handled
+   by design, not worked around: articles that fail extraction fall back to title+source only
+   (never dropped entirely), same graceful-degradation principle already used elsewhere
+   (send_digest's "no summary available" pattern). Some outlets WILL succeed (smaller/regional
+   sites, aggregators that republish wire content) and that's accepted as sufficient —
+   see next point for why redundant coverage of the same story makes this fine.
+4. **Dedup by exact URL, not by story/event similarity.** User's framing: Google News keeps
+   showing the same article across multiple days of RSS results, and the SAME underlying event
+   is often covered by multiple outlets (e.g. NYT paywalled + a regional outlet that
+   republishes/cites the same wire story) — so blocking on "extract every outlet" is
+   unnecessary; extracting whichever outlets are actually reachable is sufficient signal, as
+   long as the same exact URL is never re-processed across cycles. A new DynamoDB table
+   (`poly-rag-processed-urls`, hash key = URL) records every URL once successfully handled.
+   **No TTL** — considered and explicitly rejected: DynamoDB pay-per-request charges by
+   operation, not by idle storage of small items, so there's no real cost pressure to expire
+   entries, and permanent dedup is simpler to reason about than picking an arbitrary "safe"
+   expiry window. The underlying article content itself is NOT affected by this table either
+   way — that's permanently retained in the existing S3 `news/YYYY-MM-DD/HH.json` payloads,
+   which have no TTL and never did.
+
+**Status:** design closed 2026-08-15, not yet implemented — Terraform (new DynamoDB table),
+`ingest_news` handler rewrite (per-market Google News queries instead of the 10 fixed feeds,
+decode + extract + dedup pipeline), and dependency packaging (googlenewsdecoder + trafilatura
+in the Lambda zip, not currently used by any handler) are the remaining implementation steps.
+
+**Revisit if:** Google blocks/breaks the RSS endpoint in practice (see ToS exception note
+above), or extraction success rate turns out too low to be useful (not yet measured against
+the full market_id set).

@@ -5,7 +5,7 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-14
+Ultima actualizacion: 2026-08-15
 
 ---
 
@@ -15,6 +15,12 @@ Tres Lambdas independientes, no un orquestador unico -- una falla en una fuente 
 tumba las otras dos, y los reintentos no desperdician PUT requests de las fuentes
 que si funcionaron.
 
+**Rediseno 2026-08-15 (ver tech_debt.md, "Ingestion Redesign"):** el filtro estatico
+de 3 verticales por keyword (Macro/Geopolitica/Regulatorio-Tech) fue reemplazado por
+completo. Ver seccion "Market Registry + Ingestion Redesign" mas abajo para el
+diseno vigente -- esta seccion documenta solo el "shape" fisico de cada Lambda
+(API, formato, resiliencia), no la logica de filtrado/tagging, que cambio.
+
 **Metadata de linaje (agregado 2026-08-14):** cada JSON escrito a S3 lleva un bloque
 `metadata` con `schema_version`, `lambda_name`, `lambda_request_id` (para rastrear el
 archivo de vuelta a su ejecucion exacta en CloudWatch Logs), `llm_used` + `llm_model_id`,
@@ -23,18 +29,24 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
 
 ### 1. Polymarket (`poly-rag-ingest-polymarket`)
 - **API:** Gamma API (`gamma-api.polymarket.com`), REST/JSON, sin auth
-- **Filtro:** `active=true`, top 100 ordenado por volumen
-- **Tagging:** por vertical via keyword match con word-boundary regex, mas
-  exclusion explicita de mercados deportivos (ver `SPORTS_EXCLUSION_PATTERNS`
-  en el handler)
-- **Output:** `s3://poly-rag-369970405415/polymarket/YYYY-MM-DD/HH.json`
+- **Filtro:** `active=true`, top 500 ordenado por `volume24hr` (no `volume` total --
+  volume24hr refleja actividad reciente, volume total favorece mercados viejos/muertos)
+- **Filtrado/tagging:** ya no es keyword-match -- ver "Market Registry + Ingestion
+  Redesign" mas abajo
+- **Timeout:** 600s (subido de 60s -- el ciclo paginado + hasta ~25 llamadas Bedrock
+  secuenciales necesita mas margen, especialmente en corridas de bootstrap)
+- **Output:** `s3://poly-rag-369970405415/polymarket/YYYY-MM-DD/HH.json` (resumen de
+  la corrida, no el payload completo de mercados -- ver seccion siguiente)
 
 ### 2. News (`poly-rag-ingest-news`)
 - **Fuentes:** 10 feeds RSS curados (BBC World/Business, CBC Business/TopStories,
   NYT World/Opinion/Technology, CNN TopStories/World, France24 English)
 - **Formato:** XML, parseado con `xml.etree.ElementTree` (sin dependencias externas)
 - **Resiliencia:** fallo por-feed aislado -- si uno cae, los otros 9 siguen
-- **Tagging:** mismo esquema de keywords por vertical que Polymarket
+- **Tagging:** ya no es por vertical -- cada articulo se etiqueta con `market_ids`
+  (puede ser [], uno, o varios) via AND-match contra `news_match_terms` de cada
+  market abierto en el registry. Todos los articulos se conservan (linkeados o
+  no) -- ver "Market Registry + Ingestion Redesign"
 - **Output:** `s3://poly-rag-369970405415/news/YYYY-MM-DD/HH.json`
 
 ### 3. Bluesky (`poly-rag-ingest-bluesky`)
@@ -44,8 +56,14 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
 - **Endpoint correcto:** `bsky.social` (el PDS) para AMBOS createSession y
   searchPosts -- `public.api.bsky.app` devuelve 403 en searchPosts especificamente
   aunque otros endpoints de lectura ahi si funcionan
-- **Query strategy:** una busqueda por vertical (1 keyword representativa cada
-  una), no un filtro OR multi-keyword como Polymarket/News -- limitacion de la API
+- **Query strategy:** ya no son 3 queries fijas por vertical -- una busqueda
+  searchPosts por CADA market abierto en el registry (cobertura completa, no un
+  top-N), usando el `search_query` de ese market. Retry/backoff en 429 (rate
+  limit no medido empiricamente a este volumen, se prefiere backoff sobre
+  adivinar un N seguro)
+- **Timeout:** 600s (subido de 60s -- 500+ llamadas HTTP secuenciales externas)
+- **Escala real observada (2026-08-15):** 492 markets consultados, 689 posts,
+  0 fallos, 83s de duracion real -- muy por debajo del timeout, sin rate limiting
 - **Output:** `s3://poly-rag-369970405415/bluesky/YYYY-MM-DD/HH.json`
 
 **Reemplaza a:** Reddit (descartado -- su Responsible Builder Policy prohibe uso
@@ -68,59 +86,106 @@ Truth Social (sin API publica para individuos).
 
 ---
 
-## Vertical Taxonomy
+## Market Registry + Ingestion Redesign (vigente desde 2026-08-15)
 
-Poly-RAG no ingiere todos los mercados/noticias indiscriminadamente. Se filtran y
-etiquetan al momento de ingestion en 3 verticales, elegidas por alta volatilidad,
-abundante texto correlacionable en la web, y reglas de resolucion estrictas --
-propiedades que las hacen buen material de RAG frente a mercados de pop-culture
-ruidosos que dependen de chisme y texto no estructurado.
+Reemplaza por completo el filtro estatico de 3 verticales por keyword (Macro/
+Geopolitica/Regulatorio-Tech). Razonamiento completo, incluyendo los datos reales
+de volume24hr que justificaron el cambio de N, en tech_debt.md ("Ingestion
+Redesign" entry) -- esta seccion documenta el diseno resultante, no el porque.
 
-**Arquitectura:** pipeline unico, dato etiquetado -- no storage fisicamente separado
-por vertical. Mercados/articulos frecuentemente abarcan mas de una vertical (ej. un
-mercado de regulacion de IA es tanto geopolitica como regulatorio-tech), asi que una
-separacion rigida forzaria clasificaciones arbitrarias y logica de filtrado duplicada
-3 veces. En cambio, cada item ingerido lleva un campo `verticals` (array -- un
-mercado/articulo puede pertenecer a mas de una), y tanto Polymarket como News caen en
-el mismo esquema de particion S3 (`s3://bucket/<source>/YYYY-MM-DD/HH.json`) sin
-importar la vertical.
+**El eje de filtrado correcto no es tema, es verificabilidad.** Un market pasa el
+filtro si su outcome se resuelve contra un registro publico citable (comunicado
+oficial, conteo certificado, precio de mercado) en vez de juicio humano sobre
+evidencia ambigua (rumores, disputas sin registro oficial). Bajo este eje, un
+mercado de deportes con marcador oficial es MAS verificable que uno de rumores de
+celebridades, aunque el filtro viejo excluia deportes por completo sin evaluar esto.
 
-Los filtros hacen match contra `question`/`description` de Polymarket y
-titulo/descripcion de articulos de noticias, con regex de word-boundary (no substring
-plano -- ver bug de "sec" matcheando "second" corregido 2026-08-13).
+### Market Registry (DynamoDB: `poly-rag-market-registry`)
 
-### 1. Macro / Central Banks
-Alta correlacion con noticias financieras; se mueve con decisiones de la Fed, datos
-de CPI, etc.
+Un item por `market_id`, actualizado in-place (metadata, cambia poco -- una vez al
+crearse, una vez al resolverse). Campos: `question`, `description`, `end_date`,
+`resolution_source`, `status` (open/resolved), `search_query`, `news_match_terms`,
+`first_seen`, `last_updated`, `resolution_date`, `final_outcome`.
 
-Keywords: `fed`, `federal reserve`, `interest rate`, `inflation`, `cpi`,
-`unemployment`, `recession`, `gdp`, `trump`, `truth social`
+**Poblado por `ingest_polymarket`:**
+1. Trae top 500 candidatos activos por `volume24hr`
+2. Diffea contra el registry -- solo los ids genuinamente nuevos pasan por el LLM
+   (costo escala con tasa de aparicion de ids nuevos, no con N -- ver tech_debt.md)
+3. Llamada batched a Bedrock (20 markets/batch) que devuelve, por market: el
+   veredicto de verificabilidad Y dos representaciones de busqueda derivadas (ver
+   abajo) -- un solo llamado LLM, sin costo adicional de Bedrock
+4. Solo los verificables entran al registry; el resto se descarta
+5. Ids que estaban `open` pero ya no aparecen en el top-500: se consulta
+   `markets/{id}` directo en la Gamma API para capturar `closed` + outcome real
+   (no se infiere resolucion por ausencia)
 
-Nota: Trump/Truth Social incluidos aqui (y cross-tagged en geopolitica) porque sus
-posts mueven mercados directo y rapido -- aranceles, nominaciones de la Fed, etc. --
-no solo como figura politica sino como fuente de noticias que mueve mercados por si
-misma.
+**Dos representaciones de busqueda, no una (correccion 2026-08-15, mismo dia):**
+un primer intento con keywords sueltas (ej. `["Elon Musk", "tweets", "August
+2026"]`) perdia senal si se buscaban por separado. News y Bluesky matchean texto
+de formas distintas, asi que se generan dos campos en el mismo llamado LLM:
+- **`search_query`** (string combinado de texto libre): para Bluesky's searchPosts,
+  que acepta queries estilo motor de busqueda
+- **`news_match_terms`** (lista corta de 1-3 frases distintivas): para News, que
+  no tiene API de busqueda -- descarga el texto RSS completo y hace grep, asi que
+  el match requiere logica AND (todos los terminos deben co-ocurrir en el mismo
+  articulo) contra terminos suficientemente especificos
 
-### 2. Geopolitics / Elections
-Alta volatilidad por eventos de noticias en tiempo real -- un tweet o declaracion
-diplomatica puede mover precios bruscamente.
+**Auditoria (Bronze layer):** el prompt completo y la respuesta cruda del LLM se
+imprimen a CloudWatch Logs, y las respuestas crudas se guardan tambien en
+`metadata.llm_raw_responses` del payload S3 -- permite re-inspeccionar exactamente
+que dijo el modelo si un item del registry se ve mal clasificado.
 
-Keywords: `election`, `president`, `war`, `ceasefire`, `sanctions`, `tariff`, `nato`,
-`invasion`, `trump`, `putin`, `xi`, `ukraine`, `taiwan`, `china`
+**Robustez:** un batch con JSON malformado/truncado (max_tokens insuficiente,
+observado en produccion) se salta sin tumbar la Lambda completa -- esos markets
+simplemente se re-evaluan el siguiente ciclo (siguen siendo "nuevos" mientras no
+entren al registry).
 
-### 3. Regulatory / Tech
-Nicho especialista -- reglas de resolucion largas y tecnicas (estatus de ensayos FDA,
-progreso de casos antitrust) donde el valor de resumen de un RAG es mas alto.
+### Odds Time-Series (S3: `odds/<market_id>.json`)
 
-Keywords: `fda`, `antitrust`, `lawsuit`, `sec`, `regulation`, `approval`, `ban`,
-`ai regulation`, `google`, `apple`, `meta`, `openai`, `anthropic`, `spacex`
+Append-only, un archivo por market, un snapshot agregado cada ciclo (nunca
+sobreescrito) -- esta ES la diferenciacion real del proyecto (self-built historical
+time-series). Cada snapshot: `timestamp`, `outcomePrices`, `volume`, `volume24hr`,
+`liquidity`. Read-modify-write por ciclo: lee el archivo existente (o inicia uno
+nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
+`s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
 
-### Out of scope
+### Linkeo News/Bluesky -> market_id (Layer 1, alta confianza)
 
-Mercados/articulos que no matchean ninguna vertical (pop culture, deportes, premios
-de entretenimiento, etc.) no se ingieren. Razon: pobre material de RAG -- la
-resolucion depende de chisme/criterio subjetivo, y hay poco texto estructurado y
-correlacionable en la web contra que hacer retrieval.
+- **News:** cada articulo se etiqueta con `market_ids` (array) via AND-match de
+  `news_match_terms` contra titulo+descripcion. Todos los articulos se conservan
+  en el payload, tengan o no market_ids -- no se descartan por falta de match.
+- **Bluesky:** un `searchPosts` por market abierto usando su `search_query`;
+  cada post resultante lleva `market_ids: [ese market]`.
+
+### Retrieval por Ventana Temporal (Layer 2, contextual -- `retrieval/time_window.py`)
+
+**Limitacion reconocida del linkeo explicito:** solo captura correlacion DIRECTA
+(el texto menciona literalmente los terminos del market). Una noticia ambiental
+("sentimiento cripto se deteriora") puede mover el precio de un market de Bitcoin
+sin nunca mencionarlo explicitamente -- nunca quedaria linkeada. Ver tech_debt.md,
+"Known Limitation: Explicit ID-Linkage", para el razonamiento completo.
+
+**Mitigacion (disponible ya, sin esperar a embeddings del Dia 4):** todo item de
+News/Bluesky ya lleva timestamp de ingesta sin importar si matcheo algun market.
+`retrieval/time_window.py` responde "que se ingirio en el mundo mientras este
+market se movia" via filtro de rango de fechas sobre el raw storage existente --
+cero ML, disponible hoy. Combina Layer 1 (linkeado, alta confianza, mostrado
+primero) con Layer 2 (ventana temporal completa, señal mas ruidosa pero real,
+contexto secundario). El ranking semantico DENTRO de esa ventana ruidosa (no el
+descubrimiento de la ventana en si) es trabajo del Dia 4 (RAG/embeddings).
+
+Verificado con datos reales (2026-08-15): para un market con 2 articulos
+linkeados, la ventana de 24h trajo 609 articulos + 839 posts adicionales sin
+linkear -- confirma que la mayoria de la senal ambiental se perderia sin esta
+segunda capa.
+
+### Verificado en produccion (2026-08-15)
+
+Bootstrap completo corrido y verificado directamente contra las tablas reales:
+505 markets trackeados en el registry, 505 archivos de odds en S3, 100% con el
+schema final (`search_query` + `news_match_terms` presentes en todos), 13 markets
+detectados como resueltos con `final_outcome` real capturado. News: 367 articulos,
+3 linkeados. Bluesky: 492 markets consultados, 689 posts, 0 fallos.
 
 ---
 
@@ -173,7 +238,7 @@ completo detras de esta decision.
 - **Toggle:** variable de entorno `USE_LLM_ENRICHMENT` (true/false) por Lambda,
   permite comparar con/sin LLM en la misma tabla de metricas
 
-**Costo real medido (2026-08-13/14):**
+**Costo real medido, filtro viejo por vertical (2026-08-13/14, pre-rediseno):**
 
 | Fuente | Items/corrida | Costo/corrida |
 |---|---|---|
@@ -183,22 +248,30 @@ completo detras de esta decision.
 
 Total ciclo completo: ~$0.018. Proyectado a cadencia de 12h: ~$1.10/mes.
 
+**Costo del bootstrap del rediseno (2026-08-15):** ~500 candidatos, ~25 llamadas
+Bedrock batched (20/batch), estimado ~$0.35-0.40 -- costo de arranque UNA VEZ, no
+recurrente. Costo de estado-estable (ciclos despues del bootstrap) escala con la
+tasa de aparicion de ids nuevos por ciclo, no con el tamano del pool candidato
+(500) -- ver tech_debt.md para el razonamiento. Aun no medido empiricamente cuantos
+ids nuevos aparecen por ciclo en la practica.
+
 ---
 
 ## Infrastructure Inventory
 
 | Recurso | Nombre | Proposito |
 |---|---|---|
-| S3 bucket | `poly-rag-369970405415` | Storage crudo, particionado `<source>/YYYY-MM-DD/HH.json` |
+| S3 bucket | `poly-rag-369970405415` | Storage crudo, particionado `<source>/YYYY-MM-DD/HH.json`, mas `odds/<market_id>.json` (serie de tiempo append-only) |
 | DynamoDB table | `poly-rag-architecture-metrics` | Costo/latencia/tokens por invocacion, pay-per-request |
-| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las 3 Lambdas, permisos minimos (S3 PutObject, DynamoDB PutItem, Bedrock InvokeModel scoped al modelo especifico) |
+| DynamoDB table | `poly-rag-market-registry` | Market registry (metadata + search_query + news_match_terms), pay-per-request, hash_key `market_id` -- agregada 2026-08-15 |
+| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las 3 Lambdas, permisos: S3 PutObject/GetObject/ListBucket (ListBucket agregado 2026-08-15 -- sin el, GetObject sobre una key inexistente devuelve AccessDenied opaco en vez de NoSuchKey, rompiendo el patron read-modify-write de odds), DynamoDB PutItem en metrics + GetItem/PutItem/UpdateItem/Scan/Query en el registry, Bedrock InvokeModel scoped al modelo especifico |
 | IAM policy | `PolyRAG-BudgetBreach-Deny` | Guardrail: bloquea Bedrock/Lambda/S3-writes/DynamoDB-writes si el gasto cruza budget de $10 |
 | IAM role | `PolyRAG-BudgetsActionRole` | Permite a AWS Budgets adjuntar la Deny policy automaticamente |
 | AWS Budget | $5/mes | Alertas en 20% ($1) y 100% ($5) |
 | AWS Budget | $10 | Threshold del guardrail Deny automatico |
-| EventBridge rule | `poly-rag-ingest-polymarket-schedule` | Cron `0 0,12 * * ? *` (00:00 y 12:00 UTC), target: Lambda de Polymarket |
-| EventBridge rule | `poly-rag-ingest-news-schedule` | Mismo cron, target: Lambda de News |
-| EventBridge rule | `poly-rag-ingest-bluesky-schedule` | Mismo cron, target: Lambda de Bluesky |
+| EventBridge rule | `poly-rag-ingest-polymarket-schedule` | Cron `0 0,12 * * ? *` (00:00 y 12:00 UTC), target: Lambda de Polymarket (timeout 600s desde 2026-08-15) |
+| EventBridge rule | `poly-rag-ingest-news-schedule` | Mismo cron, target: Lambda de News (timeout 60s, sin cambio) |
+| EventBridge rule | `poly-rag-ingest-bluesky-schedule` | Mismo cron, target: Lambda de Bluesky (timeout 600s desde 2026-08-15 -- 500+ llamadas HTTP externas por ciclo) |
 
 **Region:** us-east-1 (N. Virginia) exclusivamente -- consistencia obligatoria,
 Bedrock model access y otros recursos son regionales.
@@ -238,9 +311,21 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
 
 ## Pendiente para completar el ciclo de ingestion
 
-- Confirmacion de CloudWatch Logs en corridas automaticas (primera ejecucion via
-  EventBridge aun no observada -- las pruebas hasta ahora fueron invocacion manual)
+- Confirmado (2026-08-15): las 4 Lambdas corren solas via EventBridge -- el ciclo
+  automatico de las 12:00 UTC del 15 corrio sin intervencion manual
 - Cierre del trial LLM-en-ingestion (3-4 dias de datos, ver seccion LLM Enrichment)
+  -- el rediseno de ingestion hace que el LLM ahora sea el filtro de calidad mismo,
+  no solo un resumen opcional, lo cual refuerza el caso para mantenerlo
+- Medir en la practica la tasa real de ids nuevos por ciclo (determina el costo de
+  estado-estable real, ver seccion "Market Registry + Ingestion Redesign")
+- `odds_old_2026-08-15/` en S3: 700 archivos del bootstrap con schema obsoleto
+  (keywords en vez de search_query/news_match_terms), movidos ahi en vez de
+  borrados -- desechar oficialmente en unos dias una vez confirmada la calidad
+  del nuevo bootstrap
+- Explorar paginacion `/markets/keyset` de la Gamma API para conocer el tamano
+  real del universo de mercados activos (hoy solo se confirmo un piso de ~2,100
+  via offset, que se cae mas alla de eso)
 
-Ver sprint_plan.md (gerdau/) para el resto del roadmap (Databricks Dia 3, RAG
-retrieval Dia 4, synthesis agent Dia 5).
+Ver sprint_plan.md (gerdau/) para el resto del roadmap (Databricks Dia 3 --
+Delta Lake/Unity Catalog aun no iniciados, RAG retrieval Dia 4, synthesis agent
+Dia 5).

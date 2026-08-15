@@ -1,10 +1,21 @@
 """
 Poly-RAG ingestion Lambda: Bluesky (AT Protocol).
 
-Queries app.bsky.feed.searchPosts once per vertical using a representative keyword,
-tags results by vertical, optionally enriches with a Bedrock/Claude summary (Opcion 1
-trial per CLAUDE.md Development Conventions), writes a single batched JSON to S3,
-and records cost/latency metrics to DynamoDB.
+Redesigned 2026-08-15 (see tech_debt.md, "Ingestion Redesign" entry) alongside
+ingest_polymarket/ingest_news. Replaces the 3 static VERTICAL_QUERIES with one
+searchPosts call per open market in the registry, using that market's
+search_query (a combined free-text string produced by the verifiability-
+classification LLM call in ingest_polymarket -- see that handler's module
+docstring for why this differs from news_match_terms).
+
+Full registry coverage (not a top-N subset): News can cheaply grep all 500+
+markets' terms against its own downloaded text, but Bluesky's searchPosts is
+an external HTTP call per market, so covering the whole registry means many
+more sequential requests than the old 3-query design. Handles this with
+retry/backoff on rate-limit responses (429) rather than truncating coverage
+to an arbitrary top-N -- since Bluesky's actual rate limit for this app
+password has not been empirically measured yet, backoff is the honest
+approach instead of guessing a safe N.
 
 NOTE: searchPosts requires authentication as of 2026-08-13 (confirmed by direct
 reproduction -- returns 403 unauthenticated even though other read endpoints like
@@ -18,7 +29,6 @@ tech_debt.md for why Reddit/X/Truth Social were rejected in favor of Bluesky.
 
 import json
 import os
-import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -30,6 +40,7 @@ import urllib.error
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
+REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
 BLUESKY_HANDLE = os.environ.get("BLUESKY_HANDLE")
@@ -41,20 +52,41 @@ BLUESKY_PDS_URL = "https://bsky.social"
 # endpoint even with a valid Bearer token (confirmed 2026-08-14).
 BLUESKY_SEARCH_URL = "https://bsky.social/xrpc/app.bsky.feed.searchPosts"
 
-# One representative search query per vertical (searchPosts is a single-keyword-per-call
-# API, not a multi-keyword OR filter like our regex approach for Polymarket/News) --
-# so verticals here are queried directly rather than tagged post-hoc.
-VERTICAL_QUERIES = {
-    "macro": "Federal Reserve inflation",
-    "geopolitics": "Ukraine election Trump",
-    "regulatory_tech": "FDA antitrust AI regulation",
-}
-
 RESULTS_PER_QUERY = 25
+MAX_RETRIES = 3
+BASE_BACKOFF_SECONDS = 2
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
+
+
+def get_open_markets_search_queries(table):
+    """Scans the registry for open markets and their search_query. Same
+    small-table scan approach as the other 2 ingestion Lambdas -- revisit
+    if the registry grows large enough for this to matter."""
+    markets = []
+    resp = table.scan(
+        FilterExpression="#s = :open",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":open": "open"},
+        ProjectionExpression="market_id, search_query",
+    )
+    markets.extend(resp.get("Items", []))
+    while "LastEvaluatedKey" in resp:
+        resp = table.scan(
+            FilterExpression="#s = :open",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":open": "open"},
+            ProjectionExpression="market_id, search_query",
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        markets.extend(resp.get("Items", []))
+    return [
+        (m["market_id"], m["search_query"])
+        for m in markets
+        if m.get("search_query")
+    ]
 
 
 def create_session():
@@ -80,6 +112,10 @@ def create_session():
 
 
 def search_posts(query, access_jwt, limit=RESULTS_PER_QUERY):
+    """Calls searchPosts with retry/backoff on 429 (rate limit). Bluesky's
+    actual rate limit for this app password hasn't been empirically measured
+    at this call volume (500+ sequential requests/cycle), so backoff is used
+    instead of guessing a safe request rate upfront."""
     params = urllib.parse.urlencode({"q": query, "limit": limit, "sort": "top"})
     url = f"{BLUESKY_SEARCH_URL}?{params}"
     req = urllib.request.Request(
@@ -89,11 +125,21 @@ def search_posts(query, access_jwt, limit=RESULTS_PER_QUERY):
             "Authorization": f"Bearer {access_jwt}",
         },
     )
-    with urllib.request.urlopen(req, timeout=10) as response:
-        return json.loads(response.read().decode())
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES:
+                backoff = BASE_BACKOFF_SECONDS * (2 ** attempt)
+                print(f"[search_posts] rate limited (429), retrying in {backoff}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(backoff)
+                continue
+            raise
 
 
-def extract_posts(search_response, vertical):
+def extract_posts(search_response, market_id):
     posts = []
     for item in search_response.get("posts", []):
         record = item.get("record", {})
@@ -107,21 +153,21 @@ def extract_posts(search_response, vertical):
             "created_at": record.get("createdAt"),
             "like_count": item.get("likeCount", 0),
             "repost_count": item.get("repostCount", 0),
-            "verticals": [vertical],
+            "market_ids": [market_id],
         })
     return posts
 
 
 def enrich_with_bedrock(posts_batch):
     """
-    Single Bedrock call summarizing up to 20 posts across all verticals --
-    keeps token cost bounded regardless of total post count fetched.
+    Single Bedrock call summarizing up to 20 posts -- keeps token cost
+    bounded regardless of total post count fetched.
     """
-    sample = "\n".join(f"- [{p['verticals'][0]}] {p['text'][:200]}" for p in posts_batch[:20])
+    sample = "\n".join(f"- {p['text'][:200]}" for p in posts_batch[:20])
     prompt = (
-        "Below are Bluesky posts tagged by vertical (macro/central-bank, "
-        "geopolitics, regulatory/tech). In 3-5 bullet points, summarize the "
-        "dominant sentiment and themes relevant to prediction market research.\n\n"
+        "Below are Bluesky posts related to active prediction markets. In "
+        "3-5 bullet points, summarize the dominant sentiment and themes "
+        "relevant to prediction market research.\n\n"
         + sample
     )
 
@@ -169,6 +215,9 @@ def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_pro
 
 
 def lambda_handler(event, context):
+    registry_table = dynamodb.Table(REGISTRY_TABLE)
+    market_queries = get_open_markets_search_queries(registry_table)
+
     fetch_start = time.time()
     all_posts = []
     queries_failed = []
@@ -176,20 +225,20 @@ def lambda_handler(event, context):
     try:
         access_jwt = create_session()
     except Exception as e:
-        # Auth failure blocks all 3 verticals -- report clearly instead of a
-        # confusing per-vertical 401 for each query.
+        # Auth failure blocks every market query -- report clearly instead of
+        # a confusing per-market 401 for each of the 500+ queries.
         return {
             "statusCode": 500,
             "body": json.dumps({"error": f"Bluesky authentication failed: {e}"}),
         }
 
-    for vertical, query in VERTICAL_QUERIES.items():
+    for market_id, query in market_queries:
         try:
             resp = search_posts(query, access_jwt)
-            all_posts.extend(extract_posts(resp, vertical))
+            all_posts.extend(extract_posts(resp, market_id))
         except Exception as e:
-            # One vertical's query failing must not sink the other two.
-            queries_failed.append({"vertical": vertical, "error": str(e)})
+            # One market's query failing must not sink the rest.
+            queries_failed.append({"market_id": market_id, "error": str(e)})
 
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 
@@ -207,11 +256,12 @@ def lambda_handler(event, context):
         "source": "bluesky",
         "ingested_at": now.isoformat(),
         "post_count": len(all_posts),
+        "markets_queried": len(market_queries),
         "queries_failed": queries_failed,
         "posts": all_posts,
         "llm_summary": llm_enrichment["summary"] if llm_enrichment else None,
         "metadata": {
-            "schema_version": "v1",
+            "schema_version": "v2",
             "lambda_name": context.function_name,
             "lambda_request_id": context.aws_request_id,
             "llm_used": USE_LLM_ENRICHMENT,
@@ -243,6 +293,7 @@ def lambda_handler(event, context):
         "body": json.dumps({
             "s3_key": s3_key,
             "post_count": len(all_posts),
+            "markets_queried": len(market_queries),
             "queries_failed": queries_failed,
             "llm_used": USE_LLM_ENRICHMENT,
         }),

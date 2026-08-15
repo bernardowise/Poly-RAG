@@ -15,13 +15,23 @@ market registry (DynamoDB) to find genuinely new ids, and only runs the LLM
 pass on those -- steady-state cost scales with new-id arrival rate, not with
 the candidate pool size. Ids previously tracked as open that no longer appear
 in the pull are checked individually against the Gamma API for resolution.
+
+Minimum horizon filter (added 2026-08-15, same day, after observing markets
+resolve within 11 minutes of being tracked -- e.g. live sports/esports
+matches): a market whose endDate is less than MIN_HORIZON_HOURS away is
+skipped before the LLM pass entirely, not just filtered post-hoc. This isn't
+only a "not enough time to track it" problem -- it's that the project's core
+thesis (news/sentiment can influence a market's odds while it's open) does
+not apply to a live match already being decided on the field, so including
+these markets pollutes the dataset with cases that can't demonstrate the
+thing the project is trying to measure.
 """
 
 import json
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import urllib.request
@@ -35,6 +45,11 @@ USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "tr
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CANDIDATE_POOL_SIZE = 500
 PAGE_SIZE = 100
+# 48h = 4 full 12h ingestion cycles of runway before resolution -- enough to
+# capture several odds snapshots and give news/sentiment correlation a real
+# window, per CLAUDE.md's "measure, don't guess" discipline this is a starting
+# point, not a permanent constant; revisit if it excludes too much or too little.
+MIN_HORIZON_HOURS = 48
 
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
@@ -66,6 +81,20 @@ def fetch_market_by_id(market_id):
     req = urllib.request.Request(url, headers={"User-Agent": "poly-rag-ingestion/1.0"})
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read().decode())
+
+
+def has_minimum_horizon(market, now):
+    """Excludes markets resolving too soon to be trackable (see module
+    docstring) -- checked before the LLM pass, not after, so no Bedrock cost
+    is spent on markets we'd discard anyway."""
+    end_date_str = market.get("endDate")
+    if not end_date_str:
+        return True  # no endDate to check against -- don't exclude on missing data
+    try:
+        end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+    except ValueError:
+        return True  # unparseable date -- don't exclude on malformed data
+    return (end_date - now) >= timedelta(hours=MIN_HORIZON_HOURS)
 
 
 def get_known_ids(table):
@@ -127,7 +156,10 @@ def _classify_batch(batch):
         modelId=BEDROCK_MODEL_ID,
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1500,
+            # 2500 (up from 1500): output now carries two text fields per
+            # market (search_query + news_match_terms) instead of one, and a
+            # truncated response mid-array was observed at the old limit.
+            "max_tokens": 2500,
             "messages": [{"role": "user", "content": prompt}],
         }),
     )
@@ -142,9 +174,18 @@ def _classify_batch(batch):
     try:
         classifications = json.loads(raw_text)
     except json.JSONDecodeError:
-        start_idx = raw_text.find("[")
-        end_idx = raw_text.rfind("]")
-        classifications = json.loads(raw_text[start_idx:end_idx + 1])
+        try:
+            start_idx = raw_text.find("[")
+            end_idx = raw_text.rfind("]")
+            classifications = json.loads(raw_text[start_idx:end_idx + 1])
+        except (json.JSONDecodeError, ValueError):
+            # Malformed/truncated JSON (e.g. the model ran out of max_tokens
+            # mid-array). One bad batch shouldn't fail the whole Lambda run --
+            # these markets are simply skipped this cycle and get re-classified
+            # on the next one, since they're still "new" (never entered the
+            # registry).
+            print(f"[classify_batch] FAILED to parse response, skipping this batch of {len(batch)} markets")
+            classifications = []
 
     return classifications, usage, latency_ms, raw_text
 
@@ -287,7 +328,10 @@ def lambda_handler(event, context):
 
     known_ids = get_known_ids(registry_table)
     candidate_ids = {m["id"] for m in candidates}
-    new_candidates = [m for m in candidates if m["id"] not in known_ids]
+    new_candidates = [
+        m for m in candidates
+        if m["id"] not in known_ids and has_minimum_horizon(m, now)
+    ]
 
     tokens_in, tokens_out, llm_latency_ms = 0, 0, 0
     llm_raw_responses = []

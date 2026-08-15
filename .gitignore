@@ -12,3 +12,7 @@ terraform/build/
 terraform/*.tfstate
 terraform/*.tfstate.backup
 terraform/*.tfplan
+
+# Python
+__pycache__/
+*.pyc
