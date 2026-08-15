@@ -52,6 +52,20 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
 de datos para IA/ML), X/Twitter (sin tier gratuito viable + prohibicion identica),
 Truth Social (sin API publica para individuos).
 
+### 4. Email Digest (`poly-rag-send-digest`)
+- **Proposito:** consolida los 3 llm_summary mas recientes (uno por fuente) y los
+  manda por correo -- pieza permanente de infraestructura, independiente de si el
+  LLM-en-ingestion trial se mantiene o revierte (ver seccion LLM Enrichment)
+- **Envio:** Amazon SES (`ses:SendEmail`), remitente y destinatario verificados
+  (`bernardolw@gmail.com`, modo sandbox)
+- **Trigger:** EventBridge, 5 min despues de cada ciclo de ingestion (00:05 y 12:05
+  UTC) -- da tiempo a que las 3 Lambdas de ingestion terminen de escribir a S3
+- **Degradacion graceful:** si `llm_summary` es null (trial revertido) o no hay
+  objeto S3 reciente, reporta "no summary available" / "no data" por fuente en vez
+  de fallar la Lambda completa
+- **Permisos:** solo lectura de S3 (`s3:GetObject`, `s3:ListBucket`) -- distinto
+  del role de las 3 Lambdas de ingestion, que solo tienen escritura
+
 ---
 
 ## Vertical Taxonomy
@@ -199,14 +213,15 @@ a las otras dos.
 
 ## Infrastructure as Code (Terraform)
 
-**Estado:** toda la infraestructura de arriba (S3, DynamoDB, IAM, las 3 Lambdas,
-EventBridge) esta importada a Terraform (`terraform/`) desde 2026-08-14 -- `terraform
-plan` confirma "No changes, infrastructure matches configuration" contra el estado
-real de AWS. Nada se destruyo/recreo durante el import; se adopto lo que ya existia.
+**Estado:** toda la infraestructura de arriba (S3, DynamoDB, IAM, las 4 Lambdas,
+EventBridge) esta en Terraform (`terraform/`) desde 2026-08-14 -- las primeras 3
+Lambdas de ingestion se importaron desde recursos ya vivos (cero destroy/recreate);
+la 4a Lambda (send_digest) se creo directamente via `terraform apply`, siendo la
+primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto.
 
 - **Provider:** `hashicorp/aws` ~> 5.0, region us-east-1
 - **Estructura:** `providers.tf`, `s3.tf`, `dynamodb.tf`, `iam_ingest_lambda.tf`,
-  `lambdas.tf`, `eventbridge.tf` -- un archivo por dominio de recurso
+  `iam_send_digest.tf`, `lambdas.tf`, `eventbridge.tf` -- un archivo por dominio
 - **State file:** `terraform.tfstate` gitignored (contiene ARNs/IDs de cuenta) --
   vive solo local, no versionado. Nota tech-debt: sin backend remoto (S3+DynamoDB
   lock) todavia, aceptable para un solo desarrollador, revisar si esto se vuelve

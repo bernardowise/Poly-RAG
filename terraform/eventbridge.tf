@@ -57,3 +57,24 @@ resource "aws_lambda_permission" "allow_eventbridge_bluesky" {
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.ingest_bluesky_schedule.arn
 }
+
+resource "aws_cloudwatch_event_rule" "send_digest_schedule" {
+  name        = "poly-rag-send-digest-schedule"
+  description = "Trigger poly-rag-send-digest 5min after each 12h ingestion cycle (00:05 and 12:05 UTC)"
+  # 5-minute offset gives the 3 ingestion Lambdas time to finish writing to S3
+  schedule_expression = "cron(5 0,12 * * ? *)"
+  state                = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_target" "send_digest_target" {
+  rule = aws_cloudwatch_event_rule.send_digest_schedule.name
+  arn  = aws_lambda_function.send_digest.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge_send_digest" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.send_digest.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.send_digest_schedule.arn
+}

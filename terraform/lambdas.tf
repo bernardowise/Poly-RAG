@@ -85,3 +85,29 @@ resource "aws_lambda_function" "ingest_bluesky" {
     ignore_changes = [environment[0].variables["BLUESKY_HANDLE"], environment[0].variables["BLUESKY_APP_PASSWORD"]]
   }
 }
+
+data "archive_file" "send_digest" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/send_digest/handler.py"
+  output_path = "${path.module}/build/send_digest.zip"
+}
+
+resource "aws_lambda_function" "send_digest" {
+  function_name = "poly-rag-send-digest"
+  role          = aws_iam_role.send_digest_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  timeout       = 30
+  memory_size   = 128
+
+  filename         = data.archive_file.send_digest.output_path
+  source_code_hash = data.archive_file.send_digest.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET     = aws_s3_bucket.poly_rag_data.bucket
+      SES_SENDER    = "bernardolw@gmail.com"
+      SES_RECIPIENT = "bernardolw@gmail.com"
+    }
+  }
+}

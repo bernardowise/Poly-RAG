@@ -29,7 +29,7 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
 
   statement {
     effect    = "Allow"
-    actions   = ["s3:PutObject"]
+    actions   = ["s3:PutObject", "s3:GetObject"]
     resources = ["${aws_s3_bucket.poly_rag_data.arn}/*"]
   }
 
@@ -37,6 +37,18 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
     effect    = "Allow"
     actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.architecture_metrics.arn]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:Scan",
+      "dynamodb:Query",
+    ]
+    resources = [aws_dynamodb_table.market_registry.arn]
   }
 
   statement {
