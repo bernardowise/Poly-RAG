@@ -71,11 +71,11 @@ bedrock = boto3.client("bedrock-runtime")
 lambda_client = boto3.client("lambda")
 
 
-def invoke_next_stage():
+def invoke_next_stage(cycle_started_at):
     lambda_client.invoke(
         FunctionName=NEXT_LAMBDA_NAME,
         InvocationType="Event",
-        Payload=json.dumps({}),
+        Payload=json.dumps({"cycle_started_at": cycle_started_at}),
     )
 
 
@@ -219,6 +219,17 @@ def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_pro
 
 
 def lambda_handler(event, context):
+    # cycle_started_at (fixed 2026-08-16, see tech_debt.md "Strict
+    # Ingestion Chaining"): must come from the chain (set by
+    # ingest_polymarket, threaded through News), not datetime.now() --
+    # this Lambda can run well after the hour the cycle logically started
+    # in (observed: News took ~33min due to a stuck-batch retry, so
+    # Comments ran in the NEXT UTC hour). Using now() for the S3 key
+    # misaligned this cycle's comments/ output from the same cycle's
+    # news/ output, breaking the same-cycle-same-prefix assumption a
+    # future RAG ingestion job would rely on. Falls back to now() only
+    # for a standalone/manual invocation with no upstream cycle context.
+    cycle_started_at = event.get("cycle_started_at") or datetime.now(timezone.utc).isoformat()
     registry_table = dynamodb.Table(REGISTRY_TABLE)
     markets = get_open_markets_with_comment_links(registry_table)
     entity_groups = group_by_entity(markets)
@@ -280,7 +291,8 @@ def lambda_handler(event, context):
         },
     }
 
-    s3_key = f"comments/{now.strftime('%Y-%m-%d')}/{now.strftime('%H')}.json"
+    cycle_dt = datetime.fromisoformat(cycle_started_at)
+    s3_key = f"comments/{cycle_dt.strftime('%Y-%m-%d')}/{cycle_dt.strftime('%H')}.json"
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=s3_key,
@@ -299,7 +311,7 @@ def lambda_handler(event, context):
 
     # Last stage before the digest -- see tech_debt.md "Strict Ingestion
     # Chaining".
-    invoke_next_stage()
+    invoke_next_stage(cycle_started_at)
 
     return {
         "statusCode": 200,

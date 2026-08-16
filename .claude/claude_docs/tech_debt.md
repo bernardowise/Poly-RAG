@@ -1032,30 +1032,37 @@ digest. Real digest output: 4 newly-tracked markets, coherent cross-source execu
 (correctly identified in-progress sports markets as the source of the biggest odds swings, not
 predictive trading). This is the first confirmed working run of the strict chain end-to-end.
 
-**Two new (non-blocking) issues found in this same run, not yet fixed:**
-1. **Comments/digest write to the WRONG hour partition.** `ingest_comments` and `send_digest`
-   both build their S3 key from `datetime.now(timezone.utc)` (wall-clock time when they happen to
-   run) instead of the `cycle_started_at` that travels through the rest of the chain. In this run,
-   News started at 01:56 UTC but Comments/digest didn't run until ~02:29 (the News stage took ~33
-   min due to the offset=0 retries), so their output landed under the `02` hour prefix
-   (`comments/2026-08-16/02.json`, `digest/2026-08-16/02.json`) instead of `01`, misaligned with
-   News's own `01.json`. Doesn't break the chain itself, but breaks the assumption that all 3
-   sources' outputs for one logical cycle share the same hour-prefix key -- something a Day 4/5
-   RAG ingestion job correlating sources by S3 partition would need to know about.
-2. **Double-trigger from concurrent offset=0 retries.** Because 3 offset=0 invocations were
-   in-flight simultaneously during this test (2 manual duplicates + 1 from the watchdog), 2 of
-   them independently found the completed batch set and each triggered a merge + chain-forward --
-   Comments and send_digest each ran twice. Harmless in this case (idempotent operations, no
-   duplicate email since SES doesn't dedupe but only one send_digest invocation actually happened
-   before the other's chain reached that point -- verified via CloudWatch, both send_digest
-   invocations completed cleanly) but wasteful (extra Bedrock calls, extra S3 writes). Only
-   possible because of the manual duplicate invocations sent during debugging today -- a real
-   production cycle would only ever have ONE offset=0 dispatch under normal operation, so this
-   specific double-trigger is not expected to recur outside of manual intervention scenarios like
-   today's.
+**Two issues found in this same run:**
 
-**Revisit if:** Day 4/5 RAG ingestion needs same-cycle sources aligned under one S3 prefix (fix
-issue 1 by threading `cycle_started_at` into Comments/digest's own S3 key construction, same
-pattern already used for News's batch files) -- or if double-triggers start happening during
-normal (non-manual-intervention) operation, which would indicate the watchdog's retry logic
-itself needs a lock/guard against retrying an offset that's already in flight.
+1. **Comments/digest wrote to the WRONG hour partition -- FIXED same day, 2026-08-16.**
+   `ingest_comments` and `send_digest` both built their S3 key from `datetime.now(timezone.utc)`
+   (wall-clock time when they happened to run) instead of the `cycle_started_at` that travels
+   through the rest of the chain. In the first verified run, News started at 01:56 UTC but
+   Comments/digest didn't run until ~02:29 (the News stage took ~33 min due to the offset=0
+   retries), so their output landed under the `02` hour prefix instead of `01`, misaligned with
+   News's own `01.json`. **Fix:** `ingest_comments.invoke_next_stage` now takes and forwards
+   `cycle_started_at` in its payload (it was previously invoking `send_digest` with an EMPTY
+   payload -- the propagation bug started there, not just in the S3-key construction). Both
+   `ingest_comments` and `send_digest` now read `event.get("cycle_started_at")` and use it (via
+   `datetime.fromisoformat`) to build their own S3 key, falling back to `now()` only for a
+   standalone/manual invocation with no upstream cycle context. `now()` is still correctly used
+   for `ingested_at` and the email subject/heading (those should reflect real send time, not the
+   cycle's logical start). **Verified:** manual invocation of `ingest_comments` with
+   `cycle_started_at=2026-08-16T03:00:00...` produced `comments/2026-08-16/03.json` AND correctly
+   triggered `send_digest`, which produced `digest/2026-08-16/03.json` -- both under the injected
+   cycle hour, not the real wall-clock hour (~02:38) the Lambdas actually ran in.
+
+2. **Double-trigger from concurrent offset=0 retries.** Because 3 offset=0 invocations were
+   in-flight simultaneously during the first test (2 manual duplicates + 1 from the watchdog), 2 of
+   them independently found the completed batch set and each triggered a merge + chain-forward --
+   Comments and send_digest each ran twice. Harmless (idempotent operations, both send_digest
+   invocations completed cleanly, verified via CloudWatch) but wasteful (extra Bedrock calls, extra
+   S3 writes). Only possible because of the manual duplicate invocations sent during debugging that
+   day -- a real production cycle only ever has ONE offset=0 dispatch under normal operation, so
+   this specific double-trigger is not expected to recur outside of manual intervention scenarios.
+   Not fixed -- no guard exists against the watchdog retrying an offset that's already in flight.
+
+**Revisit if:** double-triggers start happening during normal (non-manual-intervention) operation,
+which would indicate the watchdog's retry logic needs a lock/guard against retrying an offset
+that's already mid-execution (e.g. checking whether time since cycle start minus expected batch
+duration suggests a retry is premature, not just "still missing after 20 min").

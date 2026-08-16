@@ -325,6 +325,15 @@ def lambda_handler(event, context):
     now_iso = now.isoformat()
     registry_table = dynamodb.Table(REGISTRY_TABLE)
 
+    # cycle_started_at (fixed 2026-08-16, see tech_debt.md "Strict
+    # Ingestion Chaining"): the last stage of the chain -- must use the
+    # cycle's own start time for its own S3 key, not now(), for the same
+    # reason ingest_comments needed the same fix (this Lambda can run in
+    # a later UTC hour than the cycle logically started in). Falls back
+    # to now() only for a standalone/manual invocation with no upstream
+    # cycle context.
+    cycle_started_at = event.get("cycle_started_at") or now_iso
+
     digest_data = build_digest_data(registry_table, now_iso)
     exec_summary_result = synthesize_executive_summary(digest_data)
     executive_summary = exec_summary_result["text"] if exec_summary_result else None
@@ -343,7 +352,8 @@ def lambda_handler(event, context):
     # Structured JSON is the source of truth, written before the email --
     # this is what gets ingested into the RAG corpus later, independent of
     # whether the email send below succeeds.
-    digest_s3_key = f"digest/{now.strftime('%Y-%m-%d')}/{now.strftime('%H')}.json"
+    cycle_dt = datetime.fromisoformat(cycle_started_at)
+    digest_s3_key = f"digest/{cycle_dt.strftime('%Y-%m-%d')}/{cycle_dt.strftime('%H')}.json"
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=digest_s3_key,
