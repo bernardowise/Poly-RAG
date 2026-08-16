@@ -36,6 +36,7 @@ missing or a field isn't present, rather than failing the whole digest.
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 import boto3
@@ -44,6 +45,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 SES_SENDER = os.environ.get("SES_SENDER", "bernardolw@gmail.com")
 SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
+METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 
 # Sources with a per-cycle S3 payload (source -> list field whose length is
@@ -98,6 +100,32 @@ def fetch_source_payload(source):
 def get_question(registry_table, market_id):
     resp = registry_table.get_item(Key={"market_id": market_id}, ProjectionExpression="question")
     return resp.get("Item", {}).get("question", "")
+
+
+def estimate_cost_usd(tokens_in, tokens_out):
+    return round((tokens_in / 1000) * 0.003 + (tokens_out / 1000) * 0.015, 6)
+
+
+def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_processed):
+    """Same shape/pricing as the 3 ingestion Lambdas' write_metrics (see
+    ingest_comments/handler.py) -- send_digest's own Bedrock call
+    (synthesize_executive_summary) previously only landed in the S3 digest
+    JSON, invisible to the architecture-metrics cost table (see
+    tech_debt.md, added 2026-08-16 to close that gap before the next
+    12:00 UTC cycle)."""
+    table = dynamodb.Table(METRICS_TABLE)
+    now = datetime.now(timezone.utc).isoformat()
+    table.put_item(Item={
+        "pk": f"{source}#{now}#{uuid.uuid4().hex[:8]}",
+        "source": source,
+        "llm_used": llm_used,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "latency_ms": latency_ms,
+        "estimated_cost_usd": str(estimate_cost_usd(tokens_in, tokens_out)),
+        "items_processed": items_processed,
+        "timestamp": now,
+    })
 
 
 def _load_open_market_odds(registry_table):
@@ -438,6 +466,15 @@ def lambda_handler(event, context):
         "tokens_in": exec_summary_result["tokens_in"] if exec_summary_result else 0,
         "tokens_out": exec_summary_result["tokens_out"] if exec_summary_result else 0,
     }
+
+    write_metrics(
+        source="send_digest",
+        llm_used=exec_summary_result is not None,
+        tokens_in=exec_summary_result["tokens_in"] if exec_summary_result else 0,
+        tokens_out=exec_summary_result["tokens_out"] if exec_summary_result else 0,
+        latency_ms=exec_summary_result["latency_ms"] if exec_summary_result else 0,
+        items_processed=1,
+    )
 
     # Structured JSON is the source of truth, written before the email --
     # this is what gets ingested into the RAG corpus later, independent of

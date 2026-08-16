@@ -58,6 +58,16 @@ data "aws_iam_policy_document" "send_digest_permissions" {
       "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
     ]
   }
+
+  statement {
+    # Closes the metrics gap noted 2026-08-16 (see tech_debt.md): send_digest's
+    # own Bedrock call (synthesize_executive_summary) previously only landed in
+    # the S3 digest JSON, invisible to the cost table the other 3 ingestion
+    # Lambdas already write to. PutItem only -- this role never reads metrics.
+    effect    = "Allow"
+    actions   = ["dynamodb:PutItem"]
+    resources = [aws_dynamodb_table.architecture_metrics.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "send_digest_permissions" {

@@ -153,6 +153,7 @@ resource "aws_lambda_function" "send_digest" {
       SES_SENDER       = "bernardolw@gmail.com"
       SES_RECIPIENT    = "bernardolw@gmail.com"
       REGISTRY_TABLE   = aws_dynamodb_table.market_registry.name
+      METRICS_TABLE    = aws_dynamodb_table.architecture_metrics.name
       BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     }
   }

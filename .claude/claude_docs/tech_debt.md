@@ -1114,3 +1114,41 @@ band in practice), `top_conviction` being dominated by near-resolved sports mark
 noise worth filtering (e.g. excluding markets within some horizon of resolution, mirroring the
 existing 48h min-horizon filter), or `world_snapshot` needs to feed the RAG corpus (Day 4/5)
 differently than the rest of the digest JSON once retrieval work can evaluate it.
+
+---
+
+## send_digest's Bedrock Call Was Invisible to the Cost Metrics Table (closed 2026-08-16)
+
+**Issue:** ahead of letting the automated 12:00 UTC cycle run (to remeasure LLM-in-ingestion cost
+with Comments in the mix instead of the stale Bluesky figures -- see "LLM Enrichment" in
+architecture_canon.md, still pending that remeasurement), a readiness audit found `send_digest`'s
+own Bedrock call (`synthesize_executive_summary` -- the 2-3 sentence narrative at the top of every
+digest email, a real LLM call with its own tokens/cost, not just JSON formatting) was never written
+to `poly-rag-architecture-metrics`. The other 3 ingestion Lambdas (Polymarket, News, Comments) each
+call `write_metrics()` unconditionally every invocation; `send_digest` only folded its Bedrock
+usage into the S3 digest JSON's `metadata` block, invisible to anyone querying the metrics table for
+a full-cycle cost picture. Confirmed live via `aws lambda get-function-configuration`: `send_digest`
+had no `METRICS_TABLE` env var and its IAM role had no `dynamodb:PutItem` on that table at all --
+structurally incapable of writing there, not just skipped in code.
+
+**Fix:** added `write_metrics`/`estimate_cost_usd` to `lambdas/send_digest/handler.py`, same shape
+and pricing constants as the other 3 Lambdas' identical functions (source="send_digest",
+`items_processed=1` since digest synthesizes one narrative per cycle, not a list of items). Added
+`METRICS_TABLE` env var (`terraform/lambdas.tf`) and a scoped `dynamodb:PutItem` statement on
+`poly-rag-architecture-metrics` to `send_digest_role` (`terraform/iam_send_digest.tf`) -- PutItem
+only, this role never reads the metrics table.
+
+**Deployed and verified (2026-08-16):** `terraform apply -target` scoped to exactly
+`aws_iam_role_policy.send_digest_permissions` + `aws_lambda_function.send_digest` +
+`data.archive_file.send_digest` (plan confirmed `0 to add, 2 to change, 0 to destroy` before
+applying). Manual invocation immediately after confirmed a real row landed in
+`poly-rag-architecture-metrics`: `source=send_digest`, 775 tokens in, 243 tokens out, latency 7251ms,
+estimated cost $0.00597. All 4 Lambdas that call Bedrock now write to the same metrics table with
+the same schema -- the upcoming 12:00 UTC cycle will produce a complete per-Lambda cost picture,
+closing the "Pendiente: remedir con Comments en el mix" note in architecture_canon.md's LLM
+Enrichment section.
+
+**Revisit if:** the remeasured cost table (once pulled from real 12:00 UTC cycle data) shows
+send_digest's cost is negligible enough that tracking it separately isn't worth the row, or if the
+digest's executive-summary prompt grows enough (e.g. more sources, longer synthesis) that its cost
+becomes a meaningful fraction of the per-cycle total rather than a rounding error.
