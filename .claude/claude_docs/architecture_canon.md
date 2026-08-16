@@ -5,7 +5,7 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-16
+Ultima actualizacion: 2026-08-16 (Comments reemplaza a Bluesky)
 
 ---
 
@@ -109,26 +109,52 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
   narrativa completa, incluyendo el merge manual unico requerido por la
   transicion mid-deploy (no aplica a corridas futuras).
 
-### 3. Bluesky (`poly-rag-ingest-bluesky`)
-- **API:** AT Protocol, endpoint `app.bsky.feed.searchPosts`
-- **Auth:** requerida -- `com.atproto.server.createSession` con app password
-  (no el password de la cuenta), re-autentica cada invocacion
-- **Endpoint correcto:** `bsky.social` (el PDS) para AMBOS createSession y
-  searchPosts -- `public.api.bsky.app` devuelve 403 en searchPosts especificamente
-  aunque otros endpoints de lectura ahi si funcionan
-- **Query strategy:** ya no son 3 queries fijas por vertical -- una busqueda
-  searchPosts por CADA market abierto en el registry (cobertura completa, no un
-  top-N), usando el `search_query` de ese market. Retry/backoff en 429 (rate
-  limit no medido empiricamente a este volumen, se prefiere backoff sobre
-  adivinar un N seguro)
-- **Timeout:** 600s (subido de 60s -- 500+ llamadas HTTP secuenciales externas)
-- **Escala real observada (2026-08-15):** 492 markets consultados, 689 posts,
-  0 fallos, 83s de duracion real -- muy por debajo del timeout, sin rate limiting
-- **Output:** `s3://poly-rag-369970405415/bluesky/YYYY-MM-DD/HH.json`
+### 3. Comments (`poly-rag-ingest-comments`)
+**Reemplaza a Bluesky (2026-08-16, ver tech_debt.md "Comments Source Replaces
+Bluesky"):** auditoria de datos reales mostro que la mayoria de los posts de
+Bluesky eran bots republicando el propio feed de precios de Polymarket, no
+sentiment humano independiente -- señal circular. Los comentarios nativos de
+Polymarket (`gamma-api.polymarket.com/comments`, publico, sin auth,
+documentado oficialmente) son discusion real de traders.
 
-**Reemplaza a:** Reddit (descartado -- su Responsible Builder Policy prohibe uso
-de datos para IA/ML), X/Twitter (sin tier gratuito viable + prohibicion identica),
-Truth Social (sin API publica para individuos).
+- **API:** Gamma API, mismo dominio ya usado para market data. Sin auth.
+- **Lookup, no busqueda:** a diferencia de News/la Bluesky vieja (texto
+  libre), Comments consulta directo por `event_id` o `series_id` -- cada
+  market en el registry lleva `comment_entity_type`/`comment_entity_id`
+  (poblados por `ingest_polymarket`, sin LLM, directo de `events[]` en la
+  respuesta de la Gamma API). No se necesita `search_query` para esto.
+- **Agrupacion por entidad:** varios markets pueden compartir el mismo
+  event/series -- se agrupan antes de llamar a la API, asi una entidad
+  compartida por 9 markets se consulta 1 vez, no 9.
+- **Tres niveles de `link_type` (corregido 2026-08-16, mismo dia del primer
+  test):**
+  - `direct`: comentarios a nivel Event, Y ese event tiene exactamente 1
+    market abierto -- 1:1 real.
+  - `shared_event`: comentarios a nivel Event, pero el event agrupa VARIOS
+    markets (ej. torneo de esports con 1 market por equipo, todos bajo la
+    misma seccion de comments) -- encontrado en produccion: 802/1698
+    comentarios "direct" en el primer test en realidad tenian multiples
+    market_ids, lo cual rompia la promesa 1:1 de "direct" por definicion.
+  - `shared_series`: comentarios a nivel Series, compartidos entre TODOS los
+    markets de esa serie/liga, a menudo eventos no relacionados entre si
+    (verificado: dos partidos de MLB distintos mostraron el mismo hilo de
+    comentarios, incluyendo comentarios sobre un tercer partido). Prioridad
+    de lookup: Event primero, Series solo si el Event no tiene comentarios.
+  - Los tres niveles etiquetan TODOS los market_ids aplicables (no eligen
+    uno arbitrario) -- colapsar shared_event/shared_series a un solo
+    market_id exageraria la precision real del linkeo.
+- **Timeout:** 300s, memory 256MB.
+- **Verificado en produccion (2026-08-16):** 295/329 markets con cobertura
+  de comentarios (89%), 2506 comentarios reales, 94 llamadas a la API (por
+  agrupacion), 0 fallos. Distribucion: 896 direct / 802 shared_event / 808
+  shared_series.
+- **Output:** `s3://poly-rag-369970405415/comments/YYYY-MM-DD/HH.json`
+
+**Bluesky (descontinuado 2026-08-16), reemplazaba a:** Reddit (descartado --
+su Responsible Builder Policy prohibe uso de datos para IA/ML), X/Twitter (sin
+tier gratuito viable + prohibicion identica), Truth Social (sin API publica
+para individuos). Ninguna de esas exclusiones cambia -- Comments no las
+revive, simplemente Bluesky en si dejo de ser la mejor opcion disponible.
 
 ### 4. Email Digest (`poly-rag-send-digest`)
 - **Proposito:** consolida los 3 llm_summary mas recientes (uno por fuente) y los
@@ -164,31 +190,32 @@ celebridades, aunque el filtro viejo excluia deportes por completo sin evaluar e
 
 Un item por `market_id`, actualizado in-place (metadata, cambia poco -- una vez al
 crearse, una vez al resolverse). Campos: `question`, `description`, `end_date`,
-`resolution_source`, `status` (open/resolved), `search_query`, `news_match_terms`,
-`first_seen`, `last_updated`, `resolution_date`, `final_outcome`.
+`resolution_source`, `status` (open/resolved), `comment_entity_type`,
+`comment_entity_id`, `comment_link_type`, `first_seen`, `last_updated`,
+`resolution_date`, `final_outcome`.
 
 **Poblado por `ingest_polymarket`:**
 1. Trae top 500 candidatos activos por `volume24hr`
 2. Diffea contra el registry -- solo los ids genuinamente nuevos pasan por el LLM
    (costo escala con tasa de aparicion de ids nuevos, no con N -- ver tech_debt.md)
-3. Llamada batched a Bedrock (20 markets/batch) que devuelve, por market: el
-   veredicto de verificabilidad Y dos representaciones de busqueda derivadas (ver
-   abajo) -- un solo llamado LLM, sin costo adicional de Bedrock
+3. Llamada batched a Bedrock (20 markets/batch) que devuelve, por market, SOLO el
+   veredicto de verificabilidad (`is_verifiable`) -- simplificado 2026-08-16,
+   ya no genera texto de busqueda (ver nota abajo)
 4. Solo los verificables entran al registry; el resto se descarta
-5. Ids que estaban `open` pero ya no aparecen en el top-500: se consulta
+5. `comment_entity_type`/`comment_entity_id`/`comment_link_type` se extraen
+   directo de `events[]` en la respuesta de la Gamma API, sin LLM -- ver
+   `get_comment_link` en el handler y la seccion Comments arriba
+6. Ids que estaban `open` pero ya no aparecen en el top-500: se consulta
    `markets/{id}` directo en la Gamma API para capturar `closed` + outcome real
    (no se infiere resolucion por ausencia)
 
-**Dos representaciones de busqueda, no una (correccion 2026-08-15, mismo dia):**
-un primer intento con keywords sueltas (ej. `["Elon Musk", "tweets", "August
-2026"]`) perdia senal si se buscaban por separado. News y Bluesky matchean texto
-de formas distintas, asi que se generan dos campos en el mismo llamado LLM:
-- **`search_query`** (string combinado de texto libre): para Bluesky's searchPosts,
-  que acepta queries estilo motor de busqueda
-- **`news_match_terms`** (lista corta de 1-3 frases distintivas): para News, que
-  no tiene API de busqueda -- descarga el texto RSS completo y hace grep, asi que
-  el match requiere logica AND (todos los terminos deben co-ocurrir en el mismo
-  articulo) contra terminos suficientemente especificos
+**`search_query`/`news_match_terms` removidos (2026-08-16):** el diseño original
+(ver tech_debt.md, "Ingestion Redesign") generaba dos representaciones de
+busqueda por LLM para que News y Bluesky las consumieran. Ambas quedaron
+obsoletas por rediseños posteriores: News usa `question` verbatim contra Google
+News RSS (ver "News Source Redesign"), y Comments (que reemplaza a Bluesky) hace
+lookup directo por `event_id`/`series_id`, no busqueda de texto. El campo salio
+del prompt del LLM y del schema del registry -- ya no se genera ni se guarda.
 
 **Auditoria (Bronze layer):** el prompt completo y la respuesta cruda del LLM se
 imprimen a CloudWatch Logs, y las respuestas crudas se guardan tambien en
@@ -209,7 +236,7 @@ time-series). Cada snapshot: `timestamp`, `outcomePrices`, `volume`, `volume24hr
 nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
 `s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
 
-### Linkeo News/Bluesky -> market_id (Layer 1, alta confianza)
+### Linkeo News/Comments -> market_id (Layer 1, alta confianza)
 
 - **News (rediseñado 2026-08-16, ver "News Source Redesign" en tech_debt.md):**
   `news_match_terms` y el AND-match ya NO se usan -- cada articulo se etiqueta
@@ -217,8 +244,11 @@ nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
   market, usando `question` tal cual) perteneciera. El linkeo es 1:1 por
   construccion (la busqueda ya es especifica al market), no un match posterior
   contra texto libre.
-- **Bluesky:** sin cambios -- un `searchPosts` por market abierto usando su
-  `search_query`; cada post resultante lleva `market_ids: [ese market]`.
+- **Comments (reemplaza a Bluesky, 2026-08-16):** lookup directo por
+  `comment_entity_type`/`comment_entity_id`, no busqueda. La precision del
+  linkeo varia por diseño -- ver seccion Comments arriba para los 3 niveles
+  (`direct`, `shared_event`, `shared_series`) y por que no todo comentario es
+  1:1 con un solo market.
 
 ### Retrieval por Ventana Temporal (Layer 2, contextual -- `retrieval/time_window.py`)
 
@@ -246,15 +276,27 @@ segunda capa.
 
 **Bootstrap del registry (2026-08-15, tras el fix de horizonte minimo de 48h):**
 228 markets trackeados, 228 archivos de odds en S3, 100% con el schema final
-(`search_query` + `news_match_terms` presentes en todos).
+de ese momento.
 
-**Bluesky (2026-08-15):** 492 markets consultados, 689 posts, 0 fallos.
+**Registry actualizado (2026-08-16, tras simplificar el LLM y agregar campos
+de comments):** 333 markets tras un ciclo nuevo, backfill one-off corrido
+contra los 329 markets sin `comment_entity_type` (los que predataban el
+rediseño) -- 187 direct, 105 shared_series a nivel de link potencial, 37 sin
+comentarios en ningun nivel, 0 errores.
 
 **News (2026-08-16, tras el rediseño a Google News RSS + fan-out paralelo):**
 228/228 markets procesados, 887 articulos, `cycle_complete: true`. Reemplaza la
 cifra vieja de 367 articulos/3 linkeados del diseño de 10-feeds-RSS +
 `news_match_terms`, que causo el rediseño completo (ver tech_debt.md, "News
 Source Redesign").
+
+**Comments (2026-08-16, reemplaza a Bluesky):** 295/329 markets con cobertura
+(89%), 2506 comentarios, 94 llamadas a la API (agrupadas por entidad
+compartida), 0 fallos. Distribucion final tras el fix de 3 niveles: 896
+`direct` / 802 `shared_event` / 808 `shared_series`. Bluesky (492 markets
+consultados, 689 posts, 0 fallos, ultima corrida 2026-08-15) fue destruido de
+AWS el mismo dia que se verifico Comments -- ver tech_debt.md, "Comments
+Source Replaces Bluesky".
 
 ---
 
@@ -273,15 +315,18 @@ completo detras de esta decision.
 - **Toggle:** variable de entorno `USE_LLM_ENRICHMENT` (true/false) por Lambda,
   permite comparar con/sin LLM en la misma tabla de metricas
 
-**Costo real medido, filtro viejo por vertical (2026-08-13/14, pre-rediseno):**
+**Costo real medido, filtro viejo por vertical (2026-08-13/14, pre-rediseno,
+cifras historicas -- Bluesky ya no existe, tabla no actualizada desde el
+reemplazo por Comments):**
 
 | Fuente | Items/corrida | Costo/corrida |
 |---|---|---|
 | Polymarket | ~22 | ~$0.0064 |
 | News | ~93 | ~$0.0057 |
-| Bluesky | ~50 | ~$0.0063 |
+| Bluesky (descontinuado) | ~50 | ~$0.0063 |
 
-Total ciclo completo: ~$0.018. Proyectado a cadencia de 12h: ~$1.10/mes.
+Total ciclo completo (cifra historica): ~$0.018. Proyectado a cadencia de 12h:
+~$1.10/mes. Pendiente: remedir con Comments en el mix en vez de Bluesky.
 
 **Costo del bootstrap del rediseno (2026-08-15):** ~500 candidatos, ~25 llamadas
 Bedrock batched (20/batch), estimado ~$0.35-0.40 -- costo de arranque UNA VEZ, no
@@ -298,15 +343,17 @@ ids nuevos aparecen por ciclo en la practica.
 |---|---|---|
 | S3 bucket | `poly-rag-369970405415` | Storage crudo, particionado `<source>/YYYY-MM-DD/HH.json`, mas `odds/<market_id>.json` (serie de tiempo append-only) |
 | DynamoDB table | `poly-rag-architecture-metrics` | Costo/latencia/tokens por invocacion, pay-per-request |
-| DynamoDB table | `poly-rag-market-registry` | Market registry (metadata + search_query + news_match_terms), pay-per-request, hash_key `market_id` -- agregada 2026-08-15 |
-| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las 3 Lambdas, permisos: S3 PutObject/GetObject/ListBucket (ListBucket agregado 2026-08-15 -- sin el, GetObject sobre una key inexistente devuelve AccessDenied opaco en vez de NoSuchKey, rompiendo el patron read-modify-write de odds), DynamoDB PutItem en metrics + GetItem/PutItem/UpdateItem/Scan/Query en el registry, Bedrock InvokeModel scoped al modelo especifico |
+| DynamoDB table | `poly-rag-market-registry` | Market registry (metadata + comment_entity_type/id/link_type), pay-per-request, hash_key `market_id` -- agregada 2026-08-15, campos de comments agregados 2026-08-16 |
+| DynamoDB table | `poly-rag-processed-urls` | Dedup de URLs de articulos de News, pay-per-request, hash_key `url`, sin TTL -- agregada 2026-08-15 |
+| DynamoDB table | `poly-rag-domain-failures` | Blocklist dinamico de dominios para News, pay-per-request, hash_key `domain` -- agregada 2026-08-16 |
+| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las Lambdas de ingestion, permisos: S3 PutObject/GetObject/ListBucket (ListBucket agregado 2026-08-15 -- sin el, GetObject sobre una key inexistente devuelve AccessDenied opaco en vez de NoSuchKey, rompiendo el patron read-modify-write de odds), DynamoDB PutItem en metrics + GetItem/PutItem/UpdateItem/Scan/Query en el registry + tablas de News, Bedrock InvokeModel scoped al modelo especifico |
 | IAM policy | `PolyRAG-BudgetBreach-Deny` | Guardrail: bloquea Bedrock/Lambda/S3-writes/DynamoDB-writes si el gasto cruza budget de $10 |
 | IAM role | `PolyRAG-BudgetsActionRole` | Permite a AWS Budgets adjuntar la Deny policy automaticamente |
 | AWS Budget | $5/mes | Alertas en 20% ($1) y 100% ($5) |
 | AWS Budget | $10 | Threshold del guardrail Deny automatico |
 | EventBridge rule | `poly-rag-ingest-polymarket-schedule` | Cron `0 0,12 * * ? *` (00:00 y 12:00 UTC), target: Lambda de Polymarket (timeout 600s desde 2026-08-15) |
-| EventBridge rule | `poly-rag-ingest-news-schedule` | Mismo cron, target: Lambda de News (timeout 60s, sin cambio) |
-| EventBridge rule | `poly-rag-ingest-bluesky-schedule` | Mismo cron, target: Lambda de Bluesky (timeout 600s desde 2026-08-15 -- 500+ llamadas HTTP externas por ciclo) |
+| EventBridge rule | `poly-rag-ingest-news-schedule` | Mismo cron, target: Lambda de News (timeout 900s desde el rediseño a fan-out paralelo, 2026-08-16) |
+| EventBridge rule | `poly-rag-ingest-comments-schedule` | Mismo cron, target: Lambda de Comments (timeout 300s) -- reemplaza `poly-rag-ingest-bluesky-schedule`, destruida 2026-08-16 |
 
 **Region:** us-east-1 (N. Virginia) exclusivamente -- consistencia obligatoria,
 Bedrock model access y otros recursos son regionales.
@@ -334,10 +381,10 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
   vive solo local, no versionado. Nota tech-debt: sin backend remoto (S3+DynamoDB
   lock) todavia, aceptable para un solo desarrollador, revisar si esto se vuelve
   colaborativo
-- **Secrets:** las credenciales de Bluesky (`BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD`)
-  NO estan en el codigo Terraform ni en el state -- se gestionan manualmente via CLI,
-  con `lifecycle { ignore_changes }` en el recurso Lambda para que Terraform no
-  intente sobreescribirlas a vacio en cada apply
+- **Secrets:** ninguno actualmente -- las credenciales de Bluesky (`BLUESKY_HANDLE`,
+  `BLUESKY_APP_PASSWORD`, gestionadas fuera de Terraform state via
+  `lifecycle { ignore_changes }`) dejaron de aplicar cuando Bluesky se destruyo
+  (2026-08-16); Comments usa la Gamma API publica, sin auth
 - **De aqui en adelante:** cambios de infraestructura (nueva Lambda, ajustar cron,
   nuevos permisos IAM) se hacen editando `.tf` + `terraform apply`, no mas comandos
   sueltos de `aws` CLI para crear/modificar recursos
@@ -347,19 +394,23 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
 ## Pendiente para completar el ciclo de ingestion
 
 - Confirmado (2026-08-15): las 4 Lambdas corren solas via EventBridge -- el ciclo
-  automatico de las 12:00 UTC del 15 corrio sin intervencion manual
+  automatico de las 12:00 UTC del 15 corrio sin intervencion manual (nota: una
+  de esas 4, Bluesky, ya no existe -- reemplazada por Comments el 2026-08-16)
 - Cierre del trial LLM-en-ingestion (3-4 dias de datos, ver seccion LLM Enrichment)
   -- el rediseno de ingestion hace que el LLM ahora sea el filtro de calidad mismo,
   no solo un resumen opcional, lo cual refuerza el caso para mantenerlo
 - Medir en la practica la tasa real de ids nuevos por ciclo (determina el costo de
   estado-estable real, ver seccion "Market Registry + Ingestion Redesign")
-- `odds_old_2026-08-15/` en S3: 700 archivos del bootstrap con schema obsoleto
-  (keywords en vez de search_query/news_match_terms), movidos ahi en vez de
-  borrados -- desechar oficialmente en unos dias una vez confirmada la calidad
-  del nuevo bootstrap
+- Remedir el costo de LLM Enrichment con Comments en el mix (la tabla de costos
+  arriba sigue con la cifra historica de Bluesky, no actualizada aun)
+- `odds_old_2026-08-15/` en S3: 700 archivos del bootstrap con schema obsoleto,
+  movidos ahi en vez de borrados -- desechar oficialmente en unos dias una vez
+  confirmada la calidad del nuevo bootstrap
 - Explorar paginacion `/markets/keyset` de la Gamma API para conocer el tamano
   real del universo de mercados activos (hoy solo se confirmo un piso de ~2,100
   via offset, que se cae mas alla de eso)
+- Fix del bug de horizonte minimo de 48h para mercados deportivos (usa endDate,
+  que no refleja la hora real del partido -- ver tech_debt.md)
 
 Ver sprint_plan.md (gerdau/) para el resto del roadmap (Databricks Dia 3 --
 Delta Lake/Unity Catalog aun no iniciados, RAG retrieval Dia 4, synthesis agent

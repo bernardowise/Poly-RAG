@@ -36,16 +36,11 @@ just widening MIN_HORIZON_HOURS, which wouldn't actually solve a wrong-field bug
 
 ## Reddit Dropped as Data Source — Replaced by Bluesky
 
-**Update (2026-08-16, not yet deployed):** Bluesky itself is being replaced by Polymarket's own
-comments (`gamma-api.polymarket.com/comments`) as the sentiment source -- real production data
-showed most Bluesky posts were bots republishing Polymarket's own price feed, not independent
-human sentiment (circular signal). New `ingest_comments` Lambda designed and written but not yet
-deployed (`terraform apply` still pending as of this entry) -- Bluesky ingestion is still the
-live, running source in AWS until that apply runs. See the new "Comments Source Replaces
-Bluesky" entry (if present) or session_ledger.md 2026-08-16 for the full design/investigation.
-This entry (Reddit vs. the alternatives evaluated in 2026-08-13) stays as historical record of
-why Bluesky was chosen originally -- not rewritten, since Reddit's rejection reasoning is still
-accurate and unrelated to the Bluesky->Comments swap.
+**Update (2026-08-16): Bluesky itself replaced by Polymarket Comments, deployed and verified.**
+See the "Comments Source Replaces Bluesky" entry below for the full investigation, design, and
+production verification. This entry (Reddit vs. the alternatives evaluated in 2026-08-13) stays
+as historical record of why Bluesky was chosen originally -- not rewritten, since Reddit's
+rejection reasoning is still accurate and unrelated to the Bluesky->Comments swap.
 
 **Issue (resolved 2026-08-13):** Reddit's OAuth2 app registration form failed silently
 (reset after reCAPTCHA + submit, no error). Root cause confirmed by reading Reddit's
@@ -737,3 +732,84 @@ ARN only, same least-privilege pattern as `processed_urls`.
 a real block (5-strike threshold with per-success reset should make this rare, but not
 impossible) -- would need a manual DynamoDB item delete to un-block, no admin tooling built for
 this yet since it hasn't been observed as a real problem.
+
+---
+
+## Comments Source Replaces Bluesky (deployed and verified 2026-08-16)
+
+**Issue:** auditing real production data (492 markets, 689 posts, 0 HTTP failures) revealed a
+quality problem the metrics couldn't see: manually inspecting the actual post text showed most
+of the 437 sampled posts were bot accounts republishing Polymarket's own price feed verbatim
+("Will the next diplomatic US-Iran meeting be in Qatar... YES 48% -> 74% (+26) in 5m. Polymarket
+[link]") or news aggregator accounts reposting formal market questions -- not independent human
+reaction. This is circular signal: correlating "Bluesky sentiment" against odds movement would
+partly just be correlating Polymarket's odds against a mirror of themselves.
+
+**Alternative found: Polymarket's own comment sections.** `gamma-api.polymarket.com/comments`
+-- same domain already used for market data, public, no auth, officially documented at
+docs.polymarket.com (`list-comments`, `get-comments-by-comment-id`). Response includes author
+(wallet address + optional display name/pseudonym), full comment body, `createdAt`,
+`parentCommentID` (threading), and `reactions`. Rate limit: 200 req/10s (tighter than the
+general Gamma API's 4000 req/10s -- reflected in `MAX_RETRIES`/backoff in the handler). Real
+sample (2026-08-16, La Liga opener market) showed genuine trader analysis ("first game of the
+season and the away side's the favorite, always feels off for a home opener... had Sportstensor
+model open on la liga all week and its got rayo too"), not bot noise. No ToS clause found
+prohibiting AI/RAG use (unlike Reddit's explicit ban) -- Polymarket's own FAQ describes its
+API/code as "open source and free to use"; only restriction found is geographic (US persons
+blocked from trading, but data/read access is explicitly not geo-blocked).
+
+**Comments hang off Event or Series, not the market itself -- and NOT always 1:1 with a market.**
+Confirmed empirically via three separate checks before committing to a design:
+1. A market's `events[0].commentCount` can be 0 while `events[0].series[0].commentCount` is in
+   the thousands -- e.g. market 3448712 (Royals vs. Angels), event comment count 0, series (MLB)
+   comment count 6705. Comments exist somewhere for nearly every market (19-market sample: 14/19
+   had Event-level comments, the other 5 -- all sports/recurring markets -- had Series-level
+   comments instead; ~100% combined coverage).
+2. Series-level comments are NOT specific to the individual market -- verified by fetching real
+   comments for two DIFFERENT MLB games (Royals/Angels and Brewers/Dodgers, both series_id=3) and
+   confirming they returned the IDENTICAL comment thread, including comments about a THIRD,
+   unrelated MLB game. Also confirmed visually in the Polymarket frontend by the user directly
+   (screenshot matched the API response exactly). This ruled out treating Series comments as
+   "lower confidence" -- they're not lower quality, they're structurally many-to-one, a different
+   kind of fact than Event-level comments.
+3. **Second bug found in the FIRST production test run (self-caught, not by the user this
+   time):** the initial two-tier design (`direct` for any Event-level comment, `shared_series`
+   for Series-level) turned out wrong too -- an Event can itself contain MULTIPLE markets (e.g. a
+   tournament with one market per team, all sharing one comment section). Production data showed
+   802/1698 comments tagged `direct` actually carried more than one `market_id`, breaking
+   `direct`'s implicit 1:1 promise. Fixed same-day by splitting into three tiers instead of two:
+   `direct` (Event with exactly one open market), `shared_event` (Event with several), and
+   `shared_series` (Series-level, shared across a whole league/category). All three tag every
+   applicable `market_id` rather than picking one arbitrarily.
+
+**Design:** `ingest_polymarket` extracts `comment_entity_type`/`comment_entity_id`/
+`comment_link_type` per market directly from the Gamma API's `events[]` field (no LLM --
+`get_comment_link`), Event preferred, falling back to Series only if the Event has none. The new
+`ingest_comments` Lambda groups open markets by `(entity_type, entity_id)` before fetching, so a
+series shared by many markets is only queried once, then tags every comment with every applicable
+`market_id` and the correct `link_type`.
+
+**LLM search-text generation removed as a side effect.** Neither News (uses `question` verbatim
+against Google News RSS) nor Comments (direct ID lookup) need LLM-generated search text anymore
+-- `search_query`/`news_match_terms` were Bluesky's dependency specifically. Removed from the
+verifiability-classification prompt in `ingest_polymarket` (back to 1500 max_tokens from 2500)
+and from the registry schema. One-off backfill script run against the 329 pre-existing registry
+items that predated this field (`comment_entity_type` etc. only populate for NEW markets by
+default) -- 187 direct, 105 with a shared_series candidate, 37 with no comments at either level,
+0 errors.
+
+**Deployed via `terraform apply`:** `ingest_bluesky` (Lambda, EventBridge rule/target, Lambda
+permission) destroyed; `ingest_comments` (same resource types) created. No new IAM permissions
+needed -- Comments reuses the existing `dynamodb:Scan` on the registry already granted to the
+shared ingestion role. `BLUESKY_HANDLE`/`BLUESKY_APP_PASSWORD` env vars and their
+`lifecycle.ignore_changes` no longer apply to anything.
+
+**Verified in production (2026-08-16, post-fix):** 295/329 registry markets have some form of
+comment coverage (89%), 2506 comments fetched via 94 grouped API calls (not 329 individual
+calls), 0 failures. Final `link_type` distribution: 896 `direct`, 802 `shared_event`, 808
+`shared_series`.
+
+**Revisit if:** the 200 req/10s comments-specific rate limit becomes a real constraint as the
+registry grows (not hit yet at 94 calls/cycle), or `shared_event`/`shared_series` comments turn
+out too noisy to be useful once retrieval/RAG work (Day 4) can actually measure signal quality
+rather than just coverage.

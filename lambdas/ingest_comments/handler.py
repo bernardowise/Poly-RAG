@@ -16,18 +16,24 @@ ingest_polymarket, see get_comment_link there) pointing at whichever level
 actually has comments -- Event preferred (comments are specific to that one
 market), falling back to Series only if the Event has none.
 
-IMPORTANT asymmetry confirmed empirically 2026-08-16: Series-level comments
-are NOT specific to one market -- they're the same shared feed across every
-market in that series (verified directly: two different MLB games' event
-pages showed the identical comment thread, including comments about a THIRD
-unrelated game). So a Series-linked comment is tagged comment_link_type=
-"shared_series" and gets market_ids listing EVERY open market in the
-registry that shares that same series_id this cycle -- not because the
-comment is about all of them, but because it genuinely isn't attributable to
-just one, and hiding that behind a single market_id would overstate the
-linkage's precision. Event-linked comments get comment_link_type="direct"
-and a single market_id, since they're only reachable from that market's own
-page.
+Three link_type levels, not two (revised 2026-08-16 same day after finding
+the first version's bug in production -- see tech_debt.md):
+- "direct": Event-level comments AND exactly one open market behind that
+  event. Genuinely 1:1 -- the comment is reachable only from this one
+  market's page and about nothing else.
+- "shared_event": Event-level comments but the event has SEVERAL open
+  markets (e.g. a tournament with one market per team, all sharing one
+  comment section). Found empirically: 802/1698 Event-linked comments in
+  the first production run had multiple market_ids, which broke "direct"'s
+  1:1 promise. Comment applies to the whole event, not attributable to any
+  single market within it.
+- "shared_series": comments hang off a Series, shared across EVERY market
+  in that series, often unrelated events entirely (verified directly: two
+  different MLB games' pages showed the identical comment thread, including
+  comments about a THIRD unrelated game).
+All three tag every applicable market_id rather than picking one arbitrarily
+-- collapsing shared_event/shared_series down to a single market_id would
+overstate the linkage's precision.
 """
 
 import json
@@ -207,7 +213,19 @@ def lambda_handler(event, context):
     entities_failed = []
 
     for (entity_type, entity_id), market_ids in entity_groups.items():
-        link_type = "direct" if entity_type == "Event" else "shared_series"
+        # "direct" requires BOTH Event-level AND exactly one market behind
+        # that event -- an Event with several markets (e.g. a tournament
+        # with one market per team) means the comment is visible from, and
+        # presumably about, the whole event, not any single market inside
+        # it. Confirmed in production (2026-08-16): 802/1698 Event-linked
+        # comments actually had multiple market_ids, which "direct" was
+        # supposed to rule out by definition. See tech_debt.md.
+        if entity_type == "Event" and len(market_ids) == 1:
+            link_type = "direct"
+        elif entity_type == "Event":
+            link_type = "shared_event"
+        else:
+            link_type = "shared_series"
         try:
             raw = fetch_comments(entity_type, entity_id)
             all_comments.extend(extract_comments(raw, market_ids, link_type))
