@@ -172,18 +172,34 @@ para individuos). Ninguna de esas exclusiones cambia -- Comments no las
 revive, simplemente Bluesky en si dejo de ser la mejor opcion disponible.
 
 ### 4. Email Digest (`poly-rag-send-digest`)
-- **Proposito:** consolida los 3 llm_summary mas recientes (uno por fuente) y los
-  manda por correo -- pieza permanente de infraestructura, independiente de si el
-  LLM-en-ingestion trial se mantiene o revierte (ver seccion LLM Enrichment)
+- **Proposito:** ultimo eslabon de la cadena estricta (ver "Strict Ingestion
+  Chaining" en tech_debt.md) -- consolida el ciclo completo (odds/News/Comments)
+  en un artefacto JSON estructurado (`digest/YYYY-MM-DD/HH.json`, pensado para
+  ingestion RAG futura) y un email HTML generado A PARTIR de ese JSON, no al reves
+- **Contenido sintetizado (rediseño 2026-08-16, "Bespoke Digest Redesign"):**
+  `newly_tracked_markets`/`resolved_markets` (con outcome real), `top_volatility`
+  (que se MOVIO este ciclo, ranking por delta de precio entre snapshots),
+  `world_snapshot` (agregado 2026-08-16 -- que CREE el mercado ahora mismo,
+  independiente de si se movio: `top_conviction` = top 5 por `volume24hr` del
+  ultimo snapshot, `most_disputed` = top 5 mas cercanos a 50/50 dentro de una
+  banda 40-60%, ambos derivados del mismo pase de lectura de S3 que ya usa
+  `top_volatility`, sin escaneo extra), `quotes` (verbatim, no parafraseado), y
+  `executive_summary` (un llamado Bedrock que ve las 3 fuentes + world_snapshot
+  juntas y escribe 2-3 oraciones de narrativa)
 - **Envio:** Amazon SES (`ses:SendEmail`), remitente y destinatario verificados
-  (`bernardolw@gmail.com`, modo sandbox)
-- **Trigger:** EventBridge, 5 min despues de cada ciclo de ingestion (00:05 y 12:05
-  UTC) -- da tiempo a que las 3 Lambdas de ingestion terminen de escribir a S3
-- **Degradacion graceful:** si `llm_summary` es null (trial revertido) o no hay
-  objeto S3 reciente, reporta "no summary available" / "no data" por fuente en vez
-  de fallar la Lambda completa
-- **Permisos:** solo lectura de S3 (`s3:GetObject`, `s3:ListBucket`) -- distinto
-  del role de las 3 Lambdas de ingestion, que solo tienen escritura
+  (`bernardolw@gmail.com`, modo sandbox) -- ver tech_debt.md, "Digest Emails Land
+  in Spam", DKIM sin resolver, deliberado
+- **Trigger:** invocado directo por `ingest_comments` al terminar (encadenamiento
+  estricto, no EventBridge propio -- ver "Strict Ingestion Chaining" en
+  tech_debt.md), con `cycle_started_at` heredado de toda la cadena para su propia
+  key de S3
+- **Degradacion graceful:** si un source payload no esta disponible, reporta "no
+  data" para esa fuente en vez de fallar la Lambda completa
+- **Permisos:** `s3:GetObject`/`ListBucket` + `s3:PutObject` (agregado en el
+  rediseño de digest, antes solo lectura), `dynamodb:GetItem`/`Scan` en el
+  registry, `bedrock:InvokeModel` para el executive summary
+- **Estado (2026-08-16, world_snapshot):** implementado en el handler, NO
+  desplegado a AWS todavia -- pendiente `terraform apply`/deploy del zip
 
 ---
 
@@ -210,9 +226,20 @@ crearse, una vez al resolverse). Campos: `question`, `description`, `end_date`,
 `resolution_date`, `final_outcome`.
 
 **Poblado por `ingest_polymarket`:**
-1. Trae top 500 candidatos activos por `volume24hr`
-2. Diffea contra el registry -- solo los ids genuinamente nuevos pasan por el LLM
-   (costo escala con tasa de aparicion de ids nuevos, no con N -- ver tech_debt.md)
+1. Trae top 500 candidatos activos por `volume24hr` -- este fetch a la Gamma API
+   SIEMPRE es completo cada ciclo, sin excepcion. El "diff" contra el registry no
+   evita re-traer el top-500; solo decide que subset de esos candidatos pasa por
+   el paso caro (LLM). No hay forma de pedirle a Gamma "solo lo nuevo" sin
+   primero tener la lista completa para comparar contra el registry (verificado
+   leyendo `fetch_top_markets_by_volume24hr` en el handler, 2026-08-16).
+2. Diffea contra el registry (`Scan` completo de DynamoDB cada ciclo) -- solo los
+   ids genuinamente nuevos pasan por el LLM (costo escala con tasa de aparicion
+   de ids nuevos, no con N -- ver tech_debt.md). Los ids ya conocidos se saltan
+   Bedrock por completo.
+   **Lo que SI corre cada ciclo para TODO market abierto del top-500, nuevo o
+   no:** el snapshot de odds (ver "Odds Time-Series" abajo) -- el diff solo
+   protege el paso LLM, no la escritura de la serie de tiempo, que por diseno
+   debe ser cada ciclo para todos.
 3. Llamada batched a Bedrock (20 markets/batch) que devuelve, por market, SOLO el
    veredicto de verificabilidad (`is_verifiable`) -- simplificado 2026-08-16,
    ya no genera texto de busqueda (ver nota abajo)
@@ -241,6 +268,14 @@ que dijo el modelo si un item del registry se ve mal clasificado.
 observado en produccion) se salta sin tumbar la Lambda completa -- esos markets
 simplemente se re-evaluan el siguiente ciclo (siguen siendo "nuevos" mientras no
 entren al registry).
+
+**Nota (2026-08-16):** el mismo patron de "sigue siendo nuevo cada ciclo hasta
+que entre al registry" aplica a un market nuevo en el top-500 que resuelve en
+menos de 48h -- el filtro de horizonte minimo (ver tech_debt.md, bug de
+`endDate` para deportes) lo descarta ANTES del paso LLM, asi que nunca entra al
+registry y se re-evalua (y se re-descarta) cada ciclo mientras siga apareciendo
+en el top-500. No es un bug nuevo, es consecuencia directa del bug de horizonte
+ya documentado.
 
 ### Odds Time-Series (S3: `odds/<market_id>.json`)
 

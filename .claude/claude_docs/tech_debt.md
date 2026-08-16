@@ -1066,3 +1066,51 @@ predictive trading). This is the first confirmed working run of the strict chain
 which would indicate the watchdog's retry logic needs a lock/guard against retrying an offset
 that's already mid-execution (e.g. checking whether time since cycle start minus expected batch
 duration suggests a retry is premature, not just "still missing after 20 min").
+
+---
+
+## World Snapshot Added to Digest -- Belief, Not Movement (implemented and deployed 2026-08-16)
+
+**Issue (raised by the user, same day):** the digest (`top_volatility`) only ever showed what
+CHANGED this cycle -- biggest price deltas between two consecutive odds snapshots. There was no
+view of the market's current STATE independent of movement: "what does the world currently think
+is going to happen," as a single readable snapshot, not a log of the last 12h of price wiggling.
+User's own framing: an image of what the market is betting FOR or AGAINST, filtered down to what's
+actually important/relevant -- not all ~330 open registry markets.
+
+**Design (agreed via AskUserQuestion before implementation):**
+- New `world_snapshot` JSON key, additive -- coexists with `top_volatility`, doesn't replace it.
+- Two groups of 5 over the same open-market pool, not one undifferentiated list:
+  - `top_conviction`: highest `volume24hr` (from each market's latest odds snapshot) -- where the
+    most real money is placed, i.e. what the market is most confident about.
+  - `most_disputed`: current price within `SNAPSHOT_UNCERTAIN_LOW`/`HIGH` (0.40-0.60) of 50/50 --
+    genuinely contested bets, sorted by closeness to exactly 0.5.
+- Both derived from a SINGLE shared read pass (`_load_open_market_odds`, new helper in
+  `lambdas/send_digest/handler.py`) that `compute_top_volatility` and `compute_world_snapshot` both
+  consume -- avoids scanning the registry and re-reading S3 odds files twice per cycle for two
+  overlapping views of the same ~330 open markets (cost discipline per CLAUDE.md).
+- Fed into `synthesize_executive_summary`'s Bedrock prompt alongside movement data, with an
+  explicit instruction to weave in current belief, not just what changed -- and rendered as two new
+  sections in the HTML email (`Highest-Conviction Bets`, `Most Disputed Bets`).
+
+**Deployed (2026-08-16):** `terraform apply -target=aws_lambda_function.send_digest
+-target=data.archive_file.send_digest` -- scoped deploy touching ONLY the `send_digest` Lambda
+(plan confirmed `0 to add, 1 to change, 0 to destroy` before applying), no other Lambda's code or
+infra affected. Manually invoked `poly-rag-send-digest` directly afterward (not the full chain --
+no Polymarket/News/Comments re-run) to verify without waiting for the next 12h EventBridge cycle.
+
+**Verified in production (2026-08-16):** manual invocation produced `digest/2026-08-16/03.json`
+with both groups populated (5/5 each) and a real, sensible split: `most_disputed` surfaced genuine
+political toss-ups (2026 Senate balance of power at 0.49, Ohio Senate race at 0.48, Netanyahu-out
+odds at 0.47) -- exactly the kind of signal that's invisible in `top_volatility`. `top_conviction`
+mixed real conviction (Fed 50+bps cut unlikely at 0.00, Strait of Hormuz normalcy at 0.02) with
+near-settled sports markets (price 1.00/0.00 from games already effectively over) -- expected
+behavior, since `volume24hr` doesn't distinguish "the market is confident" from "the game just
+ended." Email delivered and confirmed readable by the user, including the two new HTML sections.
+
+**Revisit if:** real production data shows the 40-60% uncertainty band is too narrow/wide to
+surface a meaningful `most_disputed` group (e.g. genuinely disputed markets cluster outside that
+band in practice), `top_conviction` being dominated by near-resolved sports markets turns out to be
+noise worth filtering (e.g. excluding markets within some horizon of resolution, mirroring the
+existing 48h min-horizon filter), or `world_snapshot` needs to feed the RAG corpus (Day 4/5)
+differently than the rest of the digest JSON once retrieval work can evaluate it.

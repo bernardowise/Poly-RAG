@@ -18,10 +18,13 @@ Two things changed:
    summaries. Specifically: which markets newly entered the registry this
    cycle, which resolved (with real outcome), which open markets moved the
    most since the prior odds snapshot (volatility, not just current price),
-   and a handful of real verbatim quotes (comments/articles) rather than
-   only LLM-paraphrased prose. A single new Bedrock call synthesizes all of
-   this into one executive-summary paragraph, seeing all sources together --
-   the per-source llm_summary fields from each ingestion Lambda were each
+   a "world snapshot" of current market belief -- highest-conviction bets
+   (top volume24hr) and most-disputed bets (price near 50/50), independent
+   of what moved this cycle (added 2026-08-16, see tech_debt.md) -- and a
+   handful of real verbatim quotes (comments/articles) rather than only
+   LLM-paraphrased prose. A single new Bedrock call synthesizes all of this
+   into one executive-summary paragraph, seeing all sources together -- the
+   per-source llm_summary fields from each ingestion Lambda were each
    written blind to the other two sources.
 
 Permanent piece of infrastructure -- independent of whether the
@@ -56,6 +59,10 @@ SOURCE_LIST_FIELDS = {
 
 TOP_VOLATILITY_COUNT = 5
 QUOTE_COUNT_PER_SOURCE = 3
+SNAPSHOT_VOLUME_COUNT = 5
+SNAPSHOT_UNCERTAIN_COUNT = 5
+SNAPSHOT_UNCERTAIN_LOW = 0.40
+SNAPSHOT_UNCERTAIN_HIGH = 0.60
 
 s3 = boto3.client("s3")
 ses = boto3.client("ses")
@@ -93,11 +100,11 @@ def get_question(registry_table, market_id):
     return resp.get("Item", {}).get("question", "")
 
 
-def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
-    """Scans open markets, reads each one's last 2 odds snapshots from S3,
-    and ranks by absolute price movement between them. Movement, not
-    current price -- the digest's job is to say what CHANGED this cycle,
-    which a bare price snapshot can't show on its own."""
+def _load_open_market_odds(registry_table):
+    """Scans open markets and reads each one's odds snapshots from S3 once.
+    Shared by compute_top_volatility (movement) and compute_world_snapshot
+    (current belief) so a cycle costs one registry scan + one S3 GET per
+    open market, not two full passes over the same ~300+ markets."""
     resp = registry_table.scan(
         FilterExpression="#s = :open",
         ExpressionAttributeNames={"#s": "status"},
@@ -106,7 +113,7 @@ def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
     )
     open_markets = resp.get("Items", [])
 
-    movements = []
+    loaded = []
     for m in open_markets:
         market_id = m["market_id"]
         try:
@@ -114,11 +121,22 @@ def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
             odds_data = json.loads(obj["Body"].read())
         except s3.exceptions.ClientError:
             continue
-
         snapshots = odds_data.get("snapshots", [])
+        if not snapshots:
+            continue
+        loaded.append((m, snapshots))
+    return loaded
+
+
+def compute_top_volatility(loaded_markets, limit=TOP_VOLATILITY_COUNT):
+    """Ranks open markets by absolute price movement between their last two
+    odds snapshots. Movement, not current price -- the digest's job is to
+    say what CHANGED this cycle, which a bare price snapshot can't show on
+    its own."""
+    movements = []
+    for m, snapshots in loaded_markets:
         if len(snapshots) < 2:
             continue
-
         try:
             prev_prices = json.loads(snapshots[-2]["outcomePrices"])
             curr_prices = json.loads(snapshots[-1]["outcomePrices"])
@@ -127,7 +145,7 @@ def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
             continue
 
         movements.append({
-            "market_id": market_id,
+            "market_id": m["market_id"],
             "question": m.get("question", ""),
             "prev_price": prev_prices[0],
             "curr_price": curr_prices[0],
@@ -136,6 +154,42 @@ def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
 
     movements.sort(key=lambda x: x["delta"], reverse=True)
     return movements[:limit]
+
+
+def compute_world_snapshot(loaded_markets):
+    """A belief snapshot, not a movement snapshot -- what does the market
+    currently think will happen, independent of what changed this cycle.
+    Two groups over the same open-market pool: highest-conviction bets (top
+    volume24hr, where the most real money is placed) and most-disputed bets
+    (current price within SNAPSHOT_UNCERTAIN_LOW/HIGH of 50/50 -- the market
+    is genuinely split)."""
+    current_state = []
+    for m, snapshots in loaded_markets:
+        latest = snapshots[-1]
+        try:
+            price = float(json.loads(latest["outcomePrices"])[0])
+        except (ValueError, IndexError, KeyError, TypeError):
+            continue
+
+        current_state.append({
+            "market_id": m["market_id"],
+            "question": m.get("question", ""),
+            "price": round(price, 4),
+            "volume24hr": float(latest.get("volume24hr", 0) or 0),
+        })
+
+    by_volume = sorted(current_state, key=lambda x: x["volume24hr"], reverse=True)[:SNAPSHOT_VOLUME_COUNT]
+
+    uncertain_pool = [
+        x for x in current_state
+        if SNAPSHOT_UNCERTAIN_LOW <= x["price"] <= SNAPSHOT_UNCERTAIN_HIGH
+    ]
+    by_uncertainty = sorted(uncertain_pool, key=lambda x: abs(x["price"] - 0.5))[:SNAPSHOT_UNCERTAIN_COUNT]
+
+    return {
+        "top_conviction": by_volume,
+        "most_disputed": by_uncertainty,
+    }
 
 
 def extract_quotes(source, payload):
@@ -178,6 +232,15 @@ def synthesize_executive_summary(digest_data):
             f"{m['question']} ({m['prev_price']} -> {m['curr_price']})"
             for m in digest_data["top_volatility"]
         ))
+    snapshot = digest_data.get("world_snapshot") or {}
+    if snapshot.get("top_conviction"):
+        lines.append("Highest-conviction bets (top volume, current price): " + "; ".join(
+            f"{m['question']} @ {m['price']}" for m in snapshot["top_conviction"]
+        ))
+    if snapshot.get("most_disputed"):
+        lines.append("Most disputed bets (price near 50/50): " + "; ".join(
+            f"{m['question']} @ {m['price']}" for m in snapshot["most_disputed"]
+        ))
     for source in ("news", "comments"):
         quotes = digest_data["quotes"].get(source, [])
         if quotes:
@@ -191,7 +254,10 @@ def synthesize_executive_summary(digest_data):
         "Below is structured data from one 12h ingestion cycle across three sources: "
         "Polymarket odds, news coverage, and trader comments. Write 2-3 sentences tying "
         "them into one narrative -- what moved, why (if news/comments suggest a reason), "
-        "and what's notable. Be concrete, cite specific markets by name, no generic filler.\n\n"
+        "and what's notable. Also weave in what the market currently BELIEVES, not just "
+        "what changed -- the highest-conviction and most-disputed bets below are a "
+        "snapshot of current sentiment, independent of this cycle's movement. Be concrete, "
+        "cite specific markets by name, no generic filler.\n\n"
         + "\n".join(lines)
     )
 
@@ -225,7 +291,9 @@ def build_digest_data(registry_table, now_iso):
 
     newly_tracked = polymarket_payload.get("newly_tracked_markets", [])
     resolved = polymarket_payload.get("resolved_markets", [])
-    top_volatility = compute_top_volatility(registry_table)
+    loaded_markets = _load_open_market_odds(registry_table)
+    top_volatility = compute_top_volatility(loaded_markets)
+    world_snapshot = compute_world_snapshot(loaded_markets)
 
     quotes = {
         source: extract_quotes(source, payload)
@@ -247,6 +315,7 @@ def build_digest_data(registry_table, now_iso):
         "newly_tracked_markets": newly_tracked,
         "resolved_markets": resolved,
         "top_volatility": top_volatility,
+        "world_snapshot": world_snapshot,
         "quotes": quotes,
         "source_stats": source_stats,
     }
@@ -290,6 +359,27 @@ def build_email_html(digest_data, executive_summary):
         )
         sections.append(f"""
         <h3 style="color:#dc2626;font-size:14px;margin:20px 0 8px;">Biggest Moves</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    snapshot = digest_data.get("world_snapshot") or {}
+    if snapshot.get("top_conviction"):
+        rows = "".join(
+            f'<li style="margin-bottom:4px;">{escape(m["question"])}: '
+            f'<strong>{m["price"]:.0%}</strong></li>'
+            for m in snapshot["top_conviction"]
+        )
+        sections.append(f"""
+        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 8px;">Highest-Conviction Bets</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    if snapshot.get("most_disputed"):
+        rows = "".join(
+            f'<li style="margin-bottom:4px;">{escape(m["question"])}: '
+            f'<strong>{m["price"]:.0%}</strong></li>'
+            for m in snapshot["most_disputed"]
+        )
+        sections.append(f"""
+        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 8px;">Most Disputed Bets</h3>
         <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
 
     for source, label in (("news", "News Highlights"), ("comments", "Trader Comments")):
