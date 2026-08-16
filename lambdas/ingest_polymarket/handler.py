@@ -46,6 +46,13 @@ METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
+# Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion Chaining"):
+# News/Comments read the registry this Lambda writes -- they were never
+# truly independent, just running in parallel against a registry that might
+# not reflect this cycle yet. Chaining Polymarket -> News -> Comments ->
+# digest removes that race entirely: each stage only starts once the one
+# before it has fully written its data.
+NEXT_LAMBDA_NAME = os.environ.get("NEXT_LAMBDA_NAME", "poly-rag-ingest-news")
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CANDIDATE_POOL_SIZE = 500
@@ -59,6 +66,15 @@ MIN_HORIZON_HOURS = 48
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
+lambda_client = boto3.client("lambda")
+
+
+def invoke_next_stage(cycle_started_at):
+    lambda_client.invoke(
+        FunctionName=NEXT_LAMBDA_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({"cycle_started_at": cycle_started_at}),
+    )
 
 
 def fetch_top_markets_by_volume24hr(limit=CANDIDATE_POOL_SIZE):
@@ -377,7 +393,7 @@ def lambda_handler(event, context):
     # query the Gamma API directly per id to check for resolution.
     open_known_ids = {mid for mid, status in known_ids.items() if status == "open"}
     dropped_ids = open_known_ids - candidate_ids
-    resolved_count = 0
+    resolved_markets = []
     for market_id in dropped_ids:
         try:
             detail = fetch_market_by_id(market_id)
@@ -386,7 +402,11 @@ def lambda_handler(event, context):
         if detail.get("closed"):
             outcome_prices = detail.get("outcomePrices")
             mark_registry_resolved(registry_table, market_id, outcome_prices, now_iso)
-            resolved_count += 1
+            resolved_markets.append({
+                "market_id": market_id,
+                "question": detail.get("question", ""),
+                "outcome_prices": outcome_prices,
+            })
 
     total_latency_ms = fetch_latency_ms + llm_latency_ms
     payload = {
@@ -395,8 +415,18 @@ def lambda_handler(event, context):
         "candidate_count": len(candidates),
         "new_ids_this_cycle": len(new_candidates),
         "newly_tracked_count": len(tracked_markets),
+        # market_id + question for each newly-tracked/resolved market, not
+        # just a count -- send_digest (see tech_debt.md, "Bespoke Digest
+        # Redesign") needs the actual identity of what changed this cycle,
+        # not only how many changed, since the digest gets ingested into the
+        # RAG corpus later and a bare count carries no retrievable signal.
+        "newly_tracked_markets": [
+            {"market_id": m["id"], "question": m.get("question", "")}
+            for m in tracked_markets
+        ],
         "odds_snapshots_written": len(already_tracked_open) + len(tracked_markets),
-        "resolved_this_cycle": resolved_count,
+        "resolved_this_cycle": len(resolved_markets),
+        "resolved_markets": resolved_markets,
         "metadata": {
             "schema_version": "v2",
             "lambda_name": context.function_name,
@@ -430,13 +460,21 @@ def lambda_handler(event, context):
         items_processed=len(candidates),
     )
 
+    # Chain into News only after the registry is fully written for this
+    # cycle -- News/Comments depend on it (open markets, questions,
+    # comment_entity_type) and running them before this point risks reading
+    # a stale registry from the prior cycle. cycle_started_at travels
+    # through the whole chain so every stage's S3 output lands under the
+    # same hour partition.
+    invoke_next_stage(now_iso)
+
     return {
         "statusCode": 200,
         "body": json.dumps({
             "s3_key": s3_key,
             "candidate_count": len(candidates),
             "newly_tracked_count": len(tracked_markets),
-            "resolved_this_cycle": resolved_count,
+            "resolved_this_cycle": len(resolved_markets),
             "llm_used": USE_LLM_ENRICHMENT,
         }),
     }

@@ -26,6 +26,7 @@ resource "aws_lambda_function" "ingest_polymarket" {
       METRICS_TABLE      = aws_dynamodb_table.architecture_metrics.name
       BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
       USE_LLM_ENRICHMENT = "true"
+      NEXT_LAMBDA_NAME   = aws_lambda_function.ingest_news.function_name
     }
   }
 }
@@ -83,6 +84,7 @@ resource "aws_lambda_function" "ingest_news" {
       DOMAIN_FAILURES_TABLE = aws_dynamodb_table.domain_failures.name
       BEDROCK_MODEL_ID      = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
       USE_LLM_ENRICHMENT    = "true"
+      NEXT_LAMBDA_NAME      = aws_lambda_function.ingest_comments.function_name
     }
   }
 
@@ -119,6 +121,7 @@ resource "aws_lambda_function" "ingest_comments" {
       REGISTRY_TABLE     = aws_dynamodb_table.market_registry.name
       BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
       USE_LLM_ENRICHMENT = "true"
+      NEXT_LAMBDA_NAME   = aws_lambda_function.send_digest.function_name
     }
   }
 }
@@ -134,17 +137,23 @@ resource "aws_lambda_function" "send_digest" {
   role          = aws_iam_role.send_digest_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  timeout       = 30
-  memory_size   = 128
+  # 30s -> 60s (2026-08-16, bespoke digest redesign): now scans the open
+  # registry + reads one odds S3 object per open market for volatility
+  # ranking, plus one Bedrock call for the executive summary -- more work
+  # than the old flat concatenation of 3 existing llm_summary fields.
+  timeout     = 60
+  memory_size = 128
 
   filename         = data.archive_file.send_digest.output_path
   source_code_hash = data.archive_file.send_digest.output_base64sha256
 
   environment {
     variables = {
-      S3_BUCKET     = aws_s3_bucket.poly_rag_data.bucket
-      SES_SENDER    = "bernardolw@gmail.com"
-      SES_RECIPIENT = "bernardolw@gmail.com"
+      S3_BUCKET        = aws_s3_bucket.poly_rag_data.bucket
+      SES_SENDER       = "bernardolw@gmail.com"
+      SES_RECIPIENT    = "bernardolw@gmail.com"
+      REGISTRY_TABLE   = aws_dynamodb_table.market_registry.name
+      BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     }
   }
 }

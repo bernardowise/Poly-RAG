@@ -11,9 +11,24 @@ Ultima actualizacion: 2026-08-16 (Comments reemplaza a Bluesky)
 
 ## Data Sources (Ingestion Layer)
 
-Tres Lambdas independientes, no un orquestador unico -- una falla en una fuente no
-tumba las otras dos, y los reintentos no desperdician PUT requests de las fuentes
-que si funcionaron.
+Cuatro Lambdas independientes, no un orquestador unico -- una falla en una no tumba
+las otras, y los reintentos no desperdician PUT requests de las fuentes que si
+funcionaron.
+
+**Criterio real de separacion (aclarado 2026-08-16): aislamiento de fallos, no "una
+Lambda por dominio de API".** Polymarket (odds) y Comments comparten el mismo
+dominio (`gamma-api.polymarket.com`, sin auth) -- solo endpoints distintos
+(`/markets` vs `/comments`) -- y aun asi viven en Lambdas separadas. La razon no es
+"APIs distintas ameritan Lambdas distintas": es que odds (la serie de tiempo, el
+diferenciador real del proyecto) y comments (una fuente de sentiment mas ruidosa,
+con su propio rate limit especifico de 200 req/10s) tienen perfiles de fallo y
+criticidad distintos -- un timeout o rate-limit en Comments no debe poder bloquear
+la escritura del snapshot de odds de ese ciclo. Fusionarlas ahorraria una Lambda
+pero reintroduciria el acoplamiento que la separacion original (Dia 2) buscaba
+evitar. `ingest_polymarket` SI prepara el lookup (`comment_entity_type`/
+`comment_entity_id`, extraidos de la misma respuesta de `/markets` que ya trae
+`events[]`) pero no hace la llamada a `/comments` el mismo -- esa llamada, y su
+propio riesgo de fallo, vive enteramente en `ingest_comments`.
 
 **Rediseno 2026-08-15 (ver tech_debt.md, "Ingestion Redesign"):** el filtro estatico
 de 3 verticales por keyword (Macro/Geopolitica/Regulatorio-Tech) fue reemplazado por

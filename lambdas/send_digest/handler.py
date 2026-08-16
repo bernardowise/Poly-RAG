@@ -1,17 +1,38 @@
 """
-Poly-RAG digest Lambda: consolidates the 3 ingestion Lambdas' LLM summaries
-(Polymarket, News, Bluesky) from the most recent S3 objects and emails them
-as a single digest via Amazon SES. Triggered by EventBridge right after each
-12h ingestion cycle (00:00 and 12:00 UTC).
+Poly-RAG digest Lambda: consolidates each 12h ingestion cycle into a single
+structured digest and emails it via Amazon SES. Triggered by EventBridge
+right after each cycle (00:00 and 12:00 UTC).
 
-Permanent piece of infrastructure -- independent of whether the LLM-in-ingestion
-trial (see CLAUDE.md Development Conventions) is ultimately kept or reverted.
-If the trial is reverted, llm_summary will be null and this digest degrades
-gracefully (reports "no summary available" per source) rather than failing.
+Redesigned 2026-08-16 (see tech_debt.md, "Bespoke Digest Redesign") from a
+flat text email that just concatenated each source's individual llm_summary.
+Two things changed:
+
+1. The digest is now a real data artifact, not just an email. A structured
+   JSON is written to s3://bucket/digest/YYYY-MM-DD/HH.json FIRST -- that's
+   the source of truth, since this digest is meant to be ingested into the
+   RAG corpus later (Day 4/5), and a rendered HTML email is a poor format to
+   re-parse for that. The email body is generated FROM that JSON, not the
+   other way around.
+
+2. Content is synthesized across sources, not just concatenated per-source
+   summaries. Specifically: which markets newly entered the registry this
+   cycle, which resolved (with real outcome), which open markets moved the
+   most since the prior odds snapshot (volatility, not just current price),
+   and a handful of real verbatim quotes (comments/articles) rather than
+   only LLM-paraphrased prose. A single new Bedrock call synthesizes all of
+   this into one executive-summary paragraph, seeing all sources together --
+   the per-source llm_summary fields from each ingestion Lambda were each
+   written blind to the other two sources.
+
+Permanent piece of infrastructure -- independent of whether the
+LLM-in-ingestion trial (see CLAUDE.md Development Conventions) is ultimately
+kept or reverted. Degrades gracefully per-section if a source's S3 object is
+missing or a field isn't present, rather than failing the whole digest.
 """
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import boto3
@@ -19,11 +40,27 @@ import boto3
 S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 SES_SENDER = os.environ.get("SES_SENDER", "bernardolw@gmail.com")
 SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
+REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 
-SOURCES = ["polymarket", "news", "bluesky"]
+# Sources with a per-cycle S3 payload (source -> list field whose length is
+# shown as "item count" for that source's cycle). Polymarket's own payload
+# doesn't have a single "count" field the same way News/Comments do
+# (candidate_count is the whole candidate pool size, not what changed this
+# cycle) -- newly-tracked-market count is a more meaningful number for it.
+SOURCE_LIST_FIELDS = {
+    "polymarket": "newly_tracked_markets",
+    "news": "articles",
+    "comments": "comments",
+}
+
+TOP_VOLATILITY_COUNT = 5
+QUOTE_COUNT_PER_SOURCE = 3
 
 s3 = boto3.client("s3")
 ses = boto3.client("ses")
+dynamodb = boto3.resource("dynamodb")
+bedrock = boto3.client("bedrock-runtime")
 
 
 def get_latest_object_key(source):
@@ -43,50 +80,278 @@ def get_latest_object_key(source):
     return None
 
 
-def fetch_summary(source):
+def fetch_source_payload(source):
     key = get_latest_object_key(source)
     if not key:
-        return {"source": source, "summary": None, "item_count": 0, "error": "No recent S3 object found"}
-
+        return None
     obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-    data = json.loads(obj["Body"].read())
+    return json.loads(obj["Body"].read())
 
-    count_field = {
-        "polymarket": "market_count",
-        "news": "article_count",
-        "bluesky": "post_count",
-    }[source]
+
+def get_question(registry_table, market_id):
+    resp = registry_table.get_item(Key={"market_id": market_id}, ProjectionExpression="question")
+    return resp.get("Item", {}).get("question", "")
+
+
+def compute_top_volatility(registry_table, limit=TOP_VOLATILITY_COUNT):
+    """Scans open markets, reads each one's last 2 odds snapshots from S3,
+    and ranks by absolute price movement between them. Movement, not
+    current price -- the digest's job is to say what CHANGED this cycle,
+    which a bare price snapshot can't show on its own."""
+    resp = registry_table.scan(
+        FilterExpression="#s = :open",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":open": "open"},
+        ProjectionExpression="market_id, question",
+    )
+    open_markets = resp.get("Items", [])
+
+    movements = []
+    for m in open_markets:
+        market_id = m["market_id"]
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=f"odds/{market_id}.json")
+            odds_data = json.loads(obj["Body"].read())
+        except s3.exceptions.ClientError:
+            continue
+
+        snapshots = odds_data.get("snapshots", [])
+        if len(snapshots) < 2:
+            continue
+
+        try:
+            prev_prices = json.loads(snapshots[-2]["outcomePrices"])
+            curr_prices = json.loads(snapshots[-1]["outcomePrices"])
+            delta = abs(float(curr_prices[0]) - float(prev_prices[0]))
+        except (ValueError, IndexError, KeyError):
+            continue
+
+        movements.append({
+            "market_id": market_id,
+            "question": m.get("question", ""),
+            "prev_price": prev_prices[0],
+            "curr_price": curr_prices[0],
+            "delta": round(delta, 4),
+        })
+
+    movements.sort(key=lambda x: x["delta"], reverse=True)
+    return movements[:limit]
+
+
+def extract_quotes(source, payload):
+    """Pulls a handful of real, verbatim text snippets per source -- not
+    LLM-paraphrased -- so the digest keeps some human voice, not just
+    generated prose."""
+    if not payload:
+        return []
+    if source == "news":
+        articles = payload.get("articles", [])[:QUOTE_COUNT_PER_SOURCE]
+        return [
+            {"text": a.get("title", ""), "source": a.get("source", ""), "url": a.get("url", "")}
+            for a in articles
+        ]
+    if source == "comments":
+        comments = payload.get("comments", [])[:QUOTE_COUNT_PER_SOURCE]
+        return [
+            {"text": c.get("text", ""), "source": c.get("author", ""), "url": None}
+            for c in comments
+        ]
+    return []
+
+
+def synthesize_executive_summary(digest_data):
+    """Single Bedrock call that sees ALL sources together -- unlike each
+    ingestion Lambda's own llm_summary, which is written blind to the other
+    two sources. Produces one short paragraph tying odds movement, news,
+    and sentiment into one narrative instead of three disconnected blocks."""
+    lines = []
+    if digest_data["newly_tracked_markets"]:
+        lines.append("New markets this cycle: " + "; ".join(
+            m["question"] for m in digest_data["newly_tracked_markets"][:10]
+        ))
+    if digest_data["resolved_markets"]:
+        lines.append("Resolved this cycle: " + "; ".join(
+            f"{m['question']} -> {m['outcome_prices']}" for m in digest_data["resolved_markets"][:10]
+        ))
+    if digest_data["top_volatility"]:
+        lines.append("Biggest odds moves: " + "; ".join(
+            f"{m['question']} ({m['prev_price']} -> {m['curr_price']})"
+            for m in digest_data["top_volatility"]
+        ))
+    for source in ("news", "comments"):
+        quotes = digest_data["quotes"].get(source, [])
+        if quotes:
+            lines.append(f"{source} samples: " + " | ".join(q["text"][:150] for q in quotes))
+
+    if not lines:
+        return None
+
+    prompt = (
+        "You are writing the opening paragraph of a prediction-market research digest. "
+        "Below is structured data from one 12h ingestion cycle across three sources: "
+        "Polymarket odds, news coverage, and trader comments. Write 2-3 sentences tying "
+        "them into one narrative -- what moved, why (if news/comments suggest a reason), "
+        "and what's notable. Be concrete, cite specific markets by name, no generic filler.\n\n"
+        + "\n".join(lines)
+    )
+
+    start = time.time()
+    response = bedrock.invoke_model(
+        modelId=BEDROCK_MODEL_ID,
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 400,
+            "messages": [{"role": "user", "content": prompt}],
+        }),
+    )
+    latency_ms = int((time.time() - start) * 1000)
+    body = json.loads(response["body"].read())
+    usage = body.get("usage", {})
 
     return {
-        "source": source,
-        "summary": data.get("llm_summary"),
-        "item_count": data.get(count_field, 0),
-        "s3_key": key,
+        "text": body["content"][0]["text"],
+        "tokens_in": usage.get("input_tokens", 0),
+        "tokens_out": usage.get("output_tokens", 0),
+        "latency_ms": latency_ms,
     }
 
 
-def build_email_body(digests):
+def build_digest_data(registry_table, now_iso):
+    """Assembles the structured JSON that's the source of truth for this
+    digest -- written to S3 before anything else, independent of whether
+    the email send succeeds."""
+    source_payloads = {source: fetch_source_payload(source) for source in SOURCE_LIST_FIELDS}
+    polymarket_payload = source_payloads.get("polymarket") or {}
+
+    newly_tracked = polymarket_payload.get("newly_tracked_markets", [])
+    resolved = polymarket_payload.get("resolved_markets", [])
+    top_volatility = compute_top_volatility(registry_table)
+
+    quotes = {
+        source: extract_quotes(source, payload)
+        for source, payload in source_payloads.items()
+        if source in ("news", "comments")
+    }
+
+    source_stats = {}
+    for source, list_field in SOURCE_LIST_FIELDS.items():
+        payload = source_payloads.get(source)
+        item_count = len((payload or {}).get(list_field, []))
+        source_stats[source] = {
+            "available": payload is not None,
+            "item_count": item_count,
+        }
+
+    return {
+        "ingested_at": now_iso,
+        "newly_tracked_markets": newly_tracked,
+        "resolved_markets": resolved,
+        "top_volatility": top_volatility,
+        "quotes": quotes,
+        "source_stats": source_stats,
+    }
+
+
+def build_email_html(digest_data, executive_summary):
+    def escape(text):
+        return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    sections = []
+
+    if executive_summary:
+        sections.append(f"""
+        <div style="background:#f5f5f7;border-radius:8px;padding:16px 20px;margin-bottom:24px;">
+          <p style="margin:0;font-size:15px;line-height:1.5;color:#1a1a1a;">{escape(executive_summary)}</p>
+        </div>""")
+
+    if digest_data["newly_tracked_markets"]:
+        rows = "".join(
+            f'<li style="margin-bottom:4px;">{escape(m["question"])}</li>'
+            for m in digest_data["newly_tracked_markets"]
+        )
+        sections.append(f"""
+        <h3 style="color:#2563eb;font-size:14px;margin:20px 0 8px;">New Markets ({len(digest_data["newly_tracked_markets"])})</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    if digest_data["resolved_markets"]:
+        rows = "".join(
+            f'<li style="margin-bottom:4px;">{escape(m["question"])} &rarr; <code>{escape(str(m["outcome_prices"]))}</code></li>'
+            for m in digest_data["resolved_markets"]
+        )
+        sections.append(f"""
+        <h3 style="color:#16a34a;font-size:14px;margin:20px 0 8px;">Resolved ({len(digest_data["resolved_markets"])})</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    if digest_data["top_volatility"]:
+        rows = "".join(
+            f'<li style="margin-bottom:4px;">{escape(m["question"])}: {m["prev_price"]} &rarr; {m["curr_price"]} '
+            f'<span style="color:#dc2626;">(&Delta;{m["delta"]})</span></li>'
+            for m in digest_data["top_volatility"]
+        )
+        sections.append(f"""
+        <h3 style="color:#dc2626;font-size:14px;margin:20px 0 8px;">Biggest Moves</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    for source, label in (("news", "News Highlights"), ("comments", "Trader Comments")):
+        source_quotes = digest_data["quotes"].get(source, [])
+        if not source_quotes:
+            continue
+        rows = "".join(
+            f'<li style="margin-bottom:8px;font-style:italic;">"{escape(q["text"])}" '
+            f'<span style="color:#666;font-style:normal;">-- {escape(q["source"])}</span></li>'
+            for q in source_quotes
+        )
+        sections.append(f"""
+        <h3 style="color:#7c3aed;font-size:14px;margin:20px 0 8px;">{label}</h3>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+
+    stats_row = " &nbsp;|&nbsp; ".join(
+        f'{source}: {stats["item_count"]}' if stats["available"] else f'{source}: no data'
+        for source, stats in digest_data["source_stats"].items()
+    )
+    sections.append(f"""
+    <p style="margin-top:24px;padding-top:12px;border-top:1px solid #e5e5e5;font-size:11px;color:#999;">{stats_row}</p>""")
+
     now = datetime.now(timezone.utc)
-    lines = [f"Poly-RAG Digest -- {now.strftime('%Y-%m-%d %H:%M UTC')}", ""]
-
-    for d in digests:
-        lines.append(f"=== {d['source'].upper()} ({d.get('item_count', 0)} items) ===")
-        if d.get("summary"):
-            lines.append(d["summary"])
-        elif d.get("error"):
-            lines.append(f"[No data: {d['error']}]")
-        else:
-            lines.append("[No LLM summary available for this cycle -- enrichment may be disabled]")
-        lines.append("")
-
-    return "\n".join(lines)
+    return f"""
+    <div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+      <h2 style="font-size:18px;margin:0 0 16px;color:#1a1a1a;">Poly-RAG Digest &mdash; {now.strftime('%Y-%m-%d %H:%M UTC')}</h2>
+      {''.join(sections)}
+    </div>"""
 
 
 def lambda_handler(event, context):
-    digests = [fetch_summary(source) for source in SOURCES]
-    body = build_email_body(digests)
-
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    registry_table = dynamodb.Table(REGISTRY_TABLE)
+
+    digest_data = build_digest_data(registry_table, now_iso)
+    exec_summary_result = synthesize_executive_summary(digest_data)
+    executive_summary = exec_summary_result["text"] if exec_summary_result else None
+    digest_data["executive_summary"] = executive_summary
+
+    digest_data["metadata"] = {
+        "schema_version": "v1",
+        "lambda_name": context.function_name,
+        "lambda_request_id": context.aws_request_id,
+        "llm_used": exec_summary_result is not None,
+        "llm_model_id": BEDROCK_MODEL_ID if exec_summary_result else None,
+        "tokens_in": exec_summary_result["tokens_in"] if exec_summary_result else 0,
+        "tokens_out": exec_summary_result["tokens_out"] if exec_summary_result else 0,
+    }
+
+    # Structured JSON is the source of truth, written before the email --
+    # this is what gets ingested into the RAG corpus later, independent of
+    # whether the email send below succeeds.
+    digest_s3_key = f"digest/{now.strftime('%Y-%m-%d')}/{now.strftime('%H')}.json"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=digest_s3_key,
+        Body=json.dumps(digest_data),
+        ContentType="application/json",
+    )
+
+    html_body = build_email_html(digest_data, executive_summary)
     subject = f"Poly-RAG Digest -- {now.strftime('%Y-%m-%d %H:%M UTC')}"
 
     ses.send_email(
@@ -94,11 +359,16 @@ def lambda_handler(event, context):
         Destination={"ToAddresses": [SES_RECIPIENT]},
         Message={
             "Subject": {"Data": subject},
-            "Body": {"Text": {"Data": body}},
+            "Body": {"Html": {"Data": html_body}},
         },
     )
 
     return {
         "statusCode": 200,
-        "body": json.dumps({"sent": True, "sources_included": [d["source"] for d in digests]}),
+        "body": json.dumps({
+            "sent": True,
+            "digest_s3_key": digest_s3_key,
+            "newly_tracked_count": len(digest_data["newly_tracked_markets"]),
+            "resolved_count": len(digest_data["resolved_markets"]),
+        }),
     }

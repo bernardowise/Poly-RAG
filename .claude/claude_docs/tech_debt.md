@@ -813,3 +813,249 @@ calls), 0 failures. Final `link_type` distribution: 896 `direct`, 802 `shared_ev
 registry grows (not hit yet at 94 calls/cycle), or `shared_event`/`shared_series` comments turn
 out too noisy to be useful once retrieval/RAG work (Day 4) can actually measure signal quality
 rather than just coverage.
+
+---
+
+## Design Question: Should Comments Live Inside ingest_polymarket? (resolved 2026-08-16)
+
+**Issue (raised by the user, same day Comments was deployed):** Comments and odds both hit
+`gamma-api.polymarket.com`, no separate auth, no separate domain -- unlike News (a different
+domain entirely) or the old Bluesky (a different platform with its own auth). This raised a fair
+question: if the separation into independent Lambdas was originally justified as "one Lambda per
+data source," doesn't Comments belong inside `ingest_polymarket` since it's the same source?
+
+**Answer: the real criterion was always failure isolation, not "one Lambda per API domain" --
+that distinction just wasn't made explicit until this question forced it.** The original Day 2
+rationale (see "Data Source Dependency Risk" and the 3-Lambda pattern throughout this file) was
+"a failure in one source doesn't block the others." Comments and odds sharing a domain doesn't
+change their failure profiles: odds is the project's core differentiator (the time-series) and
+must not be blocked by anything; Comments has its own tighter rate limit (200 req/10s vs. the
+general Gamma API's 4000 req/10s) and inherently noisier data (shared_event/shared_series
+comments). Merging them would save one Lambda but reintroduce exactly the coupling risk the
+3-Lambda split existed to avoid -- a Comments timeout or rate-limit backoff could delay or block
+that cycle's odds snapshot write.
+
+**What already reflects the right boundary:** `ingest_polymarket` extracts
+`comment_entity_type`/`comment_entity_id` from the SAME `/markets` response it already fetches
+for odds (no extra API call, `events[]` is already in that payload) -- this part genuinely
+belongs with odds, since it's free data riding along with a call already being made. But the
+actual `/comments` fetch, with its own rate limit and its own risk of partial failure across up
+to ~94 grouped calls, stays in `ingest_comments`. The split isn't "by domain," it's "by which
+data must never be blocked by which other data's failure risk."
+
+**Revisit if:** this reasoning stops holding -- e.g. if Comments becomes fast/reliable enough
+that the isolation benefit is negligible, or if operational overhead of a 4th Lambda (cold
+starts, EventBridge rules, IAM surface) becomes a real cost worth trading against.
+
+---
+
+## Bespoke Digest Redesign (deployed 2026-08-16)
+
+**Issue:** the original `send_digest` was a flat text email concatenating each ingestion
+Lambda's own `llm_summary` field -- three disconnected paragraphs, one per source, each written
+blind to the other two. No structure beyond raw prose, and (separately) `SOURCES` still listed
+`bluesky` after it was destroyed, with no `comments` entry at all.
+
+**Redesign:** two real changes, not just a visual refresh.
+
+1. **The digest is now a data artifact first, an email second.** A structured JSON
+   (`digest/YYYY-MM-DD/HH.json`) is written to S3 BEFORE the email is sent -- this is the source
+   of truth, since the digest is meant to be ingested into the RAG corpus later (Day 4/5) and a
+   rendered HTML email is the wrong format to re-parse for that. The email HTML is generated FROM
+   the JSON, not authored independently.
+2. **Content is synthesized across sources, not concatenated.** New fields: `newly_tracked_markets`
+   and `resolved_markets` (with real `market_id`/`question`/outcome, not just counts --
+   `ingest_polymarket` was extended to carry these in its own S3 payload, since it already
+   computes them but previously only wrote the count), `top_volatility` (reads each open market's
+   last 2 odds snapshots from `odds/<market_id>.json` and ranks by price delta -- movement, not
+   just current price), and verbatim `quotes` (real article titles / real trader comments, not
+   LLM-paraphrased). One new Bedrock call (`synthesize_executive_summary`) sees all of this
+   together and writes a 2-3 sentence narrative tying odds movement, news, and sentiment into one
+   story -- verified in production to produce genuinely useful synthesis (e.g. correctly
+   identifying that a cluster of near-1.0 sports odds moves were probably game completions, not
+   predictive trading, and noting when news coverage had NO corresponding odds movement, which is
+   itself a signal).
+
+**IAM additions:** `send_digest_role` gained `dynamodb:GetItem`/`Scan` (registry reads for
+volatility + market_id/question lookups), `bedrock:InvokeModel` (executive summary), and
+`s3:PutObject` scoped to `digest/*` (previously read-only -- this role never wrote to S3 before).
+Timeout raised 30s -> 60s to cover the registry scan + one S3 read per open market + one Bedrock
+call, more work than the old flat concatenation of 3 pre-existing summaries.
+
+**Bugs found and fixed during testing (same day):**
+- First test hit `AccessDenied` on `s3:PutObject` -- the role had never needed to write before,
+  fixed by adding the scoped statement above.
+- `SOURCES` dict referenced count fields (`article_count`, `comment_count`) that don't actually
+  exist in News/Comments' own payloads -- those Lambdas only ever wrote the raw `articles`/
+  `comments` list, never a separate count field. Fixed by reading `len()` of the actual list field
+  instead of a nonexistent count field (`SOURCE_LIST_FIELDS`).
+- A leftover reference to the old variable name `resolved_count` (renamed to `resolved_markets`
+  during the payload-enrichment edit) survived in the Lambda's own return-value body, causing a
+  `NameError` on the very next real invocation after the rename -- caught by actually invoking the
+  Lambda in production rather than trusting the syntax check alone.
+
+**Verified in production:** real digest generated and emailed showing a genuinely new market
+(`Will Jesus Christ return before 2027?`), correct per-source item counts (72 articles, 2506
+comments), and a coherent executive summary connecting Bitcoin odds movement, a lack of political
+market reaction to real polling news, and unrelated entertainment-focused trader comments.
+
+**Revisit if:** the RAG ingestion work (Day 4/5) reveals the digest JSON schema needs different
+fields than what's captured here -- this was designed for email readability + a reasonable first
+guess at RAG-ingestible structure, not validated yet against actual retrieval needs.
+
+---
+
+## Digest Emails Land in Spam -- DKIM Not Configurable for a Third-Party Domain (found 2026-08-16)
+
+**Issue:** digest emails from `poly-rag-send-digest` keep landing in Gmail spam even after being
+manually marked "not spam" -- the misclassification recurs on every new send rather than being
+remembered.
+
+**Root cause, confirmed via `aws sesv2 get-account` and `aws ses get-identity-dkim-attributes`:**
+`DkimEnabled: false`. Without a DKIM signature (and without SPF/DMARC alignment), Gmail cannot
+verify the email was sent by an authorized party for the sender's domain, so it treats every send
+as suspicious regardless of prior manual overrides.
+
+**Why this can't be fixed by enabling DKIM in SES alone:** the sender is `bernardolw@gmail.com`
+-- a Gmail address, not a domain the project controls. DKIM works by publishing a public key in
+the SENDER DOMAIN's DNS (`gmail.com`), which only Google can modify. SES cannot sign mail as
+`@gmail.com` no matter how it's configured, because that requires write access to Google's DNS,
+not just AWS permissions. Same reasoning rules out SPF/DMARC alignment as a workaround -- Gmail's
+own SPF record doesn't authorize SES's IP ranges to send as `gmail.com`.
+
+**Real fix (not applied, explicit user choice 2026-08-16):** the only permanent solution is
+sending from a domain the project actually controls (e.g. a cheap purchased domain, ~$10-12/yr
+via Route53 or another registrar), configuring SES's Easy DKIM for that domain (3 CNAME records
+in its own DNS), and changing `SES_SENDER` to an address on that domain. Also gets the project out
+of SES sandbox mode's reputation drag as a side benefit. Not pursued today -- user explicitly
+chose to leave it as-is and filter manually rather than add domain-purchase/DNS setup scope right
+now.
+
+**Revisit if:** spam misclassification becomes a real problem (e.g. missing a time-sensitive
+digest), or a project domain gets purchased for other reasons anyway (at which point wiring DKIM
+for the existing SES setup is cheap incremental work, not a new project).
+
+---
+
+## Strict Ingestion Chaining Replaces Independent 12h Timers (deployed 2026-08-16)
+
+**Issue:** the original ingestion design ran all 3 (later 4) Lambdas on independent EventBridge
+timers, all firing at the same instant (00:00/12:00 UTC), with `send_digest` on a fixed 5-minute
+offset assumed to be "enough time" for the others to finish. Real production data showed this
+assumption was false and, worse, silently wrong: a market that `ingest_polymarket` newly tracked
+this cycle got zero News coverage, because News's timer fired at the same moment as Polymarket's
+and read a registry snapshot that (by the time News actually ran its search) didn't yet reflect
+that day's newly-tracked market in a way News's own logic could act on consistently. The digest
+similarly picked up a stale News payload from the PRIOR cycle rather than the current one, because
+News (with the parallel fan-out redesign) could take anywhere from ~10 min to well over an hour,
+far past the 5-minute digest offset.
+
+**Root architectural problem:** News and Comments were never actually independent of Polymarket --
+both read the market registry Polymarket writes (open markets, questions, comment_entity_type).
+Running them on separate timers was an illusion of isolation; in practice it meant they could run
+against a registry that hadn't been updated yet for that cycle, silently producing incomplete or
+wrong results rather than failing loudly.
+
+**Fix: strict sequential chaining.** Only `ingest_polymarket` is triggered by EventBridge now
+(00:00/12:00 UTC) -- it is the sole entry point. On completion, it invokes `ingest_news` directly
+(`lambda.invoke`, `InvocationType=Event`) with `cycle_started_at` threaded through. News's fan-out
+design (see "News Source Redesign" update) already tracks when its OWN cycle is complete (the
+`cycle_complete: true` merge) -- that exact trigger point now also invokes `ingest_comments`
+directly. Comments, which always completes in a single invocation (no fan-out), invokes
+`send_digest` at the end of its own handler. The 3 downstream EventBridge rules (News, Comments,
+digest) were deleted from Terraform entirely -- nothing fires them except the chain itself.
+
+**Explicit trade-off accepted:** this reverses the "3 independent Lambdas, one failure doesn't
+block the others" isolation principle from Day 2. If Polymarket fails, nothing else runs that
+cycle. User's own reasoning for accepting this (2026-08-16): News/Comments were never truly
+independent of Polymarket's registry write in the first place -- the old "isolation" just meant
+they'd run anyway against stale data rather than not running at all, which is worse, not better.
+Consistency of what each stage sees now takes priority over failure isolation.
+
+**Real bug found and fixed during the first production test of the new chain (same day):**
+`ingest_news`'s fan-out dispatcher (offset=0) computed `total_markets`/`all_offsets` from a fresh
+`get_open_markets()` scan, and every subsequent batch (including whichever one attempts the final
+merge) ALSO independently re-scanned the registry to recompute the same numbers. DynamoDB `Scan`
+is only eventually consistent -- two scans minutes apart, from different Lambda invocations, are
+not guaranteed to return the same count even with no real underlying data change. In the first
+real test, this caused the last batch to compute a different `all_offsets` set than what was
+actually dispatched, so `merge_batch_payloads` never found a complete matching set of
+`_batch<offset>.json` files, the merge silently never happened, and the chain never advanced to
+Comments/digest -- with no error, no log, nothing indicating anything was wrong. Root-caused via
+direct evidence: the 5 markets that changed status (4 resolved, 5 newly tracked) all had the exact
+same `first_seen`/`resolution_date` timestamp as the Polymarket run that kicked off the chain,
+proving the registry was already stable BEFORE News started, ruling out "the registry kept
+changing mid-cycle" as the explanation. **Fix:** `total_markets` is now computed ONCE by the
+dispatcher and threaded through every fanned-out batch's invocation payload (`total_markets` key)
+instead of being re-derived by each batch independently -- every batch in a cycle now agrees on
+the same expected-offset set by construction, not by hoping two DynamoDB scans agree.
+
+**Second real failure found in the same test, after the fix, on the RE-run:** even with the
+`total_markets` bug fixed, one batch (offset=0, which also does the fan-out dispatch work itself)
+genuinely hit Lambda's 900s hard timeout while extracting articles from slow-responding outlets --
+a real timeout, not a bug in the counting logic. This exposed a second, distinct unattended-
+failure mode: a single slow batch blocks the ENTIRE downstream chain (Comments, digest) with no
+retry and no notification. User's reaction, verbatim: "esto me genera mucho escepticismo... que
+pasara cuando se ejecute cada 12 horas... no estamos ni tu ni yo para depurar." Correctly
+identified that a chain which only works when someone is watching and can manually re-invoke the
+missing batch is not actually production-ready for a 12h unattended cadence.
+
+**Fix: `poly-rag-watchdog-ingest-news`, a new Lambda on a 10-minute EventBridge schedule.**
+Finds the most recent News cycle from S3 batch-file listings, checks whether that cycle's final
+merged file already exists (nothing to do if so), and if not -- and at least
+`RETRY_AFTER_MINUTES = 20` has passed since that cycle started (real margin over the 900s/15-min
+Lambda timeout case, so a batch that's merely still running isn't mistaken for stuck) -- re-invokes
+`ingest_news` directly for whichever expected offsets have no corresponding S3 file yet. Reuses
+the SAME `total_markets` value the stuck cycle's batches already agreed on (read from an existing
+batch file, not a fresh scan -- consistent with the fix above, not reintroducing the same class of
+bug). Idempotent: re-invoking an offset that's actually still in-flight or already succeeded is
+safe (News's own URL-dedup table prevents duplicate work; the batch file write is an overwrite,
+not an append). IAM scoped to exactly `lambda:InvokeFunction` on `ingest_news` plus S3 read on the
+data bucket -- nothing broader.
+
+**Not implemented (explicitly deferred):** an alerting mechanism (e.g. CloudWatch Alarm + SNS/SES
+email) if a cycle is still stuck even after watchdog retries, or if the watchdog itself fails.
+Today, if the watchdog's retry ALSO times out repeatedly, the cycle stays stuck with no human
+notification -- same silent-failure risk one level up. User was offered this as an option
+(alongside the retry mechanism) and chose to prioritize the retry first; alerting remains
+unaddressed.
+
+**Revisit if:** the watchdog's own retries prove insufficient in practice (e.g. the same offset
+keeps timing out repeatedly, suggesting a specific batch of markets or outlets is systematically
+too slow rather than transiently slow), or if the lack of alerting on a truly stuck cycle (retries
+exhausted, no human watching) causes a real missed cycle to go unnoticed for an extended period.
+
+**Verified end-to-end (2026-08-16, after the total_markets fix and watchdog deploy):** a full
+chain run completed automatically -- Polymarket -> News (cycle_complete: true, 73 articles) ->
+Comments (2587 comments) -> digest, all self-triggered with no manual invocation of Comments or
+digest. Real digest output: 4 newly-tracked markets, coherent cross-source executive summary
+(correctly identified in-progress sports markets as the source of the biggest odds swings, not
+predictive trading). This is the first confirmed working run of the strict chain end-to-end.
+
+**Two new (non-blocking) issues found in this same run, not yet fixed:**
+1. **Comments/digest write to the WRONG hour partition.** `ingest_comments` and `send_digest`
+   both build their S3 key from `datetime.now(timezone.utc)` (wall-clock time when they happen to
+   run) instead of the `cycle_started_at` that travels through the rest of the chain. In this run,
+   News started at 01:56 UTC but Comments/digest didn't run until ~02:29 (the News stage took ~33
+   min due to the offset=0 retries), so their output landed under the `02` hour prefix
+   (`comments/2026-08-16/02.json`, `digest/2026-08-16/02.json`) instead of `01`, misaligned with
+   News's own `01.json`. Doesn't break the chain itself, but breaks the assumption that all 3
+   sources' outputs for one logical cycle share the same hour-prefix key -- something a Day 4/5
+   RAG ingestion job correlating sources by S3 partition would need to know about.
+2. **Double-trigger from concurrent offset=0 retries.** Because 3 offset=0 invocations were
+   in-flight simultaneously during this test (2 manual duplicates + 1 from the watchdog), 2 of
+   them independently found the completed batch set and each triggered a merge + chain-forward --
+   Comments and send_digest each ran twice. Harmless in this case (idempotent operations, no
+   duplicate email since SES doesn't dedupe but only one send_digest invocation actually happened
+   before the other's chain reached that point -- verified via CloudWatch, both send_digest
+   invocations completed cleanly) but wasteful (extra Bedrock calls, extra S3 writes). Only
+   possible because of the manual duplicate invocations sent during debugging today -- a real
+   production cycle would only ever have ONE offset=0 dispatch under normal operation, so this
+   specific double-trigger is not expected to recur outside of manual intervention scenarios like
+   today's.
+
+**Revisit if:** Day 4/5 RAG ingestion needs same-cycle sources aligned under one S3 prefix (fix
+issue 1 by threading `cycle_started_at` into Comments/digest's own S3 key construction, same
+pattern already used for News's batch files) -- or if double-triggers start happening during
+normal (non-manual-intervention) operation, which would indicate the watchdog's retry logic
+itself needs a lock/guard against retrying an offset that's already in flight.

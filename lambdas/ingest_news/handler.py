@@ -75,6 +75,10 @@ PROCESSED_URLS_TABLE = os.environ.get("PROCESSED_URLS_TABLE", "poly-rag-processe
 DOMAIN_FAILURES_TABLE = os.environ.get("DOMAIN_FAILURES_TABLE", "poly-rag-domain-failures")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
+# Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion Chaining"):
+# only invoked once, by whichever batch actually completes the cycle (see
+# lambda_handler) -- not on every intermediate batch.
+NEXT_LAMBDA_NAME = os.environ.get("NEXT_LAMBDA_NAME", "poly-rag-ingest-comments")
 
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 RESULTS_TARGET_PER_MARKET = 5
@@ -96,6 +100,14 @@ s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
 lambda_client = boto3.client("lambda")
+
+
+def invoke_next_stage(cycle_started_at):
+    lambda_client.invoke(
+        FunctionName=NEXT_LAMBDA_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({"cycle_started_at": cycle_started_at}),
+    )
 
 # trafilatura's default DOWNLOAD_TIMEOUT is 30s -- observed in production
 # (2026-08-15) causing 3 consecutive Lambda timeouts: a single slow/blocked
@@ -132,8 +144,22 @@ def get_open_markets(table):
     return [(m["market_id"], m["question"]) for m in markets if m.get("question")]
 
 
+def sanitize_query(question):
+    """Strips literal quote characters from a market's question before it
+    becomes a Google News search query. Some Polymarket questions embed
+    quotes around a title/name (e.g. 'Will "My Life With the Walter Boys:
+    Season 3" be the top US Netflix show this week?') -- passed through
+    unchanged, those quotes would make Google treat the enclosed text as an
+    exact-phrase match instead of the free-text relevance search this
+    design relies on (see module docstring). This only strips quote
+    characters, it does not otherwise reformulate the question -- still
+    verbatim in every other respect."""
+    return question.replace('"', "").replace("'", "").replace(""", "").replace(""", "")
+
+
 def search_google_news(question):
-    params = urllib.parse.urlencode({"q": question, "hl": "en-US", "gl": "US", "ceid": "US:en"})
+    query = sanitize_query(question)
+    params = urllib.parse.urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
     url = f"{GOOGLE_NEWS_RSS_URL}?{params}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as response:
@@ -341,7 +367,7 @@ DISPATCH_STAGGER_SECONDS = 3  # small gap between fanned-out invokes -- avoids
 # a request-concurrency concern, not an IP-identity one).
 
 
-def dispatch_remaining_batches(context, offsets, cycle_started_at):
+def dispatch_remaining_batches(context, offsets, cycle_started_at, total_markets):
     """Fires every remaining batch as an independent async invocation
     (fan-out), instead of chaining one invoke per batch. Each batch writes
     to its own S3 key, so there's no shared-state race between them.
@@ -349,7 +375,20 @@ def dispatch_remaining_batches(context, offsets, cycle_started_at):
     against the same outlets/Google -- this call itself only costs a few
     seconds total (invoke() with InvocationType=Event returns immediately,
     it doesn't wait for the batch to run), it doesn't block the dispatcher's
-    own batch-0 work from starting late."""
+    own batch-0 work from starting late.
+
+    total_markets travels through the payload (fixed 2026-08-16, see
+    tech_debt.md "Strict Ingestion Chaining" -- found via a real stuck
+    cycle): previously every batch independently re-scanned the registry
+    to compute total_markets/all_offsets, and DynamoDB Scan is only
+    eventually consistent -- two scans minutes apart, from different Lambda
+    invocations, could observe different results even with no real data
+    change in between, so the batch that tried to do the final merge
+    computed a different expected-offsets set than what was actually
+    dispatched, and the merge (and the invoke of the next chain stage)
+    silently never happened. Fixed by computing this ONCE in the
+    dispatcher and passing it through every downstream invocation instead
+    of re-deriving it."""
     for i, offset in enumerate(offsets):
         if i > 0:
             time.sleep(DISPATCH_STAGGER_SECONDS)
@@ -360,6 +399,7 @@ def dispatch_remaining_batches(context, offsets, cycle_started_at):
                 "offset": offset,
                 "cycle_started_at": cycle_started_at,
                 "mode": "batch",
+                "total_markets": total_markets,
             }),
         )
 
@@ -404,12 +444,20 @@ def lambda_handler(event, context):
     processed_urls_table = dynamodb.Table(PROCESSED_URLS_TABLE)
     domain_failures_table = dynamodb.Table(DOMAIN_FAILURES_TABLE)
     open_markets = get_open_markets(registry_table)
-    total_markets = len(open_markets)
-    all_offsets = list(range(0, total_markets, BATCH_SIZE))
 
     offset = event.get("offset", 0)
     cycle_started_at = event.get("cycle_started_at") or datetime.now(timezone.utc).isoformat()
     mode = event.get("mode")  # None on the dispatch/first invocation, "batch" on fanned-out workers
+
+    # total_markets is fixed ONCE by the dispatcher and threaded through
+    # every fanned-out batch's payload (see dispatch_remaining_batches for
+    # why -- re-scanning per batch let DynamoDB's eventual consistency
+    # cause the final merge to silently never trigger). Only the dispatch
+    # invocation (mode is None) computes it fresh from the current scan.
+    total_markets = event.get("total_markets")
+    if total_markets is None:
+        total_markets = len(open_markets)
+    all_offsets = list(range(0, total_markets, BATCH_SIZE))
     batch = open_markets[offset:offset + BATCH_SIZE]
 
     # Dispatch step: only the very first invocation of a cycle (offset=0,
@@ -418,7 +466,7 @@ def lambda_handler(event, context):
     if mode is None and offset == 0:
         remaining_offsets = [o for o in all_offsets if o != 0]
         if remaining_offsets:
-            dispatch_remaining_batches(context, remaining_offsets, cycle_started_at)
+            dispatch_remaining_batches(context, remaining_offsets, cycle_started_at, total_markets)
 
     fetch_start = time.time()
     batch_articles = []
@@ -490,6 +538,11 @@ def lambda_handler(event, context):
             Body=json.dumps(merged),
             ContentType="application/json",
         )
+        # Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion
+        # Chaining"): only the batch that actually completes the cycle
+        # advances the chain -- an intermediate batch finishing must not
+        # trigger Comments early.
+        invoke_next_stage(cycle_started_at)
 
     return {
         "statusCode": 200,

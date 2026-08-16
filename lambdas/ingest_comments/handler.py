@@ -53,6 +53,12 @@ METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
+# Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion
+# Chaining"): the final stage before the digest -- Comments always
+# completes in one invocation (no fan-out like News), so unlike ingest_news
+# this can simply invoke at the end of lambda_handler, no "am I the last
+# batch" check needed.
+NEXT_LAMBDA_NAME = os.environ.get("NEXT_LAMBDA_NAME", "poly-rag-send-digest")
 
 GAMMA_COMMENTS_URL = "https://gamma-api.polymarket.com/comments"
 COMMENTS_PER_ENTITY = 20
@@ -62,6 +68,15 @@ BASE_BACKOFF_SECONDS = 2
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
+lambda_client = boto3.client("lambda")
+
+
+def invoke_next_stage():
+    lambda_client.invoke(
+        FunctionName=NEXT_LAMBDA_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({}),
+    )
 
 
 def get_open_markets_with_comment_links(table):
@@ -281,6 +296,10 @@ def lambda_handler(event, context):
         latency_ms=total_latency_ms,
         items_processed=len(all_comments),
     )
+
+    # Last stage before the digest -- see tech_debt.md "Strict Ingestion
+    # Chaining".
+    invoke_next_stage()
 
     return {
         "statusCode": 200,

@@ -109,6 +109,22 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
     actions   = ["lambda:InvokeFunction"]
     resources = [aws_lambda_function.ingest_news.arn]
   }
+
+  statement {
+    # Strict ingestion chaining (2026-08-16, see tech_debt.md "Strict
+    # Ingestion Chaining"): ingest_polymarket invokes ingest_news,
+    # ingest_news invokes ingest_comments, ingest_comments invokes
+    # send_digest -- each stage only starts once the one before it has
+    # fully written its data, since News/Comments depend on the registry
+    # ingest_polymarket writes. Scoped to exactly the 3 downstream targets
+    # this shared role's Lambdas need to invoke, not "*".
+    effect  = "Allow"
+    actions = ["lambda:InvokeFunction"]
+    resources = [
+      aws_lambda_function.ingest_comments.arn,
+      aws_lambda_function.send_digest.arn,
+    ]
+  }
 }
 
 resource "aws_iam_role_policy" "ingest_lambda_permissions" {
