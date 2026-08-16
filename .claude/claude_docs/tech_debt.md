@@ -188,11 +188,19 @@ alone — platforms tighten previously-open endpoints without much notice.
 - Refactoring risk if framework choice changes mid-project
 
 **Mitigation:**
-- Make explicit framework choice within first month of development
 - Keep framework-specific code isolated so pivoting is lower-cost
 - Document pros/cons of each approach in decision log
 
-**Revisit if:** Framework maturity or API stability changes unexpectedly.
+**Scheduled (2026-08-16):** this had never landed on a concrete task despite being called out in
+CLAUDE.md/README since day zero -- everything built so far (the 4 ingestion Lambdas,
+`synthesize_executive_summary` in send_digest) is plain boto3+Bedrock, no framework. Explicitly
+added as gerdau/sprint_plan.md Day 5, block 2: decide LangChain/LlamaIndex vs. continuing with
+boto3 directo specifically for the synthesis Lambda (retrieval + prompt-building + LLM call +
+possible tool-calling), where that pattern is the actual use case those frameworks target --
+informed by what's already working, not decided in the abstract before any code exists.
+
+**Revisit if:** Framework maturity or API stability changes unexpectedly, or Day 5 work reveals
+boto3 direct is sufficient and the framework question resolves itself by not mattering in practice.
 
 ---
 
@@ -1152,3 +1160,37 @@ Enrichment section.
 send_digest's cost is negligible enough that tracking it separately isn't worth the row, or if the
 digest's executive-summary prompt grows enough (e.g. more sources, longer synthesis) that its cost
 becomes a meaningful fraction of the per-cycle total rather than a rounding error.
+
+---
+
+## LLM-in-Ingestion Trial Closed as Canon -- RAG-Optimization Pass Deliberately Deferred (2026-08-16)
+
+**Decision (explicit, by the user, 2026-08-16):** the LLM-in-ingestion trial (started 2026-08-13,
+originally framed as optional/reversible under the strict $5/mo hard-cap regime) is now canon, not
+an open question. Two things changed since the original framing: (1) the ingestion redesign
+(verifiability filter + registry) made the LLM step the quality gate itself -- ingestion literally
+does not work the same way without it, unlike the original "nice-to-have summary" framing; (2) with
+News/Comments now live and the digest synthesizing across all three sources, LLM enrichment output
+is a direct input to the future RAG corpus (Day 4/5), not just a convenience for the human-readable
+digest email. Real measured cost from the first clean canonical cycle (2026-08-16, 12:00 UTC, all
+4 Lambdas, Comments in the mix): $0.147/cycle, ~$8.85/month projected -- see architecture_canon.md,
+"LLM Enrichment (Ingestion) -- Canon" for the full breakdown. Higher than the pre-redesign historical
+estimate (~$1.10/mo) mainly because News now generates its own LLM summary per batch (up to 11 calls
+in a full fan-out cycle) rather than once per run under the old 10-feeds-RSS design. Still well
+within the $120 promotional-credit buffer and the "spend deliberately, not miserly" principle in
+CLAUDE.md.
+
+**Explicitly deferred, not forgotten:** the current LLM enrichment output (per-source `llm_summary`
+fields, digest's `executive_summary`) was designed and tuned for human readability (the digest email)
+-- it has never been evaluated or optimized for what actually makes good RAG retrieval input
+(chunking granularity, what metadata to preserve alongside the summary, whether summarization loses
+information a retriever would want raw, embedding-friendly structure, etc.). User's explicit framing:
+this optimization pass happens later, when the RAG/retrieval layer itself gets designed (Day 4/5) --
+not now, and not on a fixed timeline. Revisiting the ingestion LLM prompts/output shape before the
+RAG design exists would mean optimizing for a consumer that doesn't have requirements yet.
+
+**Revisit if:** RAG/retrieval design work (Day 4/5) begins and reveals the current LLM enrichment
+output shape is a poor fit for retrieval (e.g. summaries are too lossy, chunking doesn't align with
+how the retriever wants to split documents, key entities/timestamps aren't preserved in a queryable
+way) -- at that point, redesign the enrichment prompts/output specifically for RAG consumption,
+informed by real retrieval requirements rather than guessed upfront.

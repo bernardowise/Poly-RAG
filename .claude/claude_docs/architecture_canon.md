@@ -350,11 +350,16 @@ Source Replaces Bluesky".
 
 ---
 
-## LLM Enrichment (Ingestion) -- Trial en curso
+## LLM Enrichment (Ingestion) -- Canon (trial cerrado 2026-08-16)
 
-**Estado:** trial activo desde 2026-08-13, evaluando 3-4 dias antes de decidir
-mantener/revertir. Ver tech_debt.md y session_ledger.md para el razonamiento
-completo detras de esta decision.
+**Estado:** ya no es un trial opcional -- es canon. Decision cerrada explicitamente
+por el usuario 2026-08-16: el rediseno de ingestion (filtro de verificabilidad +
+Comments) convirtio al LLM en el filtro de calidad mismo, no un resumen opcional
+encima de un pipeline que funcionaria igual sin el -- ademas, con las nuevas fuentes,
+el LLM enrichment es un input directo del RAG (Day 4/5), no solo una conveniencia de
+lectura humana. Queda pendiente en tech_debt.md una pasada de optimizacion
+especificamente para consumo RAG (no para email humano) -- deliberadamente diferida
+hasta que se diseñe la capa de retrieval, no un pendiente urgente hoy.
 
 - **Modelo:** Claude Sonnet 4.5 via Bedrock (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`,
   inference profile -- Sonnet 5 aun no disponible sin contacto a AWS Sales)
@@ -363,20 +368,28 @@ completo detras de esta decision.
 - **Auth:** IAM (boto3 bedrock-runtime), mismas credenciales que S3/DynamoDB --
   sin API key separada de Anthropic
 - **Toggle:** variable de entorno `USE_LLM_ENRICHMENT` (true/false) por Lambda,
-  permite comparar con/sin LLM en la misma tabla de metricas
+  sigue existiendo tecnicamente pero ya no es una decision pendiente -- es config,
+  no un experimento
 
-**Costo real medido, filtro viejo por vertical (2026-08-13/14, pre-rediseno,
-cifras historicas -- Bluesky ya no existe, tabla no actualizada desde el
-reemplazo por Comments):**
+**Costo real medido, primera corrida canonica limpia (2026-08-16, ciclo de las
+12:00 UTC, automatico end-to-end, las 4 Lambdas, Comments ya en el mix en vez de
+Bluesky):**
 
-| Fuente | Items/corrida | Costo/corrida |
-|---|---|---|
-| Polymarket | ~22 | ~$0.0064 |
-| News | ~93 | ~$0.0057 |
-| Bluesky (descontinuado) | ~50 | ~$0.0063 |
+| Fuente | Costo/corrida |
+|---|---|
+| Polymarket | $0.032607 |
+| News (11 batches) | $0.103491 |
+| Comments | $0.004965 |
+| send_digest (executive summary) | $0.006357 |
+| **Total ciclo completo** | **$0.147420** |
 
-Total ciclo completo (cifra historica): ~$0.018. Proyectado a cadencia de 12h:
-~$1.10/mes. Pendiente: remedir con Comments en el mix en vez de Bluesky.
+Proyectado a cadencia de 12h (2x/dia, ~30 dias): **~$8.85/mes**. Sube frente a la
+cifra historica pre-rediseno (~$1.10/mes) principalmente porque News ahora genera su
+propio resumen LLM POR BATCH (hasta 11 llamadas en un ciclo con fan-out completo),
+no una sola llamada por corrida como el diseno viejo de 10-feeds-RSS. Sigue dentro
+del buffer de $120 en creditos promocionales y de la disciplina de "gastar
+deliberadamente, no miseria" de CLAUDE.md, pero es una cifra real a vigilar, no la
+que se asumia originalmente.
 
 **Costo del bootstrap del rediseno (2026-08-15):** ~500 candidatos, ~25 llamadas
 Bedrock batched (20/batch), estimado ~$0.35-0.40 -- costo de arranque UNA VEZ, no
@@ -443,16 +456,21 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
 
 ## Pendiente para completar el ciclo de ingestion
 
-- Confirmado (2026-08-15): las 4 Lambdas corren solas via EventBridge -- el ciclo
-  automatico de las 12:00 UTC del 15 corrio sin intervencion manual (nota: una
-  de esas 4, Bluesky, ya no existe -- reemplazada por Comments el 2026-08-16)
-- Cierre del trial LLM-en-ingestion (3-4 dias de datos, ver seccion LLM Enrichment)
-  -- el rediseno de ingestion hace que el LLM ahora sea el filtro de calidad mismo,
-  no solo un resumen opcional, lo cual refuerza el caso para mantenerlo
+- Confirmado (2026-08-16): las 4 Lambdas corren solas via EventBridge, cadena
+  estricta completa -- el ciclo automatico de las 12:00 UTC del 16 corrio
+  end-to-end sin intervencion manual (News 367/367, cycle_complete true), primera
+  corrida canonica limpia con Comments ya en el mix en vez de Bluesky
+- Cerrado (2026-08-16): trial LLM-en-ingestion -> canon, ver seccion LLM
+  Enrichment. Queda pendiente en tech_debt.md una pasada de optimizacion del
+  formato de enrichment especificamente para consumo RAG, deliberadamente
+  diferida hasta el diseño de la capa de retrieval (Day 4/5)
 - Medir en la practica la tasa real de ids nuevos por ciclo (determina el costo de
   estado-estable real, ver seccion "Market Registry + Ingestion Redesign")
-- Remedir el costo de LLM Enrichment con Comments en el mix (la tabla de costos
-  arriba sigue con la cifra historica de Bluesky, no actualizada aun)
+- Limpieza pendiente de `poly-rag-architecture-metrics`: filas de `ingest_bluesky`
+  (fuente ya no existe) y ruido de desarrollo del 2026-08-16 (reintentos/debugging
+  antes de la primera corrida canonica) -- diferido hasta confirmar 1-2 ciclos
+  canonicos limpios consecutivos, para no perder evidencia de depuracion si algo
+  falla en el proximo ciclo
 - `odds_old_2026-08-15/` en S3: 700 archivos del bootstrap con schema obsoleto,
   movidos ahi en vez de borrados -- desechar oficialmente en unos dias una vez
   confirmada la calidad del nuevo bootstrap
