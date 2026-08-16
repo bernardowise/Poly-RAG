@@ -72,12 +72,21 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 PROCESSED_URLS_TABLE = os.environ.get("PROCESSED_URLS_TABLE", "poly-rag-processed-urls")
+DOMAIN_FAILURES_TABLE = os.environ.get("DOMAIN_FAILURES_TABLE", "poly-rag-domain-failures")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
 
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 RESULTS_TARGET_PER_MARKET = 5
 RSS_FETCH_COUNT = 15  # over-fetch since some results will fail decode/extract/dedup
+
+# Domains with this many consecutive extraction failures are skipped
+# without attempting the request -- e.g. egamersworld.com, observed
+# failing 100% of the time across many distinct markets in production
+# (2026-08-15/16). 5 gives a domain several independent chances (different
+# articles, not retries of the same URL) before it's written off, since a
+# couple of failures could be one bad article rather than a blocked site.
+BLOCKLIST_THRESHOLD = 5
 
 # ~21s/market measured (search+decode+extract) -- 35 markets is ~735s, safely
 # under Lambda's 900s hard maximum with margin for Bedrock enrichment + S3 I/O.
@@ -170,13 +179,43 @@ def extract_article(real_url):
         return None
 
 
-def process_market_news(market_id, question, processed_urls_table):
+def get_domain(url):
+    return urllib.parse.urlparse(url).netloc.lower()
+
+
+def is_domain_blocked(table, domain):
+    resp = table.get_item(Key={"domain": domain})
+    item = resp.get("Item")
+    return bool(item) and item.get("consecutive_failures", 0) >= BLOCKLIST_THRESHOLD
+
+
+def record_domain_result(table, domain, success):
+    """Resets the failure streak to 0 on any success, increments on
+    failure. A single successful extraction from a domain fully clears its
+    history -- this is a streak counter, not a lifetime failure rate, so a
+    domain that recovers (e.g. a temporary block lifts) isn't punished
+    forever for past failures."""
+    if success:
+        table.put_item(Item={"domain": domain, "consecutive_failures": 0})
+    else:
+        table.update_item(
+            Key={"domain": domain},
+            UpdateExpression="SET consecutive_failures = if_not_exists(consecutive_failures, :zero) + :one",
+            ExpressionAttributeValues={":zero": 0, ":one": 1},
+        )
+
+
+def process_market_news(market_id, question, processed_urls_table, domain_failures_table):
     """Searches Google News for this market's question verbatim, decodes
     and dedups results, and extracts full article text -- returns up to
     RESULTS_TARGET_PER_MARKET items. A result only counts toward the target
     if trafilatura successfully extracts its body text; results that fail
     extraction (paywall, anti-scraping block) are discarded, not kept as
-    title-only -- the top 5 must be full-coverage articles, not a mix."""
+    title-only -- the top 5 must be full-coverage articles, not a mix.
+    Domains with BLOCKLIST_THRESHOLD+ consecutive extraction failures
+    (tracked in poly-rag-domain-failures) are skipped without attempting
+    the request at all -- e.g. egamersworld.com, confirmed failing 100%
+    of the time across many distinct markets in production."""
     try:
         search_results = search_google_news(question)
     except Exception as e:
@@ -197,7 +236,12 @@ def process_market_news(market_id, question, processed_urls_table):
         if is_url_processed(processed_urls_table, real_url):
             continue  # already ingested in a prior cycle -- skip, don't duplicate
 
+        domain = get_domain(real_url)
+        if is_domain_blocked(domain_failures_table, domain):
+            continue  # domain has a long consecutive-failure streak -- don't bother retrying
+
         body_text = extract_article(real_url)
+        record_domain_result(domain_failures_table, domain, success=bool(body_text))
         if not body_text:
             continue  # extraction failed (paywall/block) -- discard, don't count as coverage
 
@@ -358,6 +402,7 @@ def merge_batch_payloads(cycle_started_at, total_markets, expected_offsets):
 def lambda_handler(event, context):
     registry_table = dynamodb.Table(REGISTRY_TABLE)
     processed_urls_table = dynamodb.Table(PROCESSED_URLS_TABLE)
+    domain_failures_table = dynamodb.Table(DOMAIN_FAILURES_TABLE)
     open_markets = get_open_markets(registry_table)
     total_markets = len(open_markets)
     all_offsets = list(range(0, total_markets, BATCH_SIZE))
@@ -380,7 +425,7 @@ def lambda_handler(event, context):
     batch_markets_failed = []
 
     for market_id, question in batch:
-        articles, error = process_market_news(market_id, question, processed_urls_table)
+        articles, error = process_market_news(market_id, question, processed_urls_table, domain_failures_table)
         if error:
             batch_markets_failed.append(error)
             continue

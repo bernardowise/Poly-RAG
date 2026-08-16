@@ -4,11 +4,16 @@ Poly-RAG ingestion Lambda: Polymarket Gamma API.
 Redesigned 2026-08-15 (see tech_debt.md, "Ingestion Redesign" entry). Replaces
 static keyword-vertical tagging with an LLM verifiability filter: a market is
 ingested only if its outcome resolves against a citable public record, not
-human judgment over ambiguous evidence. The same LLM call also produces a
-single combined search_query per market (not isolated keywords -- terms that
-only carry meaning together, e.g. a name plus a date, must stay combined),
-which News/Bluesky will read from the registry to drive their own searches
-(no more static VERTICAL_KEYWORDS dict).
+human judgment over ambiguous evidence.
+
+Simplified 2026-08-16 (see tech_debt.md, "Comments Source Replaces Bluesky"):
+the LLM call no longer generates search_query/news_match_terms. Neither is
+needed anymore -- News searches Google News using each market's `question`
+verbatim (see ingest_news), and the new Comments source (replacing Bluesky)
+looks up sentiment by direct event_id/series_id lookup, not text search.
+This Lambda now also extracts comment_entity_type/comment_entity_id/
+comment_link_type per market straight from the Gamma API's `events[]` field
+(no LLM involved) -- see get_comment_link.
 
 Pulls the top 500 active markets by volume24hr each cycle, diffs against the
 market registry (DynamoDB) to find genuinely new ids, and only runs the LLM
@@ -129,24 +134,9 @@ def _classify_batch(batch):
         "official statement, certified vote count, regulatory filing, market price) "
         "versus resolved by human/oracle judgment over ambiguous social evidence "
         "(e.g. celebrity rumors, disputed claims with no official record).\n\n"
-        "Also produce TWO search representations, because downstream consumers match "
-        "text differently:\n"
-        "1. search_query: a single combined free-text search string, for a search API "
-        "that accepts natural-language queries (e.g. social media search). Keep terms "
-        "that only make sense together combined in one string. Good: \"Elon Musk "
-        "Twitter posting frequency August 2026\".\n"
-        "2. news_match_terms: a short list of 1-3 DISTINCTIVE terms/phrases, for "
-        "matching against already-downloaded article text via AND logic (every term "
-        "must appear in the SAME article to count as a match -- this is substring "
-        "matching, not a search engine, so terms must be specific enough that their "
-        "co-occurrence is meaningful, not generic words that appear everywhere). "
-        "Prefer multi-word phrases over single common words. Example for the Fed "
-        "rate market: [\"Federal Reserve\", \"September 2026\"] -- NOT [\"Fed\", "
-        "\"rate\", \"2026\"], which would false-match unrelated articles.\n\n"
         f"{listing}\n\n"
         "Respond with ONLY a JSON array, one object per market, no other text:\n"
-        '[{"id": "...", "is_verifiable": true|false, "search_query": "...", '
-        '"news_match_terms": ["...", "..."]}]'
+        '[{"id": "...", "is_verifiable": true|false}]'
     )
 
     print(f"[classify_batch] prompt sent ({len(batch)} markets):\n{prompt}")
@@ -156,10 +146,13 @@ def _classify_batch(batch):
         modelId=BEDROCK_MODEL_ID,
         body=json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
-            # 2500 (up from 1500): output now carries two text fields per
-            # market (search_query + news_match_terms) instead of one, and a
-            # truncated response mid-array was observed at the old limit.
-            "max_tokens": 2500,
+            # 1500: reverted from 2500 now that the response is just
+            # is_verifiable per market (search_query/news_match_terms
+            # removed 2026-08-16 -- see tech_debt.md, "Comments Source
+            # Replaces Bluesky": neither News nor the new Comments source
+            # need LLM-generated search text, News uses `question` verbatim
+            # and Comments looks up by event_id/series_id directly).
+            "max_tokens": 1500,
             "messages": [{"role": "user", "content": prompt}],
         }),
     )
@@ -247,7 +240,32 @@ def write_metrics(source, llm_used, tokens_in, tokens_out, latency_ms, items_pro
     })
 
 
-def upsert_registry_entry(table, market, search_query, news_match_terms, now_iso):
+def get_comment_link(market):
+    """Extracts where this market's Polymarket comments live -- Event level
+    if that event has any comments, else Series level (comments shared
+    across every market in that series/league, confirmed 2026-08-16 by
+    inspecting real MLB comments: the same feed appeared verbatim under two
+    different games). Returns (entity_type, entity_id, link_type) or
+    (None, None, None) if neither has comments. link_type flags whether a
+    comment is genuinely about this specific market ("direct") or shared
+    across a whole series ("shared_series") -- not a confidence judgment,
+    the shared comments are just as real, only their attribution is
+    many-to-one instead of one-to-one. See tech_debt.md, "Comments Source
+    Replaces Bluesky"."""
+    events = market.get("events") or []
+    if not events:
+        return None, None, None
+    event = events[0]
+    if event.get("commentCount", 0) > 0:
+        return "Event", event.get("id"), "direct"
+    series_list = event.get("series") or []
+    if series_list and series_list[0].get("commentCount", 0) > 0:
+        return "Series", series_list[0].get("id"), "shared_series"
+    return None, None, None
+
+
+def upsert_registry_entry(table, market, now_iso):
+    entity_type, entity_id, link_type = get_comment_link(market)
     table.put_item(Item={
         "market_id": market["id"],
         "question": market.get("question", ""),
@@ -255,16 +273,12 @@ def upsert_registry_entry(table, market, search_query, news_match_terms, now_iso
         "end_date": market.get("endDate"),
         "resolution_source": market.get("resolutionSource", ""),
         "status": "open",
-        # Two derived search representations, because News and Bluesky match text
-        # differently -- see the redesign entry in tech_debt.md for the reasoning:
-        # - search_query: single combined free-text string, for Bluesky's
-        #   search-API-style searchPosts (accepts natural-language queries).
-        # - news_match_terms: short AND-matched term list, for substring matching
-        #   against already-downloaded RSS article text (News has no search API --
-        #   it greps its own downloaded text, so isolated common words would
-        #   false-match; every term must co-occur in the same article).
-        "search_query": search_query,
-        "news_match_terms": news_match_terms,
+        # Where to look up this market's Polymarket comments -- see
+        # get_comment_link. None/None/None if this market has no comments
+        # at either level.
+        "comment_entity_type": entity_type,
+        "comment_entity_id": entity_id,
+        "comment_link_type": link_type,
         "first_seen": now_iso,
         "last_updated": now_iso,
         "resolution_date": None,
@@ -347,9 +361,7 @@ def lambda_handler(event, context):
             verdict = classifications.get(m["id"])
             if not verdict or not verdict.get("is_verifiable"):
                 continue  # not objectively verifiable -- discard, never enters the registry
-            search_query = verdict.get("search_query", "")
-            news_match_terms = verdict.get("news_match_terms", [])
-            upsert_registry_entry(registry_table, m, search_query, news_match_terms, now_iso)
+            upsert_registry_entry(registry_table, m, now_iso)
             tracked_markets.append(m)
 
     # Every candidate id already known and still open gets a fresh odds snapshot,

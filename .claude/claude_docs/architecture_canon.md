@@ -5,7 +5,7 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-15
+Ultima actualizacion: 2026-08-16
 
 ---
 
@@ -40,12 +40,11 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
 
 ### 2. News (`poly-rag-ingest-news`)
 - **Rediseno 2026-08-16 (ver tech_debt.md, "News Source Redesign"):** reemplaza
-  por completo los 10 feeds RSS curados. Los feeds fijos quedaron obsoletos tras
-  auditar el linkeo real (367 articulos, solo 3 linkeados) y confirmar que el
-  root cause no era el matching sino el vocabulario -- el LLM generaba terminos
-  formales de Polymarket ("Federal Reserve") en vez de vocabulario periodistico
-  real ("Fed"). La seccion "News Feed Inventory" mas abajo en este documento
-  describe el diseno VIEJO y ya no aplica -- pendiente de removerse.
+  por completo los antiguos 10 feeds RSS curados (BBC/CBC/NYT/CNN/France24) y su
+  matching por keywords. Quedaron obsoletos tras auditar el linkeo real (367
+  articulos, solo 3 linkeados) y confirmar que el root cause no era el matching
+  sino el vocabulario -- el LLM generaba terminos formales de Polymarket
+  ("Federal Reserve") en vez de vocabulario periodistico real ("Fed").
 - **Fuente:** Google News RSS (`news.google.com/rss/search?q=<question>`), una
   busqueda por cada market abierto en el registry, usando `question` TAL CUAL
   como query (sin keywords generadas, sin LLM en este paso) -- delega el
@@ -65,6 +64,11 @@ individual sin tener que cruzar con la tabla DynamoDB de metricas.
   `poly-rag-processed-urls` (hash key `url`), sin TTL -- pay-per-request no
   cobra por storage ocioso, y el contenido extraido vive permanente en S3 de
   cualquier forma.
+- **Blocklist dinamico de dominios (2026-08-16):** dominios con 5+ fallos
+  consecutivos de extraccion (contador reset a 0 en cualquier exito, tabla
+  DynamoDB `poly-rag-domain-failures`, hash key `domain`) se saltan sin
+  intentar el request -- ej. egamersworld.com, confirmado fallando 100% de
+  las veces en produccion. Ver tech_debt.md, "Dynamic Domain Blocklist".
 - **Batching (fan-out paralelo, revisado 2026-08-16 mismo dia que el primer
   deploy):** ~21s/market medido end-to-end (search + decode + extract) hace
   que los ~228 markets del registry (~80 min secuenciales) no quepan en una
@@ -207,11 +211,14 @@ nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
 
 ### Linkeo News/Bluesky -> market_id (Layer 1, alta confianza)
 
-- **News:** cada articulo se etiqueta con `market_ids` (array) via AND-match de
-  `news_match_terms` contra titulo+descripcion. Todos los articulos se conservan
-  en el payload, tengan o no market_ids -- no se descartan por falta de match.
-- **Bluesky:** un `searchPosts` por market abierto usando su `search_query`;
-  cada post resultante lleva `market_ids: [ese market]`.
+- **News (rediseñado 2026-08-16, ver "News Source Redesign" en tech_debt.md):**
+  `news_match_terms` y el AND-match ya NO se usan -- cada articulo se etiqueta
+  con `market_ids: [market_id]` segun a que busqueda de Google News (una por
+  market, usando `question` tal cual) perteneciera. El linkeo es 1:1 por
+  construccion (la busqueda ya es especifica al market), no un match posterior
+  contra texto libre.
+- **Bluesky:** sin cambios -- un `searchPosts` por market abierto usando su
+  `search_query`; cada post resultante lleva `market_ids: [ese market]`.
 
 ### Retrieval por Ventana Temporal (Layer 2, contextual -- `retrieval/time_window.py`)
 
@@ -235,47 +242,19 @@ linkeados, la ventana de 24h trajo 609 articulos + 839 posts adicionales sin
 linkear -- confirma que la mayoria de la senal ambiental se perderia sin esta
 segunda capa.
 
-### Verificado en produccion (2026-08-15)
+### Verificado en produccion
 
-Bootstrap completo corrido y verificado directamente contra las tablas reales:
-505 markets trackeados en el registry, 505 archivos de odds en S3, 100% con el
-schema final (`search_query` + `news_match_terms` presentes en todos), 13 markets
-detectados como resueltos con `final_outcome` real capturado. News: 367 articulos,
-3 linkeados. Bluesky: 492 markets consultados, 689 posts, 0 fallos.
+**Bootstrap del registry (2026-08-15, tras el fix de horizonte minimo de 48h):**
+228 markets trackeados, 228 archivos de odds en S3, 100% con el schema final
+(`search_query` + `news_match_terms` presentes en todos).
 
----
+**Bluesky (2026-08-15):** 492 markets consultados, 689 posts, 0 fallos.
 
-## News Feed Inventory
-
-10 feeds RSS curados, alineados aproximadamente por vertical, en vez de un feed
-generico filtrado post-hoc. Confirmados funcionando (via curl con User-Agent de
-navegador -- varios feeds rechazan el UA default de curl, ej. CNBC devuelve 403):
-
-| Feed | URL | Vertical(es) |
-|---|---|---|
-| BBC World | `feeds.bbci.co.uk/news/world/rss.xml` | Geopolitics |
-| BBC Business | `feeds.bbci.co.uk/news/business/rss.xml` | Macro |
-| CBC Business | `cbc.ca/webfeed/rss/rss-business` | Macro |
-| CBC Top Stories | `cbc.ca/webfeed/rss/rss-topstories` | Geopolitics |
-| NYT World | `rss.nytimes.com/services/xml/rss/nyt/World.xml` | Geopolitics |
-| NYT Opinion | `rss.nytimes.com/services/xml/rss/nyt/Opinion.xml` | Macro + Geopolitics (sentiment editorial) |
-| NYT Technology | `rss.nytimes.com/services/xml/rss/nyt/Technology.xml` | Regulatory/Tech |
-| CNN Top Stories | `rss.cnn.com/rss/cnn_topstories.rss` | Geopolitics |
-| CNN World | `rss.cnn.com/rss/cnn_world.rss` | Geopolitics |
-| France 24 English | `france24.com/en/rss` | Geopolitics |
-
-**Gap conocido:** el peso de verticales esta cargado hacia geopolitica y ligero en
-regulatorio/tech (NYT Technology es la unica fuente dedicada ahi) -- revisar si
-mercados regulatorio-tech quedan desatendidos por el matching de noticias en el Dia 4.
-
-**Nota de licencia:** el aviso de copyright RSS de CBC dice "FOR PERSONAL USE ONLY"
--- aceptable para este proyecto personal de aprendizaje; requeriria revision si el
-proyecto se volviera publico/comercial.
-
-**Descartado:** Latinus (medio mexicano) evaluado pero sin feed RSS estandar
-accesible (variantes `/rss` y `/feed/` devuelven 404 o redirigen a HTML, no XML).
-Cobertura en espanol sigue siendo un gap; candidatos futuros (El Financiero, Reforma)
-sin evaluar aun.
+**News (2026-08-16, tras el rediseño a Google News RSS + fan-out paralelo):**
+228/228 markets procesados, 887 articulos, `cycle_complete: true`. Reemplaza la
+cifra vieja de 367 articulos/3 linkeados del diseño de 10-feeds-RSS +
+`news_match_terms`, que causo el rediseño completo (ver tech_debt.md, "News
+Source Redesign").
 
 ---
 

@@ -36,3 +36,22 @@ resource "aws_dynamodb_table" "processed_urls" {
     type = "S"
   }
 }
+
+resource "aws_dynamodb_table" "domain_failures" {
+  # Dynamic blocklist for outlets that consistently fail extraction (see
+  # tech_debt.md, "News Source Redesign" -- domains like egamersworld.com
+  # confirmed failing 100% of the time across many distinct markets during
+  # the 2026-08-15/16 production run). One item per domain: consecutive
+  # failure count, reset to 0 on any success, domain skipped without
+  # attempting the request once the count crosses BLOCKLIST_THRESHOLD in
+  # the handler. Chosen over a hardcoded list so it adapts to real observed
+  # failures instead of a list someone has to remember to update.
+  name         = "poly-rag-domain-failures"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "domain"
+
+  attribute {
+    name = "domain"
+    type = "S"
+  }
+}

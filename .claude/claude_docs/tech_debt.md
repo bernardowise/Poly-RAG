@@ -4,7 +4,48 @@ Track known limitations, architectural compromises, and planned refactors that m
 
 ---
 
+## Minimum-Horizon Filter Uses the Wrong Field for Sports Markets (found 2026-08-16)
+
+**Issue:** `MIN_HORIZON_HOURS = 48` in `ingest_polymarket` (see "Ingestion Redesign" entry
+below) was added specifically to exclude markets that resolve too soon to demonstrate the
+project's thesis (news/sentiment influencing odds while a market is open) -- the original
+motivating case was live sports/esports matches resolving within minutes. The filter compares
+`now` against the market's `endDate` field. Confirmed via direct Gamma API inspection
+(2026-08-16) that `endDate` for sports markets is NOT the actual game time -- it is a later
+administrative deadline (observed case: market 3448712, Kansas City Royals vs. Los Angeles
+Angels, `endDate: 2026-08-23T01:38:00Z`, roughly a week after `event.eventDate: 2026-08-15`,
+which is the real game date). The filter compared against the wrong timestamp and let a
+same-day game through the 48h horizon check.
+
+**Root cause:** `endDate` appears to represent something like "deadline for the market to be
+administratively resolved/closed" (likely with buffer for disputes, postponements, etc.), not
+"when the outcome becomes known." For non-sports markets (elections, macro events) these two
+concepts are usually close together; for sports, they can diverge by over a week.
+
+**Candidate fix (not yet implemented):** `event.eventDate` (or `event.startDate`) looks like a
+better proxy for "when does this actually resolve" for sports/recurring markets specifically --
+needs verification across a wider sample before wiring in, since the field may not exist or
+may behave differently for non-sports event types.
+
+**Revisit if:** building on the market registry's sports-market horizon accuracy becomes load-
+bearing for something (e.g. the Comments ingestion work below, which surfaced this bug while
+investigating a specific sports market) -- fix the filter to use the right field instead of
+just widening MIN_HORIZON_HOURS, which wouldn't actually solve a wrong-field bug.
+
+---
+
 ## Reddit Dropped as Data Source — Replaced by Bluesky
+
+**Update (2026-08-16, not yet deployed):** Bluesky itself is being replaced by Polymarket's own
+comments (`gamma-api.polymarket.com/comments`) as the sentiment source -- real production data
+showed most Bluesky posts were bots republishing Polymarket's own price feed, not independent
+human sentiment (circular signal). New `ingest_comments` Lambda designed and written but not yet
+deployed (`terraform apply` still pending as of this entry) -- Bluesky ingestion is still the
+live, running source in AWS until that apply runs. See the new "Comments Source Replaces
+Bluesky" entry (if present) or session_ledger.md 2026-08-16 for the full design/investigation.
+This entry (Reddit vs. the alternatives evaluated in 2026-08-13) stays as historical record of
+why Bluesky was chosen originally -- not rewritten, since Reddit's rejection reasoning is still
+accurate and unrelated to the Bluesky->Comments swap.
 
 **Issue (resolved 2026-08-13):** Reddit's OAuth2 app registration form failed silently
 (reset after reCAPTCHA + submit, no error). Root cause confirmed by reading Reddit's
@@ -660,3 +701,39 @@ fired after deploy, once from a manual dispatch -- dedup via `poly-rag-processed
 Parallel batches completed in 294s-611s each vs. ~600-800s each when sequential -- real wall-clock
 savings from not waiting on one batch to fully finish before the next starts, even though each
 individual batch's own duration didn't change.
+
+---
+
+## Dynamic Domain Blocklist for News Extraction (implemented 2026-08-16)
+
+**Issue:** during the production runs above, `egamersworld.com` was observed failing extraction
+100% of the time across many distinct markets (confirmed via CloudWatch, same domain, same
+failure pattern, no successes). Retrying it every cycle wastes ~8s (the `DOWNLOAD_TIMEOUT`) per
+attempt for zero benefit -- worth skipping known-bad domains outright rather than re-discovering
+the same failure repeatedly.
+
+**Decision (chosen explicitly over a hardcoded list via AskUserQuestion):** dynamic,
+DynamoDB-backed blocklist that adapts to real observed failures instead of a list someone has to
+remember to update. New table `poly-rag-domain-failures` (hash key `domain`,
+pay-per-request, same billing pattern as the other tables in this project): one item per domain,
+`consecutive_failures` counter. `record_domain_result` resets the counter to 0 on any success and
+increments on failure -- a streak counter, not a lifetime failure rate, so a domain that recovers
+(a temporary block lifts, a paywall opens an article) isn't punished forever for past failures.
+`is_domain_blocked` checks the counter against `BLOCKLIST_THRESHOLD = 5` before `extract_article`
+is even attempted -- 5 gives a domain several independent chances (different articles, not
+retries of the same URL) before being written off, since 1-2 failures could be one bad article
+rather than a genuinely blocked site.
+
+**Where it plugs in:** `process_market_news` checks the blocklist right after resolving the real
+URL (via `get_domain`) and before calling `extract_article` -- skips the network request entirely
+for blocked domains, same "discard, try the next result" flow already used for dedup/decode
+failures, so a blocked domain doesn't cost a slot in `RESULTS_TARGET_PER_MARKET`, it's treated
+like any other failed candidate.
+
+**IAM:** `ingest_lambda_role` granted `GetItem`/`PutItem`/`UpdateItem` scoped to the new table's
+ARN only, same least-privilege pattern as `processed_urls`.
+
+**Revisit if:** a legitimately good outlet gets blocklisted due to a transient outage rather than
+a real block (5-strike threshold with per-success reset should make this rare, but not
+impossible) -- would need a manual DynamoDB item delete to un-block, no admin tooling built for
+this yet since it hasn't been observed as a real problem.

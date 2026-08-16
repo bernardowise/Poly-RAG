@@ -76,38 +76,41 @@ resource "aws_lambda_function" "ingest_news" {
 
   environment {
     variables = {
-      S3_BUCKET            = aws_s3_bucket.poly_rag_data.bucket
-      METRICS_TABLE        = aws_dynamodb_table.architecture_metrics.name
-      REGISTRY_TABLE       = aws_dynamodb_table.market_registry.name
-      PROCESSED_URLS_TABLE = aws_dynamodb_table.processed_urls.name
-      BEDROCK_MODEL_ID     = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      USE_LLM_ENRICHMENT   = "true"
+      S3_BUCKET             = aws_s3_bucket.poly_rag_data.bucket
+      METRICS_TABLE         = aws_dynamodb_table.architecture_metrics.name
+      REGISTRY_TABLE        = aws_dynamodb_table.market_registry.name
+      PROCESSED_URLS_TABLE  = aws_dynamodb_table.processed_urls.name
+      DOMAIN_FAILURES_TABLE = aws_dynamodb_table.domain_failures.name
+      BEDROCK_MODEL_ID      = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      USE_LLM_ENRICHMENT    = "true"
     }
   }
 
   depends_on = [null_resource.ingest_news_deps]
 }
 
-data "archive_file" "ingest_bluesky" {
+data "archive_file" "ingest_comments" {
   type        = "zip"
-  source_file = "${path.module}/../lambdas/ingest_bluesky/handler.py"
-  output_path = "${path.module}/build/ingest_bluesky.zip"
+  source_file = "${path.module}/../lambdas/ingest_comments/handler.py"
+  output_path = "${path.module}/build/ingest_comments.zip"
 }
 
-resource "aws_lambda_function" "ingest_bluesky" {
-  function_name = "poly-rag-ingest-bluesky"
+resource "aws_lambda_function" "ingest_comments" {
+  function_name = "poly-rag-ingest-comments"
   role          = aws_iam_role.ingest_lambda_role.arn
   handler       = "handler.lambda_handler"
   runtime       = "python3.12"
-  # 600s (up from 60s): the redesigned pipeline queries searchPosts once per
-  # open market in the registry (full coverage, not a top-N subset -- see
-  # handler module docstring), which is 500+ sequential external HTTP calls
-  # per cycle instead of the old 3 fixed vertical queries.
-  timeout     = 600
+  # Replaces ingest_bluesky (2026-08-16, see tech_debt.md "Comments Source
+  # Replaces Bluesky") -- one comments fetch per DISTINCT event/series id in
+  # the registry (grouped, not per market -- a shared series is fetched
+  # once even if many open markets point at it), a small fraction of the
+  # 228-market registry's worth of external HTTP calls. Public, unauthenticated
+  # Gamma API endpoint, same domain already used for market data.
+  timeout     = 300
   memory_size = 256
 
-  filename         = data.archive_file.ingest_bluesky.output_path
-  source_code_hash = data.archive_file.ingest_bluesky.output_base64sha256
+  filename         = data.archive_file.ingest_comments.output_path
+  source_code_hash = data.archive_file.ingest_comments.output_base64sha256
 
   environment {
     variables = {
@@ -116,14 +119,7 @@ resource "aws_lambda_function" "ingest_bluesky" {
       REGISTRY_TABLE     = aws_dynamodb_table.market_registry.name
       BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
       USE_LLM_ENRICHMENT = "true"
-      # BLUESKY_HANDLE and BLUESKY_APP_PASSWORD are set manually via CLI/console,
-      # not tracked here -- secrets never belong in Terraform state or .tf files
-      # committed to git. See .secrets (gitignored) for the actual values.
     }
-  }
-
-  lifecycle {
-    ignore_changes = [environment[0].variables["BLUESKY_HANDLE"], environment[0].variables["BLUESKY_APP_PASSWORD"]]
   }
 }
 

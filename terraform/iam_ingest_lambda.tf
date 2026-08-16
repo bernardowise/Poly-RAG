@@ -12,7 +12,7 @@ data "aws_iam_policy_document" "lambda_assume_role" {
 
 resource "aws_iam_role" "ingest_lambda_role" {
   name               = "poly-rag-ingest-lambda-role"
-  description        = "Execution role for Poly-RAG ingestion Lambdas (Polymarket/News/Bluesky)"
+  description        = "Execution role for Poly-RAG ingestion Lambdas (Polymarket/News/Comments)"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
 }
 
@@ -68,6 +68,16 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
       "dynamodb:PutItem",
     ]
     resources = [aws_dynamodb_table.processed_urls.arn]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [aws_dynamodb_table.domain_failures.arn]
   }
 
   statement {

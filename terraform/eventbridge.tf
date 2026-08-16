@@ -38,24 +38,24 @@ resource "aws_lambda_permission" "allow_eventbridge_news" {
   source_arn    = aws_cloudwatch_event_rule.ingest_news_schedule.arn
 }
 
-resource "aws_cloudwatch_event_rule" "ingest_bluesky_schedule" {
-  name                = "poly-rag-ingest-bluesky-schedule"
-  description         = "Trigger poly-rag-ingest-bluesky every 12h (00:00 and 12:00 UTC)"
+resource "aws_cloudwatch_event_rule" "ingest_comments_schedule" {
+  name                = "poly-rag-ingest-comments-schedule"
+  description         = "Trigger poly-rag-ingest-comments every 12h (00:00 and 12:00 UTC)"
   schedule_expression = "cron(0 0,12 * * ? *)"
   state               = "ENABLED"
 }
 
-resource "aws_cloudwatch_event_target" "ingest_bluesky_target" {
-  rule = aws_cloudwatch_event_rule.ingest_bluesky_schedule.name
-  arn  = aws_lambda_function.ingest_bluesky.arn
+resource "aws_cloudwatch_event_target" "ingest_comments_target" {
+  rule = aws_cloudwatch_event_rule.ingest_comments_schedule.name
+  arn  = aws_lambda_function.ingest_comments.arn
 }
 
-resource "aws_lambda_permission" "allow_eventbridge_bluesky" {
+resource "aws_lambda_permission" "allow_eventbridge_comments" {
   statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.ingest_bluesky.function_name
+  function_name = aws_lambda_function.ingest_comments.function_name
   principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.ingest_bluesky_schedule.arn
+  source_arn    = aws_cloudwatch_event_rule.ingest_comments_schedule.arn
 }
 
 resource "aws_cloudwatch_event_rule" "send_digest_schedule" {
