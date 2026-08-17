@@ -7,6 +7,14 @@ resource "aws_dynamodb_table" "architecture_metrics" {
     name = "pk"
     type = "S"
   }
+
+  # Enabled 2026-08-17, same reasoning as S3 versioning (see s3.tf) -- applied
+  # to all 4 tables for consistency, not just market_registry where the
+  # immediate cleanup happened. Any accidental delete/overwrite from here on
+  # is recoverable via a deliberate point-in-time restore, not gone outright.
+  point_in_time_recovery {
+    enabled = true
+  }
 }
 
 resource "aws_dynamodb_table" "market_registry" {
@@ -17,6 +25,10 @@ resource "aws_dynamodb_table" "market_registry" {
   attribute {
     name = "market_id"
     type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
   }
 }
 
@@ -34,6 +46,10 @@ resource "aws_dynamodb_table" "processed_urls" {
   attribute {
     name = "url"
     type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
   }
 }
 
@@ -53,6 +69,10 @@ resource "aws_dynamodb_table" "processed_comments" {
     name = "comment_id"
     type = "S"
   }
+
+  point_in_time_recovery {
+    enabled = true
+  }
 }
 
 resource "aws_dynamodb_table" "domain_failures" {
@@ -71,5 +91,9 @@ resource "aws_dynamodb_table" "domain_failures" {
   attribute {
     name = "domain"
     type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
   }
 }

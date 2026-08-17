@@ -404,19 +404,19 @@ ids nuevos aparecen por ciclo en la practica.
 
 | Recurso | Nombre | Proposito |
 |---|---|---|
-| S3 bucket | `poly-rag-369970405415` | Storage crudo, particionado `<source>/YYYY-MM-DD/HH.json`, mas `odds/<market_id>.json` (serie de tiempo append-only) |
-| DynamoDB table | `poly-rag-architecture-metrics` | Costo/latencia/tokens por invocacion, pay-per-request |
-| DynamoDB table | `poly-rag-market-registry` | Market registry (metadata + comment_entity_type/id/link_type), pay-per-request, hash_key `market_id` -- agregada 2026-08-15, campos de comments agregados 2026-08-16 |
-| DynamoDB table | `poly-rag-processed-urls` | Dedup de URLs de articulos de News, pay-per-request, hash_key `url`, sin TTL -- agregada 2026-08-15 |
-| DynamoDB table | `poly-rag-domain-failures` | Blocklist dinamico de dominios para News, pay-per-request, hash_key `domain` -- agregada 2026-08-16 |
-| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las Lambdas de ingestion, permisos: S3 PutObject/GetObject/ListBucket (ListBucket agregado 2026-08-15 -- sin el, GetObject sobre una key inexistente devuelve AccessDenied opaco en vez de NoSuchKey, rompiendo el patron read-modify-write de odds), DynamoDB PutItem en metrics + GetItem/PutItem/UpdateItem/Scan/Query en el registry + tablas de News, Bedrock InvokeModel scoped al modelo especifico |
+| S3 bucket | `poly-rag-369970405415` | Storage crudo, particionado `<source>/YYYY-MM-DD/HH.json`, mas `odds/<market_id>.json` (serie de tiempo append-only). Versionado activado 2026-08-17 (ver nota abajo) |
+| DynamoDB table | `poly-rag-architecture-metrics` | Costo/latencia/tokens por invocacion, pay-per-request, PITR activado 2026-08-17 |
+| DynamoDB table | `poly-rag-market-registry` | Market registry (metadata + comment_entity_type/id/link_type), pay-per-request, hash_key `market_id`, PITR activado 2026-08-17 -- agregada 2026-08-15, campos de comments agregados 2026-08-16 |
+| DynamoDB table | `poly-rag-processed-urls` | Dedup de URLs de articulos de News, pay-per-request, hash_key `url`, sin TTL, PITR activado 2026-08-17 -- agregada 2026-08-15 |
+| DynamoDB table | `poly-rag-processed-comments` | Dedup de comment_id de Comments, pay-per-request, hash_key `comment_id`, sin TTL, PITR activado 2026-08-17 -- agregada 2026-08-17, ver seccion Comments |
+| DynamoDB table | `poly-rag-domain-failures` | Blocklist dinamico de dominios para News, pay-per-request, hash_key `domain`, PITR activado 2026-08-17 -- agregada 2026-08-16 |
+| IAM role | `poly-rag-ingest-lambda-role` | Execution role de las Lambdas de ingestion, permisos: S3 PutObject/GetObject/ListBucket (ListBucket agregado 2026-08-15 -- sin el, GetObject sobre una key inexistente devuelve AccessDenied opaco en vez de NoSuchKey, rompiendo el patron read-modify-write de odds), DynamoDB PutItem en metrics + GetItem/PutItem/UpdateItem/Scan/Query en el registry + tablas de News/Comments, Bedrock InvokeModel scoped al modelo especifico |
 | IAM policy | `PolyRAG-BudgetBreach-Deny` | Guardrail: bloquea Bedrock/Lambda/S3-writes/DynamoDB-writes si el gasto cruza budget de $10 |
 | IAM role | `PolyRAG-BudgetsActionRole` | Permite a AWS Budgets adjuntar la Deny policy automaticamente |
 | AWS Budget | $5/mes | Alertas en 20% ($1) y 100% ($5) |
 | AWS Budget | $10 | Threshold del guardrail Deny automatico |
-| EventBridge rule | `poly-rag-ingest-polymarket-schedule` | Cron `0 0,12 * * ? *` (00:00 y 12:00 UTC), target: Lambda de Polymarket (timeout 600s desde 2026-08-15) |
-| EventBridge rule | `poly-rag-ingest-news-schedule` | Mismo cron, target: Lambda de News (timeout 900s desde el rediseño a fan-out paralelo, 2026-08-16) |
-| EventBridge rule | `poly-rag-ingest-comments-schedule` | Mismo cron, target: Lambda de Comments (timeout 300s) -- reemplaza `poly-rag-ingest-bluesky-schedule`, destruida 2026-08-16 |
+| EventBridge rule | `poly-rag-ingest-polymarket-schedule` | Cron `0 0,12 * * ? *` (00:00 y 12:00 UTC), UNICO trigger de EventBridge del pipeline principal desde el "Strict Ingestion Chaining" (2026-08-16, ver tech_debt.md) -- target: Lambda de Polymarket (timeout 600s desde 2026-08-15). News, Comments y send_digest ya NO tienen su propio EventBridge rule; se invocan encadenados directo via `lambda.invoke()` |
+| EventBridge rule | `poly-rag-watchdog-schedule` | Cron cada 10 min, target: `poly-rag-watchdog-ingest-news` -- detecta un ciclo de News atorado (batches faltantes 20+ min despues de iniciado) y reintenta solo los offsets faltantes |
 
 **Region:** us-east-1 (N. Virginia) exclusivamente -- consistencia obligatoria,
 Bedrock model access y otros recursos son regionales.
@@ -471,9 +471,24 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
   antes de la primera corrida canonica) -- diferido hasta confirmar 1-2 ciclos
   canonicos limpios consecutivos, para no perder evidencia de depuracion si algo
   falla en el proximo ciclo
-- `odds_old_2026-08-15/` en S3: 700 archivos del bootstrap con schema obsoleto,
-  movidos ahi en vez de borrados -- desechar oficialmente en unos dias una vez
-  confirmada la calidad del nuevo bootstrap
+- **Cerrado (2026-08-17):** `odds_old_2026-08-15/` ya no existia en el bucket (se
+  habia limpiado en algun momento previo a esta sesion, confirmado via listado
+  directo -- 0 objetos). Nota vieja removida.
+- **Cerrado (2026-08-17), limpieza mayor del registry y del bucket:** el usuario
+  identifico que 329 de 629 registry items eran residuo del pipeline pre-2026-08-16
+  (linkeados al diseño viejo de Bluesky + News-por-keywords, con campos
+  `search_query`/`news_match_terms` obsoletos) -- no datos falsos, pero producto de
+  un pipeline ya muerto. Borrados permanentemente: 329 registry items + sus 329
+  `odds/<market_id>.json` correspondientes + `test/README.md` (prueba trivial del
+  Dia 1) + el prefijo `bluesky/` completo (7 objetos, restos de la fuente
+  descontinuada). Registry: 629 -> 300 items (250 open / 50 resolved), 0 campos
+  legacy remanentes. Antes de borrar, se activo **S3 bucket versioning** y
+  **DynamoDB PITR en las 5 tablas** (deliberadamente en ese orden -- versionar
+  primero hace el borrado recuperable via una restauracion deliberada, no
+  irreversible, mientras que activar despues del borrado no habria protegido nada
+  de lo que se acababa de borrar). Decision explicita del usuario: "mas higienico
+  aunque si sea recuperable" -- el objetivo no era destruccion forense sino que
+  estos datos dejaran de alimentar el pipeline vivo y el futuro corpus RAG.
 - Explorar paginacion `/markets/keyset` de la Gamma API para conocer el tamano
   real del universo de mercados activos (hoy solo se confirmo un piso de ~2,100
   via offset, que se cae mas alla de eso)
@@ -481,5 +496,7 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
   que no refleja la hora real del partido -- ver tech_debt.md)
 
 Ver sprint_plan.md (gerdau/) para el resto del roadmap (Databricks Dia 3 --
-Delta Lake/Unity Catalog aun no iniciados, RAG retrieval Dia 4, synthesis agent
-Dia 5).
+Delta Lake/Unity Catalog iniciados 2026-08-17, tablas `workspace.poly_rag.market_registry`/
+`odds_snapshots` creadas y verificadas, falta demostrar time travel real (solo existe
+version 0 por ahora) y la lectura conceptual de DAMA-DMBOK/Data Mesh; RAG retrieval
+Dia 4, synthesis agent Dia 5).
