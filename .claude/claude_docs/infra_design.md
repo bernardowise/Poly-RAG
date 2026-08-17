@@ -51,8 +51,9 @@ CLAUDE.md):
   entrevista del usuario, no sobre Poly-RAG como producto, y nunca se trackea en git.
 - **`new_skills.md`** (no listado en la tabla de CLAUDE.md pero vive aqui) -- tracking
   personal de skills reales aprendidas construyendo el proyecto, para CV/LinkedIn.
-  Igual que `gerdau/`, es sobre el usuario, no sobre el proyecto -- pero a diferencia
-  de `gerdau/`, este SI esta trackeado en git (no aparece en `.gitignore`).
+  Igual que `gerdau/`, es sobre el usuario, no sobre el proyecto, y **tambien esta
+  gitignorado** (`.gitignore:7`) -- correccion 2026-08-17, la version anterior de este
+  documento decia erroneamente que si estaba trackeado.
 
 ---
 

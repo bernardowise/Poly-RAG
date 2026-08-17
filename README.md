@@ -1,104 +1,141 @@
 # Poly-RAG
-Poly-RAG is Yet another IS-ALL-YOU-NEED LLM project that you don't need... yet.
 
+A RAG assistant over live Polymarket prediction-market data, correlated with news
+coverage and trader sentiment. Guided by Chip Huyen's *AI Engineering* book — a
+personal, long-term AI engineering learning project, not a client engagement.
 
-Pienza 1.0's origin and framing
+## Why this exists
 
-I was obsessed with digitizing my experience as an Uber driver in Mexico City while I transitiond my career into Data Science— capturing ~4,700 real accept/reject decisions over a controlled observation window, building the whole pipeline from raw OCR/webapp capture through classification, causal inference, synthetic data, and eventually a RAG layer on top. It was deliberately personal: I wasn't building for a market, I was proving to myself, that I could take a lived, messy dataset all the way through the ML lifecycle. That's exactly why for me Pienza was valuable despite the narrowness — it wasn't theoretical, I had real skin in the game with data I generated myself.
+A general-purpose LLM with web search can tell you what a market's odds are *right
+now*. It cannot tell you how those odds moved over time in correlation with specific
+news events or trader sentiment — that history isn't logged anywhere unless someone
+is actively collecting it. Poly-RAG is that someone: a self-built historical
+time-series of odds movement, concurrent news, and trader comments, queryable as one
+coherent view. That proprietary time-series — not the LLM, not the retrieval code —
+is the actual differentiator.
 
+Agentic-first from day one: Claude Code is the primary development environment, and
+multi-agent orchestration (data-collection, retrieval, synthesis) is a first-class
+design goal, not something bolted onto a finished pipeline afterward.
 
-The two bottlenecks that define its ceiling
+## Architecture
 
-Static data, zero MLOps: everything in Pienza runs on a closed dataset. There's no live traffic, no continuous ingestion, no inference serving loop — which means it's a strong showcase of data science depth (stats, ML, GenAI) but doesn't demonstrate the engineering muscle of keeping a system alive against a moving target.
+Four AWS Lambdas, strictly chained (not independent timers — see
+`.claude/claude_docs/tech_debt.md`, "Strict Ingestion Chaining"):
 
-Narrow audience: n=1 driver, one city, one platform. Even a technically excellent project here has a ceiling on who cares, because the domain itself is hyper-specific.
+```
+EventBridge (00:00 / 12:00 UTC)
+        |
+        v
+ingest_polymarket --invoke--> ingest_news --invoke--> ingest_comments --invoke--> send_digest
+   (top-500 by            (Google News RSS,          (Polymarket's own      (synthesizes all
+    volume24hr, LLM        one search per open         comment API,          3 sources into one
+    verifiability          market, fan-out             grouped by Event/     JSON artifact +
+    filter, registry       batching + parallel         Series, deduped       HTML email, its
+    diff, odds             merge, deduped by            by comment_id)        own Bedrock call)
+    time-series)            URL)
+```
 
-Why the RL/MDP "Pienza 2.0" idea got cut
+Only `ingest_polymarket` has its own EventBridge trigger. Every other stage is
+invoked directly by the one before it (`lambda.invoke`), threading a single
+`cycle_started_at` through the whole chain so every stage's S3 output lands under the
+same cycle's date/hour partition, regardless of how long an earlier stage took. A
+separate watchdog Lambda (`poly-rag-watchdog-ingest-news`, 10-min cron) detects a
+stuck News cycle and retries only the missing batches.
 
-My original sequel concept doubled down on the same niche — autonomous driving decision-making via Markov Decision Processes (MDPs) — which would have taken me further into Waymo-adjacent territory instead of away from the two bottlenecks above. It solves neither the static-data problem in a meaningful new way nor the narrow-audience problem; if anything it deepens the audience problem, since full autonomous-driving RL is an even more specialized field than ride-hailing itself.
+**Data flow, per cycle:**
+1. **Registry** (DynamoDB, `poly-rag-market-registry`) — one item per market, updated
+   in place. A market enters only after an LLM verifiability check (does its outcome
+   resolve against a citable public record, not human judgment over ambiguous
+   evidence?). Never deleted — resolved markets stay in the registry with their final
+   outcome, so the full open-to-resolution history is preserved.
+2. **Odds time-series** (S3, `odds/<market_id>.json`) — one file per market,
+   append-only, one snapshot per cycle for every open market. This is the actual
+   differentiator; nothing else in the pipeline matters if this isn't clean.
+3. **News** (S3, `news/YYYY-MM-DD/HH.json`) — full article text (via
+   `googlenewsdecoder` + `trafilatura`), tagged with the specific `market_id`(s) it's
+   about.
+4. **Comments** (S3, `comments/YYYY-MM-DD/HH.json`) — real trader discussion from
+   Polymarket's own comment sections, diffed against `poly-rag-processed-comments` so
+   only genuinely new comments are pulled in each cycle.
+5. **Digest** (S3, `digest/YYYY-MM-DD/HH.json` + email) — a structured artifact built
+   for future RAG ingestion, not just a human-readable email. Includes
+   `top_volatility` (what moved this cycle) and `world_snapshot` (what the market
+   currently believes, independent of movement: highest-conviction and most-disputed
+   open bets), plus an LLM-synthesized executive summary that sees all three sources
+   together.
 
-Why the Polymarket RAG project is the actual answer to both bottlenecks
+## Stack
 
-It directly attacks the static-data ceiling: Polymarket's free Gamma API gives me a live, refreshable batch-data source, so for the first time I'm forced to design around data that changes daily instead of a dataset I already finished capturing.
+| Layer | Choice |
+|---|---|
+| Compute | AWS Lambda (Python 3.12), event-driven, no always-on servers |
+| Storage | S3 (raw JSON, partitioned by source/date/hour) + DynamoDB (registry, dedup, metrics, PAY_PER_REQUEST, point-in-time recovery enabled) |
+| LLM | Claude Sonnet 4.5 via Bedrock, IAM-authenticated (no separate API key) |
+| Orchestration | EventBridge (single cron trigger) + direct Lambda-to-Lambda chaining |
+| IaC | Terraform (`terraform/`), one file per resource domain |
+| Exploration | Databricks (Delta Lake + Unity Catalog), separate from the live pipeline |
 
-It attacks the narrow-audience ceiling: financial markets and prediction data are a broadly legible domain — recognizable to way more people (and employers) than ride-hailing driver economics.
+Budget discipline: operates against a $5/month AWS Budget with automated
+Deny-policy guardrails at $10, spending real promotional credits deliberately, not
+treating them as free.
 
-It shifts my skill focus from training predictive models (what Pienza 1.0 proved I can do) to AI engineering — retrieval, orchestration, tool-calling over live tabular + unstructured data — which is a distinct, currently-hot skill set I'm deliberately building in parallel with reading Chip Huyen's book, chapter by chapter.
+## Repo structure
 
-While I'm currently job hunting, this repo will serve as a side personal year-long project that hopefully has a broader audience and allows me to upskill myself by learning by doing. 
+```
+lambdas/
+  ingest_polymarket/    registry + odds time-series, LLM verifiability filter
+  ingest_news/           Google News RSS, fan-out batching, article extraction
+  ingest_comments/       Polymarket comments, entity grouping, comment_id dedup
+  send_digest/           cross-source synthesis, JSON artifact + email
+  watchdog_ingest_news/  stuck-cycle detection and retry
+retrieval/
+  time_window.py         timestamp-window retrieval over raw storage (Layer 2,
+                          contextual/temporal, complements explicit market_id linkage)
+terraform/                all AWS infrastructure as code
+.claude/
+  claude_docs/            architecture_canon.md, tech_debt.md, session_ledger.md,
+                           knowledge.md, hooks.md, infra_design.md (see CLAUDE.md
+                           for what each one is for)
+  commands/                slash commands for repeatable workflows
+  skills/, .databricks/    Databricks CLI integration for Claude Code
+CLAUDE.md                  project instructions, loaded automatically every session
+```
 
+`.claude/claude_docs/architecture_canon.md` is the authoritative, current-state
+snapshot of everything above — this README is a summary of it, not a replacement.
 
+## Status
 
+Verified in production: the full 4-Lambda chain runs unattended on the 00:00/12:00
+UTC schedule with no manual intervention, cost/latency/tokens logged per invocation
+to `poly-rag-architecture-metrics` for all 4 Lambdas. Registry currently tracks
+markets under the current (post-2026-08-16) design only — an early-pipeline cleanup
+removed all registry/odds data tied to the deprecated Bluesky + keyword-matching
+design.
 
+## Pending / TODO
 
-
-
-Project Overview
-
-This is a personal learning project — an AI application built on top of foundation models (LLMs), applied to the finance domain, specifically prediction markets (Polymarket). The project is guided by Chip Huyen's AI Engineering book, which serves as the primary reference for architecture and design decisions as the project evolves.
-
-Unlike a prior project (Pienza), which relied on a single static dataset sitting in Google Cloud Storage, this project is explicitly designed to be dynamic — continuously ingesting live data rather than working off a frozen snapshot.
-
-What This Is (and Isn't)
-
-This is a RAG (retrieval-augmented generation) assistant with NLP components, built on top of LLMs — not a real-time charting dashboard. The visualization/analytics side is explicitly out of scope; the focus is on retrieval, reasoning, and language understanding over market-related data.
-
-The Core Problem: Why Build This At All?
-
-A central design constraint driving this project: it must do something a general-purpose LLM with web search (Claude, Gemini, etc.) genuinely cannot do. If a user could get an equally good answer by just asking Claude or Gemini directly, the project wouldn't be solving a real problem.
-
-The differentiator is proprietary, self-collected historical data. General LLMs with web search can retrieve current information, but they can't retroactively reconstruct how a market's odds moved over time in correlation with specific news events or sentiment shifts — because that data isn't logged anywhere unless someone is actively collecting it. This project aims to be that someone: building a time-series dataset over weeks/months that ties together odds movement, news, and sentiment in one coherent, queryable view.
-
-Data Sources
-
-All three sources are being pulled from day one, rather than starting narrow:
-
-Polymarket API — live market data: questions, current odds, trading volume, order book depth. This is the core structured time-series data.
-News (free tier) — a free news API or RSS feeds from financial outlets, matched to specific markets via keyword/entity matching.
-Reddit API — free access to relevant finance/politics subreddits, used as an unstructured text source for NLP tasks like sentiment analysis, topic extraction, and entity recognition.
-
-Collection cadence: Data is logged on a recurring schedule (e.g. every few hours), building a proprietary historical dataset over time that ties odds movement to concurrent news and sentiment shifts.
-
-Learning Objectives
-
-This project is twofold in purpose:
-
-Domain learning — becoming proficient in prediction markets and how they function as a financial product.
-AI/MLOps engineering learning — the bigger motivator. Despite strong data science proficiency, MLOps is a current gap. This project is meant to force hands-on learning of:
-Batch and real-time/streaming data processing (e.g. via Kinesis)
-Building and orchestrating a live data pipeline rather than working from a static dataset
-AWS-native MLOps tooling (Bedrock, SageMaker) as opposed to GCP, which is already familiar
-Infrastructure & Cloud Strategy
-Cloud provider: AWS, chosen deliberately over the already-familiar GCP, specifically to build proficiency in the ecosystem most AI companies use in production (Bedrock, SageMaker).
-Approach: Full commitment to AWS from the start rather than prototyping on GCP first — the friction of the unfamiliar stack is considered part of the point.
-Budget constraint: A hard cap of roughly $5/month for hosting. This shapes architecture choices significantly:
-Favored: Lambda, S3, DynamoDB, Kinesis — all pay-per-use with no idle cost
-Avoided: always-on compute like EC2 or MSK (Kafka), and frequent/high-volume Bedrock LLM calls, both of which can quickly exceed the budget
-LLM calls should be made on-demand (e.g. when a user asks a question) rather than on every scheduled data pull, to keep Bedrock usage low
-Context
-
-This is a personal project, not built for a client or employer. It exists purely for learning purposes, with an underlying secondary motivation of building demonstrable, paid-work-adjacent skilled experience.
-
-
-
-
-
-Development Philosophy: Agentic-First From Day One
-
-This is the key architectural difference from Pienza. In Pienza, Claude Code was adopted late — introduced only when migrating from Jupyter Notebooks to Codespaces, effectively bolted onto an already-mature data science project. That meant the agentic tooling never got to shape the project's foundations.
-
-This project inverts that. Agentic engineering is a first-class design goal from the start, not an afterthought layered on top of a finished data pipeline. Concretely, this means:
-
-Building with Claude Code from scratch, with the codebase, project structure, and workflows designed around agentic development from commit one.
-Multi-agent workflows and orchestration as a core architectural pattern — not a single assistant bolted onto a RAG pipeline, but a system of agents and sub-agents with defined responsibilities (e.g. a data-collection agent, a retrieval/research agent, a synthesis agent).
-MCP (Model Context Protocol) integration, to give agents structured, tool-based access to data sources and services.
-Reusing prior work — skills, commands, and hooks already developed during Pienza will be ported over as a starting foundation, since Pienza's own growth had plateaued.
-Exploring frontier frameworks beyond just Claude Code — including LangChain and LlamaIndex — to compare approaches to agent orchestration, retrieval, and tool use.
-
-This reflects a broader maturity point: having gone through Pienza already, the goal now isn't just to build another data science project, but to design the foundations — the agentic architecture itself — well enough that the project can keep growing and scaling, rather than plateauing the way Pienza did.
-
-
-
-Why "Polymarket Agents" Doesn't Replace Poly-RAG???
- 
-Existing frameworks like Polymarket Agents focus on live execution and real-time execution loops (programmatic trading, querying current order books, immediate automated workflows). They are built to act now.Your project is built to answer: "What happened, why did it happen, and how did the market react over time?"FeatureExisting Polymarket FrameworksYour Poly-RAG ProjectPrimary GoalAutomated programmatic trading & live state querying.Historical context reconstruction & longitudinal reasoning.Data PhilosophyReal-time stateless API polling.Proprietary, stateful time-series data storage.The "Moat"Execution speed and API connectivity.Self-collected historical correlation (Odds + News + Sentiment).Core LLM ActionTool-calling for immediate market actions.RAG over an unstructured/structured temporal database.A general-purpose LLM or a standard trading agent cannot look back and explain how a sudden Reddit sentiment spike on a Tuesday correlated with an odds drop on Thursday because that historical intersection isn't preserved in a single, open API. 
+- **RAG retrieval (Day 4)** — not started. `retrieval/time_window.py` exists as a
+  timestamp-window layer over raw storage; embeddings/semantic ranking within that
+  window is unbuilt.
+- **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
+  is the closest existing precedent (multi-source context → Bedrock → synthesis) but
+  there's no user-facing query interface yet. Includes an open, explicitly deferred
+  decision: LangChain/LlamaIndex vs. continuing with direct boto3 calls.
+- **Databricks Delta Lake / Unity Catalog** — tables created and verified
+  (`workspace.poly_rag.market_registry`, `odds_snapshots`), but only one version
+  exists so far; real time-travel (comparing two versions) not yet demonstrated.
+- **LLM enrichment output not yet optimized for RAG** — current `llm_summary` /
+  `executive_summary` fields were designed for human readability (the digest email),
+  not evaluated against real retrieval requirements. Deliberately deferred until the
+  retrieval layer exists (see tech_debt.md).
+- **Sports-market resolution-horizon bug** — the minimum-horizon filter uses a
+  market's `endDate`, which for sports markets is an administrative deadline, not the
+  actual game time. Confirmed but not fixed (see tech_debt.md).
+- **Self-referential corpus** — a RAG index over this repo's own git history
+  (querying how the architecture evolved) is designed but not built.
+- **DKIM/deliverability** — digest emails land in spam; the real fix requires a
+  project-owned domain, deferred by explicit choice.
+- **No CI/CD** — deploys are manual (`terraform apply`, scoped with `-target`),
+  Terraform state is local and gitignored, no remote backend.
