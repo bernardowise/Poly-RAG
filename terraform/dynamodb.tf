@@ -37,6 +37,24 @@ resource "aws_dynamodb_table" "processed_urls" {
   }
 }
 
+resource "aws_dynamodb_table" "processed_comments" {
+  # Dedup for Polymarket comment ingestion (added 2026-08-17) -- one item per
+  # comment_id ever fetched. Same pattern/reasoning as processed_urls: without
+  # this, fetch_comments re-pulls the same top-20-by-createdAt comments per
+  # entity every cycle regardless of whether anything new was posted, and the
+  # comments/HH.json payload re-includes comments already seen in prior
+  # cycles. No TTL: pay-per-request doesn't charge for idle storage of small
+  # items, so permanent dedup is simpler than an arbitrary expiry window.
+  name         = "poly-rag-processed-comments"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "comment_id"
+
+  attribute {
+    name = "comment_id"
+    type = "S"
+  }
+}
+
 resource "aws_dynamodb_table" "domain_failures" {
   # Dynamic blocklist for outlets that consistently fail extraction (see
   # tech_debt.md, "News Source Redesign" -- domains like egamersworld.com

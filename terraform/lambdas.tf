@@ -116,12 +116,13 @@ resource "aws_lambda_function" "ingest_comments" {
 
   environment {
     variables = {
-      S3_BUCKET          = aws_s3_bucket.poly_rag_data.bucket
-      METRICS_TABLE      = aws_dynamodb_table.architecture_metrics.name
-      REGISTRY_TABLE     = aws_dynamodb_table.market_registry.name
-      BEDROCK_MODEL_ID   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      USE_LLM_ENRICHMENT = "true"
-      NEXT_LAMBDA_NAME   = aws_lambda_function.send_digest.function_name
+      S3_BUCKET                 = aws_s3_bucket.poly_rag_data.bucket
+      METRICS_TABLE             = aws_dynamodb_table.architecture_metrics.name
+      REGISTRY_TABLE            = aws_dynamodb_table.market_registry.name
+      PROCESSED_COMMENTS_TABLE  = aws_dynamodb_table.processed_comments.name
+      BEDROCK_MODEL_ID          = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      USE_LLM_ENRICHMENT        = "true"
+      NEXT_LAMBDA_NAME          = aws_lambda_function.send_digest.function_name
     }
   }
 }

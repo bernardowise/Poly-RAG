@@ -51,6 +51,7 @@ import boto3
 S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
+PROCESSED_COMMENTS_TABLE = os.environ.get("PROCESSED_COMMENTS_TABLE", "poly-rag-processed-comments")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
 # Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion
@@ -145,15 +146,34 @@ def fetch_comments(entity_type, entity_id, limit=COMMENTS_PER_ENTITY):
             raise
 
 
-def extract_comments(raw_comments, market_ids, link_type):
+def is_comment_processed(table, comment_id):
+    resp = table.get_item(Key={"comment_id": str(comment_id)})
+    return "Item" in resp
+
+
+def mark_comment_processed(table, comment_id):
+    table.put_item(Item={"comment_id": str(comment_id), "processed_at": datetime.now(timezone.utc).isoformat()})
+
+
+def extract_comments(raw_comments, market_ids, link_type, processed_comments_table):
+    """Diffs against poly-rag-processed-comments (added 2026-08-17) before
+    including a comment -- without this, fetch_comments' top-20-by-createdAt
+    pull re-included the same comments every cycle regardless of whether
+    anything new was posted for that entity, since the Gamma API has no
+    since= cursor and this Lambda never persisted what it had already seen
+    (unlike News, which has always deduped by URL). Same shape as News'
+    is_url_processed/mark_url_processed."""
     comments = []
     for c in raw_comments:
+        comment_id = c.get("id")
+        if comment_id is None or is_comment_processed(processed_comments_table, comment_id):
+            continue
         body = c.get("body", "")
         if not body:
             continue
         profile = c.get("profile") or {}
         comments.append({
-            "comment_id": c.get("id"),
+            "comment_id": comment_id,
             "author": profile.get("name") or c.get("userAddress"),
             "text": body,
             "created_at": c.get("createdAt"),
@@ -161,6 +181,7 @@ def extract_comments(raw_comments, market_ids, link_type):
             "market_ids": list(market_ids),
             "link_type": link_type,
         })
+        mark_comment_processed(processed_comments_table, comment_id)
     return comments
 
 
@@ -231,6 +252,7 @@ def lambda_handler(event, context):
     # for a standalone/manual invocation with no upstream cycle context.
     cycle_started_at = event.get("cycle_started_at") or datetime.now(timezone.utc).isoformat()
     registry_table = dynamodb.Table(REGISTRY_TABLE)
+    processed_comments_table = dynamodb.Table(PROCESSED_COMMENTS_TABLE)
     markets = get_open_markets_with_comment_links(registry_table)
     entity_groups = group_by_entity(markets)
 
@@ -254,7 +276,7 @@ def lambda_handler(event, context):
             link_type = "shared_series"
         try:
             raw = fetch_comments(entity_type, entity_id)
-            all_comments.extend(extract_comments(raw, market_ids, link_type))
+            all_comments.extend(extract_comments(raw, market_ids, link_type, processed_comments_table))
         except Exception as e:
             # One entity's fetch failing must not sink the rest.
             entities_failed.append({"entity_type": entity_type, "entity_id": entity_id, "error": str(e)})
@@ -274,6 +296,11 @@ def lambda_handler(event, context):
     payload = {
         "source": "comments",
         "ingested_at": now.isoformat(),
+        # NEW comments this cycle only (post-dedup, 2026-08-17) -- previously
+        # this was the top-20-per-entity pull re-included every cycle
+        # regardless of whether anything new was posted. send_digest's
+        # source_stats reads this list's length directly, so its "comments"
+        # count now reflects real per-cycle growth, not a re-fetched total.
         "comment_count": len(all_comments),
         "markets_with_comments": len(markets),
         "entities_queried": len(entity_groups),

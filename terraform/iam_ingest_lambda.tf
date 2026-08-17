@@ -81,6 +81,16 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
   }
 
   statement {
+    # Comments dedup, added 2026-08-17 -- same shape as processed_urls above.
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+    ]
+    resources = [aws_dynamodb_table.processed_comments.arn]
+  }
+
+  statement {
     effect  = "Allow"
     actions = ["bedrock:InvokeModel"]
     resources = [
