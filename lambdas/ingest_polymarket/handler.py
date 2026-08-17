@@ -357,7 +357,6 @@ def lambda_handler(event, context):
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 
     known_ids = get_known_ids(registry_table)
-    candidate_ids = {m["id"] for m in candidates}
     new_candidates = [
         m for m in candidates
         if m["id"] not in known_ids and has_minimum_horizon(m, now)
@@ -380,33 +379,45 @@ def lambda_handler(event, context):
             upsert_registry_entry(registry_table, m, now_iso)
             tracked_markets.append(m)
 
-    # Every candidate id already known and still open gets a fresh odds snapshot,
-    # regardless of whether it was newly classified this cycle.
-    already_tracked_open = [
-        m for m in candidates
-        if m["id"] in known_ids and known_ids[m["id"]] == "open"
-    ]
-    for m in already_tracked_open + tracked_markets:
-        append_odds_snapshot(m, now_iso)
+    # Odds snapshot + resolution check -- decoupled from candidate discovery
+    # entirely (redesigned 2026-08-17, see tech_debt.md). Every market
+    # currently open in the registry is processed here, regardless of
+    # whether it happened to appear in today's top-500 pull. The top-500
+    # batch (candidates_by_id) is reused as a free data source when a
+    # market happens to be in it -- but it is no longer the determining
+    # factor for who gets a snapshot. A market that falls out of top-500 by
+    # volume24hr is not "dropped": it is simply fetched individually
+    # instead, same as before, just no longer framed as a special edge case.
+    # Closes a real gap found the same day: market 1365861 had a silent,
+    # unrecorded hole in its odds history (present cycle 1, missing cycle 2,
+    # back for cycles 3-4) purely because it briefly fell out of the top-500
+    # ranking -- contradicting the project's core thesis of a complete
+    # open-to-resolution time-series for every tracked market.
+    candidates_by_id = {m["id"]: m for m in candidates}
+    open_registry_ids = {mid for mid, status in known_ids.items() if status == "open"}
+    open_registry_ids |= {m["id"] for m in tracked_markets}
 
-    # Ids that were open in the registry but no longer appear in today's top-N pull:
-    # query the Gamma API directly per id to check for resolution.
-    open_known_ids = {mid for mid, status in known_ids.items() if status == "open"}
-    dropped_ids = open_known_ids - candidate_ids
     resolved_markets = []
-    for market_id in dropped_ids:
-        try:
-            detail = fetch_market_by_id(market_id)
-        except Exception:
-            continue  # transient API error -- leave status as-is, retry next cycle
-        if detail.get("closed"):
-            outcome_prices = detail.get("outcomePrices")
+    snapshots_written = 0
+    for market_id in open_registry_ids:
+        market_data = candidates_by_id.get(market_id)
+        if market_data is None:
+            try:
+                market_data = fetch_market_by_id(market_id)
+            except Exception:
+                continue  # transient API error -- leave status as-is, retry next cycle
+            market_data["id"] = market_id  # markets/{id} response isn't guaranteed to echo id back
+        if market_data.get("closed"):
+            outcome_prices = market_data.get("outcomePrices")
             mark_registry_resolved(registry_table, market_id, outcome_prices, now_iso)
             resolved_markets.append({
                 "market_id": market_id,
-                "question": detail.get("question", ""),
+                "question": market_data.get("question", ""),
                 "outcome_prices": outcome_prices,
             })
+            continue
+        append_odds_snapshot(market_data, now_iso)
+        snapshots_written += 1
 
     total_latency_ms = fetch_latency_ms + llm_latency_ms
     payload = {
@@ -424,7 +435,7 @@ def lambda_handler(event, context):
             {"market_id": m["id"], "question": m.get("question", "")}
             for m in tracked_markets
         ],
-        "odds_snapshots_written": len(already_tracked_open) + len(tracked_markets),
+        "odds_snapshots_written": snapshots_written,
         "resolved_this_cycle": len(resolved_markets),
         "resolved_markets": resolved_markets,
         "metadata": {

@@ -1194,3 +1194,52 @@ output shape is a poor fit for retrieval (e.g. summaries are too lossy, chunking
 how the retriever wants to split documents, key entities/timestamps aren't preserved in a queryable
 way) -- at that point, redesign the enrichment prompts/output specifically for RAG consumption,
 informed by real retrieval requirements rather than guessed upfront.
+
+---
+
+## Odds Snapshot Coverage Silently Coupled to Top-500 Candidate Discovery (fixed 2026-08-17)
+
+**Issue (found via real data, 2026-08-17):** while auditing `eda_mio` (the user's own Databricks EDA
+notebook) against the 4 clean complete cycles, found that markets already open and tracked in the
+registry could have silent, unrecorded gaps in their odds time-series. Concrete example: market
+1365861 had a snapshot in cycle 1, no snapshot in cycle 2, then snapshots again in cycles 3 and 4 --
+with nothing in the data indicating why, or that a gap had even occurred.
+
+**Root cause:** `ingest_polymarket` only ever appended an odds snapshot for markets present in that
+cycle's top-500-by-volume24hr candidate pull (`already_tracked_open`, the old variable name). A
+market still open and still being tracked in the registry, but whose `volume24hr` happened to rank
+outside the top 500 that cycle, simply got skipped -- not because it resolved, not because of any
+error, but purely because two unrelated concerns were coupled into one fetch: (1) discovering NEW
+candidate markets to evaluate for the registry, and (2) deciding who gets an odds snapshot this
+cycle. This directly contradicts the project's core thesis (CLAUDE.md): a complete, self-built
+open-to-resolution time-series for every tracked market. A market that quietly drops in and out of
+top-500 ranking would have a time-series full of unexplained holes.
+
+**Fix (user-directed redesign, not a patch):** decoupled the two concerns entirely. Odds
+snapshot + resolution-check now iterates over `open_registry_ids` -- literally every market with
+`status == "open"` in the registry (plus markets newly tracked this same cycle) -- with no concept
+of "dropped" markets at all. For each: if the market happens to already be in this cycle's top-500
+batch (`candidates_by_id`), that data is reused for free; otherwise it's fetched individually via
+`fetch_market_by_id` (the Gamma API's single-market endpoint), which also reveals whether it has
+resolved (`closed`) in the same call. A market falling out of top-500 by volume is no longer a
+special case needing a fix -- it's simply routed to individual fetch instead of the batch, same as
+before, just no longer silently dropped from odds tracking.
+
+**Zero added cost, confirmed:** the old code already called `fetch_market_by_id` once for every
+market in what used to be called `dropped_ids` (purely to check resolution status, discarding the
+price data if the market wasn't closed). The new code calls `fetch_market_by_id` for the exact same
+set of markets (open registry markets not in this cycle's top-500 batch) -- it just uses the
+response's price data instead of throwing it away. No new Gamma API calls, only better use of ones
+already being paid for.
+
+**First iteration considered and rejected:** an earlier version of this fix kept `dropped_ids` as a
+named special case and added a `recovered_snapshots_written` counter to track how often the gap-fix
+path fired. User rejected this as still architecturally wrong -- the existence of a "dropped ids
+need special handling" concept was itself the bug, not something to patch around and measure. The
+final design has no such counter because there's no such special case anymore: `snapshots_written`
+counts everyone uniformly, regardless of which data source (batch or individual fetch) supplied it.
+
+**Revisit if:** the number of markets requiring individual `fetch_market_by_id` calls grows large
+enough (e.g. if the registry grows well beyond ~300-500 open markets while top-500-by-volume stays
+fixed) that per-cycle latency or Gamma API rate limits become a real constraint -- not yet measured,
+but structurally the same cost profile as the resolution-check that already existed before this fix.

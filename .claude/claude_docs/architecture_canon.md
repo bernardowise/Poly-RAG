@@ -489,6 +489,40 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
   de lo que se acababa de borrar). Decision explicita del usuario: "mas higienico
   aunque si sea recuperable" -- el objetivo no era destruccion forense sino que
   estos datos dejaran de alimentar el pipeline vivo y el futuro corpus RAG.
+- **Extension (2026-08-17, mismo dia):** el usuario noto que ciclos crudos de
+  `news/` y `polymarket/` anteriores al rediseño del 15 de agosto seguian en el
+  bucket -- misma naturaleza obsoleta que los 329 markets (evidencia de disenos
+  muertos: filtro de 3 verticales, 10-feeds-RSS sin extraccion de texto real) pero
+  fuera del alcance original de esa limpieza (esos payloads son historial de
+  CICLO, no datos de registry/odds ligados a un market_id). Confirmado con
+  evidencia directa (campos `feed`/`verticals` en News, sin `url` real -- el
+  pipeline de extraccion `googlenewsdecoder`/`trafilatura` aun no existia) antes
+  de borrar. Borrados: 5 archivos `news/` (13 y 14 de agosto, mas 08-15 00/12/16h)
+  + 8 archivos `polymarket/` (13 y 14 de agosto, mas 08-15 00/04/12/15/16h) = 13
+  objetos. El archivo mas viejo que queda en `news/` ahora es `2026-08-15/22.json`
+  (23:39 UTC, ya con Google News); en `polymarket/`, `2026-08-16/00.json`. Bucket
+  total tras esta segunda pasada: 379 objetos.
+- **Extension (2026-08-17), definicion de "ciclo completo" y purga a nivel
+  snapshot individual:** desde `eda_mio` (notebook de EDA propio del usuario en
+  Databricks), se definio ciclo completo como las 4 etapas (polymarket, news,
+  comments, digest) con su archivo FINAL presente bajo la misma fecha/hora
+  (excluye explicitamente los `_batchN.json` intermedios de News). Resultado real
+  a la fecha: solo 4 ciclos completos -- 2026-08-16 01:00 y 12:00 UTC, 2026-08-17
+  00:00 y 12:00 UTC. Borrados 15 archivos de ciclo sueltos que no pertenecian a
+  ninguno de los 4 (restos de debugging: comments/digest del 16 de agosto,
+  batches huerfanos de News, un `polymarket/2026-08-16/00.json` que nunca llego a
+  completar cadena). Extendido el mismo criterio a `odds/<market_id>.json`
+  (perspectiva del usuario: un snapshot debe estar asociado al ciclo que lo
+  genero -- el timestamp del snapshot coincide exacto con el momento en que
+  corrio esa invocacion de `ingest_polymarket`, el mismo usado para su propio
+  archivo de ciclo, asi que la asociacion es real, no una aproximacion). De 483
+  snapshots totales, 4 no pertenecian a ninguno de los 4 ciclos completos (los 4
+  del mismo timestamp `2026-08-16T00:31:01`, la invocacion incompleta ya
+  borrada) -- removidos. Un market (`1088487`) quedo con 0 snapshots validos tras
+  el filtro (su unico snapshot era ese mismo timestamp) -- su archivo se borro
+  por completo, no se dejo vacio, por decision explicita del usuario. Estado
+  final: 299 markets con odds, 479 snapshots, todos asociados a uno de los 4
+  ciclos completos. Bucket total: 363 objetos.
 - Explorar paginacion `/markets/keyset` de la Gamma API para conocer el tamano
   real del universo de mercados activos (hoy solo se confirmo un piso de ~2,100
   via offset, que se cae mas alla de eso)
