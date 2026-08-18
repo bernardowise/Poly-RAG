@@ -5,12 +5,27 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-18 (Dia 4 -- backfill de historia de odds via CLOB)
+Ultima actualizacion: 2026-08-18 (Dia 4 -- F-lambdas desplegado: created_at, odds history
+retroactivo, y captura post-resolucion ahora nativos en ingest_polymarket/ingest_news)
 
 **Estado del corpus al 2026-08-18** (medido directo contra S3/DynamoDB, no estimado): 6
-ciclos completos, registry con 595 markets (502 open / 93 resolved). Las cifras de 285
-items / 4 ciclos que aparecen mas abajo en las notas de limpieza del 2026-08-17 son
-historicas y correctas para ESA fecha -- el registry crece cada ciclo con markets nuevos.
+ciclos completos, registry con 595+ markets (crece cada ciclo -- 9 markets nuevos entraron
+solo durante la verificacion de F-lambdas esta misma tarde). Las cifras de 285 items / 4
+ciclos que aparecen mas abajo en las notas de limpieza del 2026-08-17 son historicas y
+correctas para ESA fecha.
+
+**Registry, campos agregados 2026-08-18 (ver tech_debt.md para el diseno completo de cada
+uno):** ademas de los campos ya documentados abajo,
+- `created_at` -- fecha REAL de creacion del market en Polymarket (de la misma respuesta
+  Gamma que ya se leia, cero costo extra), distinta de `first_seen` (cuando NOSOTROS
+  empezamos a trackear). Backfilleado a los 595 markets pre-existentes
+  (`scripts/backfill_registry_created_at.py`), y escrito nativamente por
+  `upsert_registry_entry` para cualquier market que entre de aqui en adelante.
+- `post_resolution_cycles_remaining` -- contador para la captura de noticias
+  post-resolucion (ver "Post-Resolution News Capture" en tech_debt.md). Arranca en 0 al
+  crear el registro; `mark_registry_resolved` lo pone en 4 en el momento exacto de la
+  transicion open->resolved (nunca antes, nunca despues); `ingest_news` lo decrementa cada
+  ciclo que el market siga incluido en su busqueda, con guarda contra valores negativos.
 
 **Odds time-series, tras el backfill de historia pre-tracking (ver tech_debt.md, "Odds
 History Backfill from Polymarket CLOB"):** 595 archivos, **63,641 snapshots totales**
@@ -303,20 +318,26 @@ tech_debt.md, "Cycle Snapshots Explicitly Tagged source=cycle"):
   `volume24hr`, `liquidity`. Read-modify-write por ciclo: lee el archivo existente
   (o inicia uno nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas
   de `s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
-- **`source: "clob_backfill"`** -- historia pre-tracking recuperada una sola vez
-  (2026-08-18) desde `clob.polymarket.com/prices-history`, gratis y sin auth, hasta
-  la fecha de creacion real del market (ver tech_debt.md, "Odds History Backfill
-  from Polymarket CLOB", para el diseno completo, los dos bugs encontrados via dry
-  run antes de escribir, y los numeros verificados). Campos: solo `timestamp`,
-  `outcomePrices`, `source`, `backfilled_at` -- SIN `volume`/`volume24hr`/
-  `liquidity` (el endpoint CLOB no los expone), lo cual es una segunda senal
-  estructural independiente del campo `source` para distinguir el origen. Un
-  cutoff duro impide escribir cualquier punto en o despues de la primera cycle real
-  (2026-08-16) -- el backfill solo puede tocar el pasado, nunca el ciclo trackeado.
-  NO corre dentro de la cadena de ingestion (es un script manual, one-off, mismo
-  patron que el bootstrap del registry) -- una vez recuperada, la historia
-  pre-tracking de un market es inmutable, re-consultarla cada ciclo no aportaria
-  nada nuevo.
+- **`source: "clob_backfill"`** -- historia pre-tracking desde
+  `clob.polymarket.com/prices-history`, gratis y sin auth, hasta la fecha de creacion
+  real del market. Campos: solo `timestamp`, `outcomePrices`, `source`,
+  `backfilled_at` -- SIN `volume`/`volume24hr`/`liquidity` (el endpoint CLOB no los
+  expone), lo cual es una segunda senal estructural independiente del campo `source`
+  para distinguir el origen. Un cutoff duro impide escribir cualquier punto en o
+  despues del momento en que el market entra al registry -- el backfill solo puede
+  tocar el pasado, nunca el ciclo trackeado.
+  - **Dos caminos, mismo mecanismo (ver tech_debt.md para ambos):** (1) un backfill
+    manual one-off (`scripts/backfill_odds_history.py`) corrido 2026-08-18 sobre los
+    595 markets ya trackeados en ese momento -- 62,273 snapshots recuperados, dos bugs
+    reales encontrados via dry run antes de escribir (alineacion de timestamps entre
+    tokens perdiendo ~75% de la historia real, y el endpoint `?id=` de Gamma ocultando
+    markets `closed:true`); (2) **desde F-lambdas (2026-08-18, mismo dia), tambien
+    corre NATIVAMENTE dentro de `ingest_polymarket`** -- `backfill_odds_history_for_new_market`,
+    invocada automaticamente justo despues de que un market entra al registry por
+    primera vez. Ningun market nuevo entra ya de aqui en adelante con una serie de
+    tiempo vacia. Verificado en produccion real (dos invocaciones live) el mismo dia:
+    un market creado 2025-11-11 trajo 255 snapshots backfilleados automaticamente al
+    momento de entrar al registry, cero intervencion manual.
 
 **Deliberadamente fuera de alcance (decision explicita del usuario, 2026-08-18):**
 recuperar el HISTORIAL DE NOTICIAS que corresponde a esa ventana pre-tracking. Google
@@ -332,6 +353,28 @@ vamos a ir" -- ver tech_debt.md para el razonamiento completo.
   market, usando `question` tal cual) perteneciera. El linkeo es 1:1 por
   construccion (la busqueda ya es especifica al market), no un match posterior
   contra texto libre.
+  - **Campos temporales agregados 2026-08-18 (ver tech_debt.md para el diseño
+    completo de ambos):** `temporal_tier` (`"3.1"`/`"3.2"`/`"3.3"`/`"too_old"`/
+    `"unknown_market"`) -- clasifica `pubDate` del articulo contra `created_at` y
+    `first_seen` del market; y `market_status_at_publish` (`"open"`/`"closed"`/
+    `"unknown_market"`) -- si el market seguia abierto o ya habia resuelto al
+    momento de publicarse el articulo, calculado desde `resolution_date`, NO desde
+    el status ACTUAL del market. Son dos ejes independientes a proposito (mismo
+    error evitado que el two-tier `link_type` de Comments) -- la combinacion
+    `temporal_tier == "3.3" AND market_status_at_publish == "open"` es la señal de
+    mayor confianza para "esto puede explicar un movimiento de odds real."
+    Retro-tageados sobre los 3,315 articulos existentes
+    (`scripts/tag_news_temporal_tier.py`, `scripts/tag_news_market_status.py`);
+    aun NO se calculan nativamente en `ingest_news` para articulos nuevos --
+    ambas funciones de clasificacion quedaron escritas standalone para copiarse
+    directo al handler cuando se decida hacerlo (no forma parte de F-lambdas,
+    que solo cubrio la AMPLIACION de que markets se buscan, no el tagging de
+    lo que se encuentra).
+  - **Captura post-resolucion (F-lambdas, 2026-08-18):** `get_open_markets` ya no
+    filtra solo `status == open` -- tambien incluye markets `resolved` con
+    `post_resolution_cycles_remaining > 0` (ver seccion de campos del registry
+    arriba). Verificado en produccion: 502 open + 93 resolved (los 93 legacy,
+    arrancados manualmente una sola vez) = 595 exacto.
 - **Comments (reemplaza a Bluesky, 2026-08-16):** lookup directo por
   `comment_entity_type`/`comment_entity_id`, no busqueda. La precision del
   linkeo varia por diseño -- ver seccion Comments arriba para los 3 niveles

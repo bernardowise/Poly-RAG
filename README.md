@@ -30,10 +30,10 @@ EventBridge (00:00 / 12:00 UTC)
 ingest_polymarket --invoke--> ingest_news --invoke--> ingest_comments --invoke--> send_digest
    (top-500 by            (Google News RSS,          (Polymarket's own      (synthesizes all
     volume24hr, LLM        one search per open         comment API,          3 sources into one
-    verifiability          market, fan-out             grouped by Event/     JSON artifact +
-    filter, registry       batching + parallel         Series, deduped       HTML email, its
-    diff, odds             merge, deduped by            by comment_id)        own Bedrock call)
-    time-series)            URL)
+    verifiability          + resolved-in-window        grouped by Event/     JSON artifact +
+    filter, registry       market, fan-out              Series, deduped       HTML email, its
+    diff, odds+history     batching + parallel          by comment_id)        own Bedrock call)
+    for new markets)        merge, deduped by URL)
 ```
 
 Only `ingest_polymarket` has its own EventBridge trigger. Every other stage is
@@ -48,19 +48,32 @@ stuck News cycle and retries only the missing batches.
    in place. A market enters only after an LLM verifiability check (does its outcome
    resolve against a citable public record, not human judgment over ambiguous
    evidence?). Never deleted — resolved markets stay in the registry with their final
-   outcome, so the full open-to-resolution history is preserved.
+   outcome, so the full open-to-resolution history is preserved. Each item also
+   carries `created_at` (the market's real Polymarket creation date, distinct from
+   `first_seen` — when *we* started tracking it) and
+   `post_resolution_cycles_remaining` (a counter that arms at 4 the exact cycle a
+   market resolves, driving the post-resolution News capture below).
 2. **Odds time-series** (S3, `odds/<market_id>.json`) — one file per market,
-   append-only, one snapshot per cycle for every open market. This is the actual
-   differentiator; nothing else in the pipeline matters if this isn't clean. Each
-   snapshot carries an explicit `source`: `cycle` (written every 12h, includes
-   `volume`/`volume24hr`/`liquidity`) or `clob_backfill` (a one-off 2026-08-18
-   backfill of each market's full pre-tracking price history from Polymarket's
-   free CLOB API, back to `createdAt` — price only, no volume/liquidity, and never
-   overlapping the tracked window). See `.claude/claude_docs/tech_debt.md`, "Odds
-   History Backfill from Polymarket CLOB."
+   append-only. This is the actual differentiator; nothing else in the pipeline
+   matters if this isn't clean. Every snapshot carries an explicit `source`:
+   `cycle` (written every 12h, includes `volume`/`volume24hr`/`liquidity`) or
+   `clob_backfill` (pre-tracking price history recovered from Polymarket's free
+   CLOB API, back to the market's `created_at` — price only, no volume/liquidity,
+   and never overlapping the tracked window). The CLOB backfill runs two ways: a
+   one-off pass over the markets already tracked before 2026-08-18, and natively
+   inside `ingest_polymarket` for any market entering the registry from that date
+   forward — no market starts with an empty time-series anymore. See
+   `.claude/claude_docs/tech_debt.md`, "Odds History Backfill from Polymarket CLOB."
 3. **News** (S3, `news/YYYY-MM-DD/HH.json`) — full article text (via
    `googlenewsdecoder` + `trafilatura`), tagged with the specific `market_id`(s) it's
-   about.
+   about. Also classified by `temporal_tier` (when the article was published
+   relative to the market's lifecycle — before it existed, after it existed but
+   before we tracked it, or while we were tracking it) and
+   `market_status_at_publish` (whether the market was still open or had already
+   resolved) — two independent questions, see tech_debt.md, "News Temporal Tiers."
+   Search now covers open markets plus recently-resolved ones still inside their
+   4-cycle post-resolution window, to capture how coverage/reaction looks right
+   after a market's outcome is fixed.
 4. **Comments** (S3, `comments/YYYY-MM-DD/HH.json`) — real trader discussion from
    Polymarket's own comment sections, diffed against `poly-rag-processed-comments` so
    only genuinely new comments are pulled in each cycle.
@@ -90,13 +103,15 @@ treating them as free.
 
 ```
 lambdas/
-  ingest_polymarket/    registry + odds time-series, LLM verifiability filter
-  ingest_news/           Google News RSS, fan-out batching, article extraction
+  ingest_polymarket/    registry + odds time-series (+ CLOB backfill for new
+                         markets), LLM verifiability filter
+  ingest_news/           Google News RSS (open + post-resolution markets),
+                          fan-out batching, article extraction
   ingest_comments/       Polymarket comments, entity grouping, comment_id dedup
   send_digest/           cross-source synthesis, JSON artifact + email
   watchdog_ingest_news/  stuck-cycle detection and retry
 scripts/                  one-off scripts, run manually, not part of the 12h chain
-                           (odds history backfill, snapshot provenance tagging)
+                           (odds/registry backfills, News temporal/status tagging)
 terraform/                all AWS infrastructure as code
 .claude/
   claude_docs/            architecture_canon.md, tech_debt.md, session_ledger.md,
@@ -119,45 +134,47 @@ markets under the current (post-2026-08-16) design only — an early-pipeline cl
 removed all registry/odds data tied to the deprecated Bluesky + keyword-matching
 design.
 
-**Corpus, as of 2026-08-18 (6 complete cycles):** 595 registry markets (502 open /
-93 resolved), 3,315 news articles (~5.2M tokens, 100% linked to exactly one
-market_id), 12,711 comments (~261K tokens — News keeps growing steadily per cycle,
-Comments flattened to steady-state volume once its dedup table caught up), and
-63,641 odds snapshots (1,368 from the 12h cycle, 62,273 from the CLOB backfill —
-see above).
+**Corpus, as of 2026-08-18 (6 complete cycles, registry growing every cycle):**
+595+ registry markets, 3,315 news articles (~5.2M tokens, 100% linked to exactly
+one market_id, all classified by temporal tier and market status at publish time),
+12,711 comments (~261K tokens — News keeps growing steadily per cycle, Comments
+flattened to steady-state volume once its dedup table caught up), and 63,641+ odds
+snapshots (a growing mix of `cycle` and `clob_backfill` provenance — most markets
+now carry history back to their real creation date, not just since we started
+tracking them).
 
 ## Pending / TODO
 
-- **RAG retrieval (Day 4)** — in design. The earlier two-layer model (explicit
-  linkage + ambient time-window) was deprecated on 2026-08-18 and its implementation
-  (`retrieval/time_window.py`) deleted: the per-market News redesign left 100% of
-  articles linked to exactly one market, so the ambient pool it retrieved from is
-  empty. Current model is a single path — metadata filter (`market_id`, time, source)
-  plus semantic ranking. Odds history now reaches back to each market's creation
-  (see the CLOB backfill above), which unblocks correlating older news against real
-  price movement. Two findings still need resolving before chunking starts: (1) most
-  ingested articles are stale relative to the market they're linked to (only ~23%
-  are ≤1 day old at ingestion; median age 41 days, since Google News ranks by
-  relevance to the market's question, not recency) — decided: keep everything (real
-  market context even without odds impact), cap at 1 year relative to the market's
-  `createdAt` (not ingestion date), and classify each article into one of three
-  temporal tiers (published before the market existed / after creation but before
-  we tracked it / while we were tracking) — none of this classification logic is
-  built yet; (2) a deliberate scope boundary — backfilling the *news* history for
-  the pre-tracking window is explicitly out of scope (Google News RSS has no
-  arbitrary date-range search; recovering it would be a separate project). Also
-  planned: capturing news for 4-8 cycles after a market resolves, to record
-  post-resolution reaction. Chunking strategy, embedding model, and vector store
-  remain open; embedding must be incremental within the ingestion chain, since the
-  corpus accumulates roughly 1M tokens per cycle from News alone (Comments' growth
-  has flattened at steady state).
+- **RAG retrieval (Day 4)** — corpus-enrichment groundwork done; chunking/embedding/
+  retrieval itself not started. Completed so far: the earlier two-layer retrieval
+  model (explicit linkage + ambient time-window) was deprecated and its
+  implementation (`retrieval/time_window.py`) deleted — the per-market News
+  redesign left 100% of articles linked to exactly one market, so the ambient pool
+  it retrieved from was empty. Current model is a single path — metadata filter
+  (`market_id`, time, source) plus semantic ranking, still to be built. Odds
+  history now reaches back to each market's creation (CLOB backfill, both one-off
+  and native going forward), unblocking correlation against older news. News
+  articles are classified by `temporal_tier` and `market_status_at_publish`
+  (capped at 1 year relative to the market's `created_at`, not ingestion date —
+  see architecture_canon.md). Post-resolution News capture (4 cycles / 48h after a
+  market resolves) is live in `ingest_news`. A real orphan-data finding (305
+  articles referencing markets purged in an earlier cleanup) was found and
+  deliberately left untouched, to be handled later, possibly at query time.
+  **Still open:** chunking strategy (articles are long and need splitting;
+  comments are too short to embed individually), embedding model, and vector
+  store (candidates: FAISS-in-S3, ChromaDB, Databricks Vector Search — OpenSearch
+  Serverless ruled out on cost). Embedding must be incremental within the
+  ingestion chain, since the corpus accumulates roughly 1M tokens per cycle from
+  News alone.
 - **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
   is the closest existing precedent (multi-source context → Bedrock → synthesis) but
   there's no user-facing query interface yet. Includes an open, explicitly deferred
-  decision: LangChain/LlamaIndex vs. continuing with direct boto3 calls.
+  decision: LangChain/LlamaIndex vs. continuing with direct boto3 calls. CI/CD
+  (remote Terraform state → first Python tests → CI → CD via GitHub OIDC) is
+  scheduled here too, deliberately deferred out of Day 4.
 - **Databricks Delta Lake / Unity Catalog** — tables created and verified
-  (`workspace.poly_rag.market_registry`, `odds_snapshots`), but only one version
-  exists so far; real time-travel (comparing two versions) not yet demonstrated.
+  (`workspace.poly_rag.market_registry`, `odds_snapshots`), real time-travel
+  demonstrated (comparing two live registry versions via `VERSION AS OF`).
 - **LLM enrichment output not yet optimized for RAG** — current `llm_summary` /
   `executive_summary` fields were designed for human readability (the digest email),
   not evaluated against real retrieval requirements. Deliberately deferred until the
@@ -170,4 +187,5 @@ see above).
 - **DKIM/deliverability** — digest emails land in spam; the real fix requires a
   project-owned domain, deferred by explicit choice.
 - **No CI/CD** — deploys are manual (`terraform apply`, scoped with `-target`),
-  Terraform state is local and gitignored, no remote backend.
+  Terraform state is local and gitignored, no remote backend. Scheduled for Day 5
+  (see above), not before.

@@ -1681,15 +1681,138 @@ trending -- see the News staleness finding above). None were published after res
 because `ingest_news` never searches a market once it leaves `status == "open"`. This is live
 proof, not just design reasoning, of the exact gap this feature exists to close.
 
-**Not yet implemented -- deferred to "F-lambdas"** (a batched, single-deploy set of
-`ingest_polymarket`/`ingest_news` changes for markets going forward, alongside the odds-history
-backfill extension and the `created_at` extension from the entry above): `ingest_news` needs to
-widen its candidate set from "open markets" to "open markets, plus markets whose
-`resolution_date` falls within the last 4 cycles," and `classify_market_status()` (written
-standalone in the tagging script, same reuse intent as `classify_temporal_tier()`) needs to be
-copied in to tag new articles as they're fetched.
+**Implemented same day (F-lambdas, 2026-08-18) -- see the batched Lambda-extension entry below
+for the other two changes deployed alongside this one.** Design changed slightly from the
+original plan during implementation: rather than comparing dates on every run, the mechanism
+is a COUNTER, not a live date comparison --
+`mark_registry_resolved` (`lambdas/ingest_polymarket/handler.py`) sets
+`post_resolution_cycles_remaining = 4` the exact cycle a market transitions open->resolved (the
+transition itself, never re-armed later); `get_open_markets`
+(`lambdas/ingest_news/handler.py`) now selects `status == open OR
+post_resolution_cycles_remaining > 0`; `decrement_post_resolution_counter` counts it down by 1
+each cycle a resolved market is included, guarded by a `ConditionExpression` so it can never go
+negative (verified live: 2 -> 1 -> 0 -> 0, third decrement correctly a no-op). This is simpler
+than date math and matches exactly how the user described it ("checa si estaba open y ahora
+closed... y si ya esta closed entonces empieza el pull de 4 ciclos") -- a transition-triggered
+counter, not a resolution_date comparison recomputed every cycle.
 
-**Revisit if:** F-lambdas ships and the first real post-resolution cycle produces `closed`
-articles -- confirm the 4-cycle window in practice actually captures meaningful reaction rather
-than silence (Google News may have little to say about a market 12-48h after resolution if the
-underlying event itself isn't newsworthy beyond the market resolving).
+**One-time catch-up for the 93 markets resolved BEFORE this code existed, per the user's
+explicit decision:** `scripts/start_legacy_post_resolution_windows.py`, a hardcoded list of the
+93 `market_id`s frozen at the moment this was written (deliberately NOT a live "all resolved
+markets" query -- see the script's docstring for why re-running that query later would wrongly
+re-arm markets whose real window already happened and ended). Starts their counter at 4 as if
+they had just resolved NOW, accepting the resulting bias (Google News reflects what's indexed
+today, not each market's real historical 48h window) as acceptable given the pipeline's own
+short lifetime (News has only run 6 cycles / 3 days total, so "old" here means at most 2-3
+days). Dry run confirmed 93/93 with 0 errors before applying; DynamoDB verified post-apply: all
+93 resolved markets show `post_resolution_cycles_remaining == 4`. No standalone News-fetching
+script was written for this -- the regular `ingest_news` cycle picks these 93 up automatically
+through the same widened `get_open_markets` query, so there is no duplicate search/decode/
+extract/dedup logic to maintain.
+
+**Cleanup reminder: delete `scripts/start_legacy_post_resolution_windows.py` on 2026-08-19**
+(tomorrow, Mexico City date), once the next 1-2 real ingest_news cycles have run and consumed
+all 93 legacy windows (4 cycles = 48h, so by the 2026-08-20 12:00 UTC cycle every one of the 93
+counters will have reached 0 through normal operation). The script's own docstring already warns
+against re-running it later with an updated/live market list -- once its one-time job is done,
+the file itself is dead code, not a reusable tool, and should be removed rather than left as a
+trap for a future session that might reach for it again against a different set of resolved
+markets.
+
+**Revisit if:** the first real post-resolution cycles (starting with the 93 legacy markets)
+produce meaningful `closed`-tagged articles -- confirm the 4-cycle window in practice actually
+captures reaction rather than silence (Google News may have little to say about a market 12-48h
+after resolution if the underlying event isn't newsworthy beyond the market resolving).
+
+---
+
+## F-lambdas: Batched Ingestion Extensions for Markets Going Forward (deployed 2026-08-18)
+
+**Issue:** three extensions to `ingest_polymarket`/`ingest_news`, each discovered as a "not yet
+implemented, deferred" note earlier the same day (see the CLOB odds backfill, News temporal
+tiers, and post-resolution capture entries above) -- all three only ever mattered for markets
+NEWLY entering the registry going forward, since the one-off scripts already covered every
+market tracked before today. Deliberately batched into ONE deploy rather than three, per the
+user's explicit call ("dejar la letra F para el final, un solo deploy") -- avoids touching the
+same two Lambdas multiple times in one session for unrelated reasons.
+
+**Three changes, `lambdas/ingest_polymarket/handler.py`:**
+1. **`created_at` written on registry entry** (`upsert_registry_entry`) -- straight from the same
+   Gamma API response already used for everything else, zero extra cost. Closes the gap the
+   `created_at` backfill script had to fill retroactively for the 595 pre-existing markets.
+2. **`backfill_odds_history_for_new_market`**, called immediately after a market is upserted --
+   same CLOB endpoint, same YES-token-only + derived-complement logic as
+   `scripts/backfill_odds_history.py` (see that entry above for the two bugs found there and why
+   the complement derivation is sound for binary markets only). Fails silently on any error --
+   odds history is a bonus, must never block registry entry itself. `append_odds_snapshot`
+   (already called for every open market later in the same handler run) correctly read-modify-
+   writes on top of whatever this function just wrote, so no merge logic was needed.
+3. **Post-resolution counter started at the open->resolved transition** (`mark_registry_resolved`,
+   now also setting `post_resolution_cycles_remaining = POST_RESOLUTION_CYCLES = 4`) -- the
+   transition itself is the only moment this should ever be armed, never re-armed later.
+
+**One change, `lambdas/ingest_news/handler.py`:**
+4. **`get_open_markets` widened** from `status == open` to `status == open OR
+   post_resolution_cycles_remaining > 0` -- the exact gap proven empirically in the entry above
+   (0/3315 articles were `closed` because a resolved market stopped being searched entirely).
+   Now returns `(market_id, question, status)` tuples (previously just `(market_id, question)`)
+   so the handler knows which markets are in their post-resolution window.
+5. **`decrement_post_resolution_counter`**, called once per resolved market actually processed
+   this cycle -- guarded with a `ConditionExpression` so the counter can never go negative
+   (verified live before deploy: 2 -> 1 -> 0 -> 0, third decrement correctly a no-op).
+
+**Design note, mechanism differs slightly from the original plan:** rather than comparing
+`resolution_date` against "now" on every run (which the user correctly identified as redundant
+work once a counter exists), the final design is a pure counter armed once at the transition and
+decremented by the consuming Lambda -- matches the user's own framing exactly ("checa si estaba
+open y ahora closed... y si ya esta closed entonces empieza el pull de 4 ciclos").
+
+**Verified before deploy (all against real data/API, nothing assumed):**
+- `fetch_clob_price_history` (the ingest_polymarket copy) returned 371 real points for market
+  559672, matching the one-off script's earlier result exactly.
+- `decrement_post_resolution_counter` tested live against a throwaway registry item
+  (`__test_market_do_not_use__`, deleted after): 2 -> 1 -> 0 -> 0, guard confirmed working.
+- `get_open_markets` against the real registry returned exactly 502 open + 93 resolved = 595,
+  matching the registry's real composition with no duplicates or omissions.
+- Both handlers compile clean (`python3 -m py_compile`).
+
+**Deployed via `terraform apply -target=aws_lambda_function.ingest_polymarket
+-target=aws_lambda_function.ingest_news`** (plan reviewed first: `1 to add, 2 to change, 1 to
+destroy` -- the add/destroy pair is `null_resource.ingest_news_deps` being replaced because its
+`handler_hash` trigger changed, which is what correctly forces the dependency zip to rebuild
+with the new handler code, not an unexpected resource). Applied cleanly: `1 added, 2 changed, 1
+destroyed`, no other resource touched (Comments, send_digest, EventBridge, IAM, S3, DynamoDB all
+untouched by this deploy).
+
+**One-time catch-up for the 93 pre-existing resolved markets:** see the "Post-Resolution News
+Capture" entry above for `scripts/start_legacy_post_resolution_windows.py` (already run,
+93/93 counters set to 4) -- these 93 will be picked up by the newly-deployed `get_open_markets`
+starting with the very next `ingest_news` cycle, through the same normal path as any market that
+resolves from now on.
+
+**Revisit if:** the next few live cycles show `backfill_odds_history_for_new_market` silently
+failing more often than expected (its errors are swallowed by design -- worth spot-checking
+CloudWatch logs after a few real new-market cycles to confirm it's actually firing, not just
+failing invisibly every time), or if post-resolution News capture in practice needs the window
+length or trigger condition adjusted once real `closed`-tagged articles start arriving.
+
+**Bug found and fixed during post-deploy verification, same day:** `append_odds_snapshot`
+(the function that writes every cycle's own odds snapshot, unchanged by this deploy) was never
+updated to write `source: "cycle"` -- verified live by invoking `ingest_polymarket` twice against
+production and inspecting the resulting S3 files directly. This would have reintroduced, for all
+NEW snapshots going forward, exactly the implicit-absence problem the user explicitly rejected
+earlier the same day for the 1,368 pre-existing snapshots (see "Cycle Snapshots Explicitly Tagged
+source=cycle" above). Fixed by adding the field directly to `append_odds_snapshot`'s snapshot
+dict -- redeployed with a second, separately verified `terraform apply -target` (plan confirmed
+`0 to add, 1 to change, 0 to destroy` first). Verified against a real snapshot written by the
+second live invocation: `{"source": "cycle", "timestamp": ..., ...}`, field present natively,
+no follow-up tagging script needed for snapshots written from this point forward.
+
+**Verified against two real, live invocations of `poly-rag-ingest-polymarket`** (not a
+CloudWatch-only check): first invocation (before the source fix) surfaced 9 real new markets,
+each landing in the registry with a genuine `created_at` (spanning 2025-11-11 to 2026-08-17) and
+`post_resolution_cycles_remaining: 0` as expected; 4 of those markets' `odds/<id>.json` files
+confirmed populated with `clob_backfill` history automatically, including one (677396, created
+2025-11-11) with 255 backfilled snapshots -- nearly 9 months of price history recovered the
+instant the market entered the registry, zero manual script involved. Second invocation (after
+the source fix) confirmed newly-written cycle snapshots now carry `source: "cycle"` natively.

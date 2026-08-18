@@ -121,27 +121,53 @@ _TRAFILATURA_CONFIG.set("DEFAULT", "DOWNLOAD_TIMEOUT", "8")
 
 
 def get_open_markets(table):
-    """Scans the registry for open markets and their question text. Same
-    small-table scan approach used elsewhere in the pipeline -- revisit if
-    the registry grows large enough for this to matter."""
+    """Scans the registry for markets to search News for THIS cycle: every
+    open market, PLUS resolved markets still inside their post-resolution
+    capture window (see tech_debt.md, "Post-Resolution News Capture") --
+    post_resolution_cycles_remaining > 0, set by ingest_polymarket the
+    cycle a market resolves and decremented once per cycle by this Lambda
+    (see decrement_post_resolution_counter). A resolved market with the
+    counter already at 0 is excluded, same as before this change existed.
+    Same small-table full-scan approach used elsewhere in the pipeline --
+    revisit if the registry grows large enough for this to matter."""
+    scan_kwargs = {
+        "FilterExpression": (
+            "#s = :open OR post_resolution_cycles_remaining > :zero"
+        ),
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":open": "open", ":zero": 0},
+        "ProjectionExpression": "market_id, question, #s, post_resolution_cycles_remaining",
+    }
     markets = []
-    resp = table.scan(
-        FilterExpression="#s = :open",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":open": "open"},
-        ProjectionExpression="market_id, question",
-    )
+    resp = table.scan(**scan_kwargs)
     markets.extend(resp.get("Items", []))
     while "LastEvaluatedKey" in resp:
-        resp = table.scan(
-            FilterExpression="#s = :open",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":open": "open"},
-            ProjectionExpression="market_id, question",
-            ExclusiveStartKey=resp["LastEvaluatedKey"],
-        )
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **scan_kwargs)
         markets.extend(resp.get("Items", []))
-    return [(m["market_id"], m["question"]) for m in markets if m.get("question")]
+    return [
+        (m["market_id"], m["question"], m.get("status"))
+        for m in markets
+        if m.get("question")
+    ]
+
+
+def decrement_post_resolution_counter(table, market_id):
+    """Called once per cycle for every resolved market included in this
+    cycle's search (see get_open_markets) -- counts down the post-resolution
+    capture window started by ingest_polymarket's mark_registry_resolved.
+    Guarded with a condition expression so a counter already at 0 (or
+    concurrently decremented) is never driven negative -- defensive, since
+    nothing in the current design decrements twice in one cycle, but cheap
+    insurance against a future change that re-invokes this Lambda."""
+    try:
+        table.update_item(
+            Key={"market_id": market_id},
+            UpdateExpression="SET post_resolution_cycles_remaining = post_resolution_cycles_remaining - :one",
+            ConditionExpression="post_resolution_cycles_remaining > :zero",
+            ExpressionAttributeValues={":one": 1, ":zero": 0},
+        )
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        pass  # already at 0 -- nothing to decrement, market simply won't be re-selected next cycle
 
 
 def sanitize_query(question):
@@ -472,12 +498,17 @@ def lambda_handler(event, context):
     batch_articles = []
     batch_markets_failed = []
 
-    for market_id, question in batch:
+    for market_id, question, status in batch:
         articles, error = process_market_news(market_id, question, processed_urls_table, domain_failures_table)
         if error:
             batch_markets_failed.append(error)
             continue
         batch_articles.extend(articles)
+        if status == "resolved":
+            # Only resolved markets carry a post-resolution counter to begin
+            # with (see get_open_markets) -- open markets are excluded here
+            # by construction, not by an extra status check on every market.
+            decrement_post_resolution_counter(registry_table, market_id)
 
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 

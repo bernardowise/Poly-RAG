@@ -63,6 +63,14 @@ PAGE_SIZE = 100
 # point, not a permanent constant; revisit if it excludes too much or too little.
 MIN_HORIZON_HOURS = 48
 
+# Post-resolution News capture (see tech_debt.md, "Post-Resolution News
+# Capture"): 4 cycles = 48h of continued News search after a market
+# resolves, to capture reaction to the now-fixed outcome. The cycle a
+# market resolves in counts as post-resolution cycle #1 -- this constant
+# is what that first cycle's counter gets set to (ingest_news decrements
+# it by 1 each cycle it includes the market, stopping at 0).
+POST_RESOLUTION_CYCLES = 4
+
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
@@ -296,21 +304,46 @@ def upsert_registry_entry(table, market, now_iso):
         "comment_entity_id": entity_id,
         "comment_link_type": link_type,
         "first_seen": now_iso,
+        # The market's REAL creation date (from the same Gamma response,
+        # zero extra API cost), distinct from first_seen (when WE started
+        # tracking it) -- required to classify News articles into temporal
+        # tiers (see scripts/tag_news_temporal_tier.py and tech_debt.md,
+        # "News Temporal Tiers"). Backfilled for the 595 pre-existing
+        # registry items via scripts/backfill_registry_created_at.py; new
+        # entries get it directly going forward as of this change.
+        "created_at": market.get("createdAt"),
         "last_updated": now_iso,
         "resolution_date": None,
         "final_outcome": None,
+        # Post-resolution News capture (see tech_debt.md, "Post-Resolution
+        # News Capture"): 0 here means "not resolved yet, nothing to
+        # count." Set to POST_RESOLUTION_CYCLES when this market transitions
+        # to resolved (see mark_registry_resolved) and decremented by
+        # ingest_news each cycle it's included in the search.
+        "post_resolution_cycles_remaining": 0,
     })
 
 
 def mark_registry_resolved(table, market_id, final_outcome, now_iso):
+    """Marks a market resolved AND starts its post-resolution News capture
+    window (see tech_debt.md, "Post-Resolution News Capture") -- this is the
+    open->closed transition itself, the only moment this counter should ever
+    be initialized. ingest_news reads post_resolution_cycles_remaining each
+    cycle to decide whether to keep searching a resolved market, and
+    decrements it; it never re-initializes it, so a market only ever gets
+    this one 4-cycle window, starting exactly at its real resolution."""
     table.update_item(
         Key={"market_id": market_id},
-        UpdateExpression="SET #s = :resolved, final_outcome = :outcome, resolution_date = :now, last_updated = :now",
+        UpdateExpression=(
+            "SET #s = :resolved, final_outcome = :outcome, resolution_date = :now, "
+            "last_updated = :now, post_resolution_cycles_remaining = :cycles"
+        ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
             ":resolved": "resolved",
             ":outcome": final_outcome,
             ":now": now_iso,
+            ":cycles": POST_RESOLUTION_CYCLES,
         },
     )
 
@@ -332,6 +365,12 @@ def append_odds_snapshot(market, now_iso):
         history = {"market_id": market["id"], "snapshots": []}
 
     history["snapshots"].append({
+        # Explicit provenance (see tech_debt.md, "Cycle Snapshots Explicitly
+        # Tagged source=cycle") -- written directly here as of 2026-08-18 so
+        # every NEW snapshot is self-describing from day one, rather than
+        # needing another one-off tagging pass later the way the 1,368
+        # pre-existing snapshots did.
+        "source": "cycle",
         "timestamp": now_iso,
         "outcomePrices": market.get("outcomePrices"),
         "volume": market.get("volumeNum"),
@@ -345,6 +384,76 @@ def append_odds_snapshot(market, now_iso):
         Body=json.dumps(history),
         ContentType="application/json",
     )
+
+
+# Odds history backfill for newly-tracked markets (see tech_debt.md, "Odds
+# History Backfill from Polymarket CLOB", "Not yet decided" note). Same
+# CLOB endpoint, same YES-token-only + derived-complement approach as
+# scripts/backfill_odds_history.py -- see that script's docstring for the
+# full reasoning (the cross-token timestamp misalignment bug that discarded
+# ~75% of real history, and why deriving NO=1-YES is sound for binary
+# markets). This is the forward-going counterpart: instead of a one-off
+# script backfilling 595 already-tracked markets, this runs automatically
+# the moment a market FIRST enters the registry, so no market starts with
+# a cycle-only time-series the way every market did before 2026-08-18.
+CLOB_PRICES_HISTORY_URL = "https://clob.polymarket.com/prices-history"
+
+
+def fetch_clob_price_history(token_id):
+    url = f"{CLOB_PRICES_HISTORY_URL}?market={token_id}&interval=max&fidelity=1440"
+    req = urllib.request.Request(url, headers={"User-Agent": "poly-rag-ingestion/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.loads(response.read().decode()).get("history", []) or []
+
+
+def backfill_odds_history_for_new_market(market, now):
+    """Fetches and writes pre-tracking odds history for a market the moment
+    it enters the registry. Binary markets only (2 clobTokenIds) -- markets
+    with more outcomes are skipped, same as the one-off script, since the
+    complement-derivation trick only holds for two-outcome markets. Silently
+    does nothing on any fetch error or missing/malformed clobTokenIds --
+    this must never block registry entry itself, odds history is a bonus,
+    not a prerequisite."""
+    try:
+        token_ids = json.loads(market.get("clobTokenIds") or "[]")
+    except json.JSONDecodeError:
+        return
+    if len(token_ids) != 2:
+        return
+
+    try:
+        history = fetch_clob_price_history(token_ids[0])
+    except Exception:
+        return  # transient API error -- market still gets cycle snapshots going forward
+
+    snapshots = []
+    for point in sorted(history, key=lambda p: p["t"]):
+        moment = datetime.fromtimestamp(point["t"], timezone.utc)
+        if moment >= now:
+            continue  # never write into or past the current cycle's own snapshot
+        yes_price = float(point["p"])
+        snapshots.append({
+            "source": "clob_backfill",
+            "timestamp": moment.isoformat(),
+            "outcomePrices": json.dumps([f"{yes_price:.4f}", f"{1 - yes_price:.4f}"]),
+            "backfilled_at": now.isoformat(),
+        })
+
+    if not snapshots:
+        return
+
+    key = f"odds/{market['id']}.json"
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps({"market_id": market["id"], "snapshots": snapshots}),
+        ContentType="application/json",
+    )
+    # append_odds_snapshot (called later in lambda_handler for every open
+    # registry market, including this one) does its own read-modify-write
+    # and will correctly read this file back and append today's cycle
+    # snapshot on top -- no merge logic needed here, this only ever runs
+    # once, before that first cycle snapshot exists.
 
 
 def lambda_handler(event, context):
@@ -377,6 +486,7 @@ def lambda_handler(event, context):
             if not verdict or not verdict.get("is_verifiable"):
                 continue  # not objectively verifiable -- discard, never enters the registry
             upsert_registry_entry(registry_table, m, now_iso)
+            backfill_odds_history_for_new_market(m, now)
             tracked_markets.append(m)
 
     # Odds snapshot + resolution check -- decoupled from candidate discovery
