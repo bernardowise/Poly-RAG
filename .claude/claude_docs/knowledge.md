@@ -183,3 +183,49 @@ sprint -- el primero construye el insumo estructurado que el segundo necesita.
 ingestion generan y guardan en S3 (distinto del correo digest que ya recibe) --
 confirmando que hoy solo estan en raw storage, sin indexar de ninguna forma, justo
 antes de arrancar el Dia 3 del sprint.
+
+---
+
+# Polymarket -- conceptos de dominio
+
+A diferencia de la seccion de arriba (conceptos tecnicos de AI/RAG/NLP), esta seccion
+archiva conceptos del dominio de prediction markets/Polymarket en si -- necesarios para
+entender los datos que el proyecto ingiere, no la arquitectura de IA que los procesa.
+
+## 2026-08-17 -- Mecanismo de Polymarket: peer-to-peer, no casa de apuestas
+
+Polymarket no es una casa de apuestas (sportsbook/casino) ni funciona como comprar
+acciones -- es un mercado peer-to-peer donde Polymarket solo facilita que dos usuarios
+con opiniones opuestas se encuentren, cobrando una comision pequena por transaccion. No
+toma posicion ni gana/pierde segun el resultado.
+
+**El mecanismo:** cada market tiene dos tokens complementarios, YES y NO. La regla
+ancla es que 1 YES + 1 NO siempre valen $1 combinados, respaldados 1:1 en USDC via un
+"complete set" en garantia (escrow) del contrato inteligente. El precio de cada token
+(ej. YES a $0.73) **es** la probabilidad implicita que el mercado le asigna a ese
+resultado -- sube si hay mas presion de compra en YES que en NO, baja al reves.
+
+**Liquidacion al resolver:** el contrato paga $1 a cada share ganador y $0 a cada share
+perdedor, sacando el dinero del pool de garantia -- no es un pago directo persona-a-
+persona, pero en efecto neto el dinero que le habria tocado al lado perdedor termina
+financiando el pago del lado ganador. La ganancia/perdida de cada trader depende del
+precio al que compro su share, no de un monto fijo -- comprar YES a $0.10 y ganar paga
+$0.90/share de ganancia; comprar YES a $0.95 y ganar paga solo $0.05/share.
+
+**Por que no es como una accion:** una accion representa dueñidad de una empresa, sin
+fecha de expiracion, con valor que puede crecer indefinidamente. Un share de Polymarket
+es un contrato binario que expira en la fecha de resolucion del market y solo puede
+valer $0 o $1 -- mas parecido a una opcion financiera binaria que a una accion. Se
+parece a una accion solo en el mecanismo de trading (order book, precio que fluctua por
+oferta/demanda), no en lo que representa.
+
+**`volume24hr` vs `volumeNum`:** el proyecto usa `volume24hr` (valor total en USD
+tradeado en las ultimas 24h, ventana movil que sube y baja) para el ranking de top-500,
+no `volumeNum` (volumen total acumulado desde que el market abrio, que nunca baja) --
+`volume24hr` refleja actividad reciente/real, mientras que el volumen total favorece
+markets viejos que ya no tienen actividad pero acumularon mucho trading en el pasado.
+
+**Contexto:** El usuario pregunto por el mecanismo real detras de los numeros de
+`volume24hr` que se venian explorando en el notebook `eda_mio_2` (top/bottom 10 por
+volumen) -- llevo a explicar como funciona Polymarket desde primeros principios, sin
+casa de apuestas de por medio, y la diferencia entre volumen de 24h y volumen total.

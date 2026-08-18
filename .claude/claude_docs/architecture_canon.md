@@ -523,6 +523,24 @@ primera pieza de infra desplegada nativamente por Terraform en vez de CLI suelto
   por completo, no se dejo vacio, por decision explicita del usuario. Estado
   final: 299 markets con odds, 479 snapshots, todos asociados a uno de los 4
   ciclos completos. Bucket total: 363 objetos.
+- **Extension final (2026-08-17), aplicado tambien al registry:** desde
+  `eda_mio_2`, construyendo una celda de "saldo" (entraron/salieron por ciclo)
+  para el registry, se detecto que el saldo corrido no cuadraba con el total
+  real (saldo=210 vs. 250 open reales) -- causa raiz: 15 registry items no
+  habian entrado por ninguno de los 4 ciclos completos, sino por otras
+  invocaciones de `ingest_polymarket` (debugging del 16 de agosto, timestamps
+  00:31/01:07/01:08-09/01:34, ninguno coincide con los 4 ciclos reales).
+  Reconciliado con evidencia exacta (los `market_id` reales de
+  `newly_tracked_markets` en cada payload de ciclo, no aproximacion por hora --
+  un primer intento de reconciliar por prefijo de hora fallo porque varias
+  invocaciones de debug caian en la misma hora que un ciclo real). Mismo
+  criterio aplicado que al resto del dia: si no entro por un ciclo completo
+  real, no debe existir. Borrados los 15 registry items + 14 archivos
+  `odds/<market_id>.json` correspondientes (uno, `1088487`, ya no tenia
+  archivo -- se habia borrado en la pasada anterior por quedar en 0
+  snapshots). Estado final verificado: registry = 285 items, EXACTO igual a
+  los 285 market_ids que entraron via los 4 ciclos completos (237 open / 48
+  resolved). Bucket total: 349 objetos.
 - Explorar paginacion `/markets/keyset` de la Gamma API para conocer el tamano
   real del universo de mercados activos (hoy solo se confirmo un piso de ~2,100
   via offset, que se cae mas alla de eso)

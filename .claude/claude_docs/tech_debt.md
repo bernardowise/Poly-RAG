@@ -1243,3 +1243,25 @@ counts everyone uniformly, regardless of which data source (batch or individual 
 enough (e.g. if the registry grows well beyond ~300-500 open markets while top-500-by-volume stays
 fixed) that per-cycle latency or Gamma API rate limits become a real constraint -- not yet measured,
 but structurally the same cost profile as the resolution-check that already existed before this fix.
+
+---
+
+## Databricks Notebooks Not Version-Controlled (raised 2026-08-17, not yet done)
+
+**Issue:** `poly_rag_exploration` and `eda_mio` (Day 3 work, Delta Lake + Unity Catalog + the user's
+own EDA) only exist in the Databricks workspace -- never committed to this repo. Every other piece
+of the project (Lambda code, Terraform, docs) is git-tracked; the notebooks are the one exception,
+kept in sync today only via ad-hoc `databricks workspace export`/`import` CLI calls run manually
+during sessions, with no persistent copy in git history.
+
+**User asked, then declined to build now:** whether a git copy of the notebooks is common practice
+(yes) -- confirmed, then explicitly deferred actually wiring it up, asking only for this to be
+recorded as a pending item.
+
+**Real fix: Databricks Repos.** Databricks' native git integration -- connects the workspace
+directly to this GitHub repo so notebook changes sync in both directions automatically, instead of
+relying on someone remembering to run an export/import CLI command. Not yet configured.
+
+**Revisit if:** notebook work picks up again (more Day 3 Delta Lake/Unity Catalog work, or Day 4/5
+touching Databricks) and the manual export/import friction becomes annoying enough to justify the
+one-time setup cost of connecting Databricks Repos to this repo.
