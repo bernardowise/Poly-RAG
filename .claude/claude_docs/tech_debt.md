@@ -1246,22 +1246,27 @@ but structurally the same cost profile as the resolution-check that already exis
 
 ---
 
-## Databricks Notebooks Not Version-Controlled (raised 2026-08-17, not yet done)
+## Databricks Notebooks Not Version-Controlled (closed 2026-08-18)
 
-**Issue:** `poly_rag_exploration` and `eda_mio` (Day 3 work, Delta Lake + Unity Catalog + the user's
-own EDA) only exist in the Databricks workspace -- never committed to this repo. Every other piece
-of the project (Lambda code, Terraform, docs) is git-tracked; the notebooks are the one exception,
-kept in sync today only via ad-hoc `databricks workspace export`/`import` CLI calls run manually
-during sessions, with no persistent copy in git history.
+**Issue (raised 2026-08-17):** `poly_rag_exploration` and `eda_mio` (Day 3 work, Delta Lake + Unity
+Catalog + the user's own EDA) only existed in the Databricks workspace -- never committed to this
+repo. Every other piece of the project (Lambda code, Terraform, docs) is git-tracked; the notebooks
+were the one exception, kept in sync only via ad-hoc `databricks workspace export`/`import` CLI
+calls run manually during sessions, with no persistent copy in git history.
 
-**User asked, then declined to build now:** whether a git copy of the notebooks is common practice
-(yes) -- confirmed, then explicitly deferred actually wiring it up, asking only for this to be
-recorded as a pending item.
+**Closed (2026-08-18):** Databricks Repos (now called Git Folders in the newer UI) connected to
+`bernardowise/Poly-RAG`. Setup: a GitHub fine-grained PAT scoped to only this repo (Contents:
+Read and write, Metadata: Read-only) registered as a Databricks git credential
+(`databricks git-credentials create`), then `databricks repos create` cloned the repo into
+`/Users/bernardolw@gmail.com/Poly-RAG` inside the workspace. `eda_mio`, `eda_mio_2`, `eda_mio_3`
+moved into a new `databricks/` folder inside that git-connected copy (`databricks/eda_mio.py`,
+etc.), mirroring how `lambdas/` and `terraform/` already organize the repo by domain. Committing
+and pushing back to GitHub from there is a manual step done by the user via Databricks' Git panel
+UI (not automated by Claude, consistent with this repo's git rules in CLAUDE.md -- commits are
+never run on the user's behalf).
 
-**Real fix: Databricks Repos.** Databricks' native git integration -- connects the workspace
-directly to this GitHub repo so notebook changes sync in both directions automatically, instead of
-relying on someone remembering to run an export/import CLI command. Not yet configured.
-
-**Revisit if:** notebook work picks up again (more Day 3 Delta Lake/Unity Catalog work, or Day 4/5
-touching Databricks) and the manual export/import friction becomes annoying enough to justify the
-one-time setup cost of connecting Databricks Repos to this repo.
+**Revisit if:** the GitHub fine-grained PAT registered for this integration needs rotating (it was
+created with no expiration, GitHub's own recommendation is to set one) -- or if committing/pushing
+from Databricks proves annoying enough in practice to warrant automating it further (e.g. a
+scheduled sync job), though manual commits from the Databricks Git panel are the deliberate default
+today, matching this repo's git rules.
