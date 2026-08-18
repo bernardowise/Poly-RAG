@@ -5,13 +5,21 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-18 (Dia 4 -- modelo de dos capas de retrieval deprecado)
+Ultima actualizacion: 2026-08-18 (Dia 4 -- backfill de historia de odds via CLOB)
 
-**Estado del corpus al 2026-08-18 12:00 UTC** (medido directo contra S3/DynamoDB, no
-estimado): 6 ciclos completos, registry con 595 markets (502 open / 93 resolved) y 595
-archivos de odds. Las cifras de 285 items / 4 ciclos que aparecen mas abajo en las notas
-de limpieza del 2026-08-17 son historicas y correctas para ESA fecha -- el registry
-crece cada ciclo con markets nuevos.
+**Estado del corpus al 2026-08-18** (medido directo contra S3/DynamoDB, no estimado): 6
+ciclos completos, registry con 595 markets (502 open / 93 resolved). Las cifras de 285
+items / 4 ciclos que aparecen mas abajo en las notas de limpieza del 2026-08-17 son
+historicas y correctas para ESA fecha -- el registry crece cada ciclo con markets nuevos.
+
+**Odds time-series, tras el backfill de historia pre-tracking (ver tech_debt.md, "Odds
+History Backfill from Polymarket CLOB"):** 595 archivos, **63,641 snapshots totales**
+(62,273 `clob_backfill` + 1,368 `cycle`, tag explicito en ambos -- ver tech_debt.md, "Cycle
+Snapshots Explicitly Tagged source=cycle"). Antes del backfill cada market solo tenia
+historia desde que entro al registry (1-6 snapshots); ahora 487/595 markets tienen historia
+retroactiva hasta su `createdAt` real, hasta 375 puntos diarios en el caso mas profundo
+(market creado 2025-07-03). Los 108 restantes simplemente nacieron despues del 2026-08-16 y
+no tienen pre-historia que traer.
 
 ---
 
@@ -285,12 +293,36 @@ ya documentado.
 
 ### Odds Time-Series (S3: `odds/<market_id>.json`)
 
-Append-only, un archivo por market, un snapshot agregado cada ciclo (nunca
-sobreescrito) -- esta ES la diferenciacion real del proyecto (self-built historical
-time-series). Cada snapshot: `timestamp`, `outcomePrices`, `volume`, `volume24hr`,
-`liquidity`. Read-modify-write por ciclo: lee el archivo existente (o inicia uno
-nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
-`s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
+Append-only, un archivo por market -- esta ES la diferenciacion real del proyecto
+(self-built historical time-series). Cada archivo mezcla DOS origenes distintos de
+snapshot, distinguibles por un campo `source` explicito (nunca inferido -- ver
+tech_debt.md, "Cycle Snapshots Explicitly Tagged source=cycle"):
+
+- **`source: "cycle"`** -- un snapshot agregado por `ingest_polymarket` cada ciclo
+  (12h), nunca sobreescrito. Campos: `timestamp`, `outcomePrices`, `volume`,
+  `volume24hr`, `liquidity`. Read-modify-write por ciclo: lee el archivo existente
+  (o inicia uno nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas
+  de `s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
+- **`source: "clob_backfill"`** -- historia pre-tracking recuperada una sola vez
+  (2026-08-18) desde `clob.polymarket.com/prices-history`, gratis y sin auth, hasta
+  la fecha de creacion real del market (ver tech_debt.md, "Odds History Backfill
+  from Polymarket CLOB", para el diseno completo, los dos bugs encontrados via dry
+  run antes de escribir, y los numeros verificados). Campos: solo `timestamp`,
+  `outcomePrices`, `source`, `backfilled_at` -- SIN `volume`/`volume24hr`/
+  `liquidity` (el endpoint CLOB no los expone), lo cual es una segunda senal
+  estructural independiente del campo `source` para distinguir el origen. Un
+  cutoff duro impide escribir cualquier punto en o despues de la primera cycle real
+  (2026-08-16) -- el backfill solo puede tocar el pasado, nunca el ciclo trackeado.
+  NO corre dentro de la cadena de ingestion (es un script manual, one-off, mismo
+  patron que el bootstrap del registry) -- una vez recuperada, la historia
+  pre-tracking de un market es inmutable, re-consultarla cada ciclo no aportaria
+  nada nuevo.
+
+**Deliberadamente fuera de alcance (decision explicita del usuario, 2026-08-18):**
+recuperar el HISTORIAL DE NOTICIAS que corresponde a esa ventana pre-tracking. Google
+News RSS no soporta busqueda por rango de fecha arbitrario, asi que hacerlo seria un
+proyecto aparte, no una extension de este. El backfill de odds es "lo mas atras que
+vamos a ir" -- ver tech_debt.md para el razonamiento completo.
 
 ### Linkeo News/Comments -> market_id
 

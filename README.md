@@ -51,7 +51,13 @@ stuck News cycle and retries only the missing batches.
    outcome, so the full open-to-resolution history is preserved.
 2. **Odds time-series** (S3, `odds/<market_id>.json`) — one file per market,
    append-only, one snapshot per cycle for every open market. This is the actual
-   differentiator; nothing else in the pipeline matters if this isn't clean.
+   differentiator; nothing else in the pipeline matters if this isn't clean. Each
+   snapshot carries an explicit `source`: `cycle` (written every 12h, includes
+   `volume`/`volume24hr`/`liquidity`) or `clob_backfill` (a one-off 2026-08-18
+   backfill of each market's full pre-tracking price history from Polymarket's
+   free CLOB API, back to `createdAt` — price only, no volume/liquidity, and never
+   overlapping the tracked window). See `.claude/claude_docs/tech_debt.md`, "Odds
+   History Backfill from Polymarket CLOB."
 3. **News** (S3, `news/YYYY-MM-DD/HH.json`) — full article text (via
    `googlenewsdecoder` + `trafilatura`), tagged with the specific `market_id`(s) it's
    about.
@@ -89,6 +95,8 @@ lambdas/
   ingest_comments/       Polymarket comments, entity grouping, comment_id dedup
   send_digest/           cross-source synthesis, JSON artifact + email
   watchdog_ingest_news/  stuck-cycle detection and retry
+scripts/                  one-off scripts, run manually, not part of the 12h chain
+                           (odds history backfill, snapshot provenance tagging)
 terraform/                all AWS infrastructure as code
 .claude/
   claude_docs/            architecture_canon.md, tech_debt.md, session_ledger.md,
@@ -111,6 +119,13 @@ markets under the current (post-2026-08-16) design only — an early-pipeline cl
 removed all registry/odds data tied to the deprecated Bluesky + keyword-matching
 design.
 
+**Corpus, as of 2026-08-18 (6 complete cycles):** 595 registry markets (502 open /
+93 resolved), 3,315 news articles (~5.2M tokens, 100% linked to exactly one
+market_id), 12,711 comments (~261K tokens — News keeps growing steadily per cycle,
+Comments flattened to steady-state volume once its dedup table caught up), and
+63,641 odds snapshots (1,368 from the 12h cycle, 62,273 from the CLOB backfill —
+see above).
+
 ## Pending / TODO
 
 - **RAG retrieval (Day 4)** — in design. The earlier two-layer model (explicit
@@ -118,9 +133,24 @@ design.
   (`retrieval/time_window.py`) deleted: the per-market News redesign left 100% of
   articles linked to exactly one market, so the ambient pool it retrieved from is
   empty. Current model is a single path — metadata filter (`market_id`, time, source)
-  plus semantic ranking. Chunking strategy, embedding model, and vector store are the
-  open decisions; embedding must be incremental within the ingestion chain, since the
-  corpus accumulates ~1M tokens per cycle.
+  plus semantic ranking. Odds history now reaches back to each market's creation
+  (see the CLOB backfill above), which unblocks correlating older news against real
+  price movement. Two findings still need resolving before chunking starts: (1) most
+  ingested articles are stale relative to the market they're linked to (only ~23%
+  are ≤1 day old at ingestion; median age 41 days, since Google News ranks by
+  relevance to the market's question, not recency) — decided: keep everything (real
+  market context even without odds impact), cap at 1 year relative to the market's
+  `createdAt` (not ingestion date), and classify each article into one of three
+  temporal tiers (published before the market existed / after creation but before
+  we tracked it / while we were tracking) — none of this classification logic is
+  built yet; (2) a deliberate scope boundary — backfilling the *news* history for
+  the pre-tracking window is explicitly out of scope (Google News RSS has no
+  arbitrary date-range search; recovering it would be a separate project). Also
+  planned: capturing news for 4-8 cycles after a market resolves, to record
+  post-resolution reaction. Chunking strategy, embedding model, and vector store
+  remain open; embedding must be incremental within the ingestion chain, since the
+  corpus accumulates roughly 1M tokens per cycle from News alone (Comments' growth
+  has flattened at steady state).
 - **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
   is the closest existing precedent (multi-source context → Bedrock → synthesis) but
   there's no user-facing query interface yet. Includes an open, explicitly deferred

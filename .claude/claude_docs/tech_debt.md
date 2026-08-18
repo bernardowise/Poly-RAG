@@ -1359,3 +1359,172 @@ created with no expiration, GitHub's own recommendation is to set one) -- or if 
 from Databricks proves annoying enough in practice to warrant automating it further (e.g. a
 scheduled sync job), though manual commits from the Databricks Git panel are the deliberate default
 today, matching this repo's git rules.
+
+---
+
+## Future Consideration: Publish the Digest to LinkedIn as Personal Branding (raised 2026-08-18)
+
+**Idea (user, 2026-08-18):** once the project is genuinely finished end-to-end, publish the
+LLM-generated digest to the user's LinkedIn profile at a cadence of **2-3 times per week** (not
+every cycle -- 14 posts/week from a 12h pipeline would read as automated spam, which is the
+opposite of the intended effect), as a way to build a public track record as an AI engineer. The
+content already exists and is already synthesized: `digest/YYYY-MM-DD/HH.json` carries
+`executive_summary`, `top_volatility`, `world_snapshot` (`top_conviction`/`most_disputed`), and
+verbatim `quotes` -- a post is a rendering problem, not a new-content problem, the same way the
+digest email is already generated FROM that JSON rather than authored separately.
+
+**Explicitly gated on the project being 100% done** -- user's own framing. Not a Day 4/5 task,
+and deliberately not something to start while the pipeline is still changing shape underneath it.
+
+**What would need deciding when this is picked up (none of it resolved now):**
+- **Selection, not just cadence.** 2-3 posts/week over a 14-cycle week means most digests are
+  never published -- so something has to CHOOSE. Candidates: highest `top_volatility` delta of
+  the week, a market resolving against consensus, or manual pick. This is the real design
+  question; the posting mechanics are the easy half.
+- **Automated vs. human-in-the-loop.** Publishing to a personal profile is outward-facing and
+  irreversible in reputation terms, unlike everything else in this pipeline (S3 writes, an email
+  to oneself). Strong argument for draft-then-approve rather than direct auto-post, at least
+  initially -- an LLM-written post about live prediction markets going out unreviewed under the
+  user's own name carries a different risk profile than a wrong number in a private digest.
+- **Accuracy/liability framing.** Posts would state market probabilities and implied forecasts
+  publicly. Needs an explicit stance on hedging language and on not reading as investment advice
+  -- a concern that does not exist for the private digest email.
+- **LinkedIn API access.** Not yet investigated. Per this project's standing ToS-check discipline
+  (established after the Reddit rejection and applied to Google News/GDELT/Brave), verify the
+  developer terms permit automated posting BEFORE building anything -- LinkedIn's API has
+  historically been restrictive about third-party posting, and the free-tier path may not exist
+  for an individual developer. Possible fallback: generate the post text and copy-paste manually,
+  which sidesteps the API question entirely and pairs naturally with human-in-the-loop review.
+
+**Revisit if:** the project reaches a genuinely finished state (retrieval + synthesis agent
+working end-to-end, per the Day 4/5 sprint items) -- at which point this becomes a small, well-
+scoped addition on top of a digest artifact that already exists, rather than new scope competing
+with core pipeline work.
+
+---
+
+## Odds History Backfill from Polymarket CLOB (implemented and verified 2026-08-18)
+
+**Issue:** the odds time-series only started when a market first entered the registry
+(first cycle 2026-08-16), even though Polymarket exposes each market's full price history
+from creation, free, no auth, via `clob.polymarket.com/prices-history`. This directly
+matters for Day 4 retrieval design -- see "Known Limitation: Explicit ID-Linkage", flag 3.2
+(news published after a market was created but before we started tracking it): without odds
+history for that window, such news is uncorrelatable by definition, not by choice.
+
+**Decision, and an explicit scope boundary (user, 2026-08-18):** backfill odds only, as far
+back as the CLOB API allows (market creation). Backfilling the NEWS side of that same
+history (what was published during a market's pre-tracking life) is explicitly OUT of
+scope -- Google News RSS has no arbitrary historical date-range search, so recovering it
+would be a project of its own, not an extension of this one. User's framing: "this is the
+furthest back I am willing to go, no more." If this gap needs revisiting later, it is a new
+scoped decision, not an assumed continuation of the odds backfill.
+
+**One-off script, not a Lambda, not part of the 12h cycle:** `scripts/backfill_odds_history.py`,
+run manually like the registry bootstrap and the `comment_entity_type` backfill before it. A
+market's pre-tracking history is immutable, so re-fetching it every cycle would be ~600
+wasted API calls twice a day. The chained Lambdas are unmodified and keep appending forward
+snapshots exactly as before.
+
+**Provenance made explicit, not inferred (see the paired entry below on `source: cycle`
+tagging):** every backfilled point carries `source: "clob_backfill"` and lacks
+`volume`/`volume24hr`/`liquidity` (not returned by the CLOB endpoint) -- two independent,
+structural signals separating it from a real cycle snapshot, so nothing needs to be
+remembered as a convention.
+
+**Hard safety guarantees, all verified against real S3 data after `--apply`:**
+- A hard cutoff (`CYCLE_BOUNDARY = 2026-08-16T00:00:00Z`) refuses to write any point at or
+  after the first real cycle -- confirmed 0 boundary violations across all 63,641 snapshots
+  post-apply. The backfill can only ever touch the past.
+- Merge-on-timestamp, existing (cycle) data always wins a collision -- idempotent, safe to
+  re-run.
+- Dry run is the script's default; nothing was written until a human reviewed the dry-run
+  output twice (once after each bug fix below) and explicitly approved `--apply`.
+
+**Two real bugs found and fixed via the dry run, before any write -- both are worth keeping
+as a pattern, not just a changelog line, because both ran clean and looked like findings
+about the data rather than defects in the code:**
+
+1. **Cross-token timestamp alignment discarded ~75% of real history.** First version
+   required every outcome token to report a price at the exact same timestamp before
+   accepting a snapshot. Measured on market 559672: YES token had 371 points, NO had 395,
+   but only 43 timestamps were shared between them -- each token trades independently on its
+   own order book, so they are not sampled together. The script reported
+   `snapshots added: 318` with zero errors; nothing signaled that ~943 real points had been
+   silently thrown away except an absurd-looking `[+672 incomplete]` counter that prompted
+   investigation. **Fix:** read only the first (YES) outcome's history and derive the
+   complement (`NO = 1 - YES`) -- sound for binary markets by construction (complete-sets
+   mechanism, see knowledge.md), and simpler besides (one fetch instead of two). Non-binary
+   markets are skipped outright rather than approximated (0 encountered in this registry).
+   Re-running after the fix recovered 62,273 real points from the same corpus that had
+   produced 318.
+2. **All 93 resolved markets would have been silently skipped.** The script queried
+   `gamma-api.polymarket.com/markets?id={id}` -- a FILTERED LIST endpoint that returns an
+   empty list for `closed: True` markets, not an error. This read as "no clobTokenIds" and
+   skipped the market with a plausible-sounding message, `no clobTokenIds: 93` in the
+   summary. This would have denied backfill to exactly the complete open-to-resolution
+   arcs the README names as the project's differentiator, while looking like a genuine
+   Polymarket data limitation rather than a wrong endpoint choice. **Fix:** switched to
+   `gamma-api.polymarket.com/markets/{id}` -- the path endpoint, which `ingest_polymarket`
+   already uses for its own resolution checks and returns closed markets correctly.
+   Verified post-fix: `no clobTokenIds: 0` across all 595 markets, resolved markets like
+   3514570 and 3448662 backfilled successfully (4 and 6 points respectively).
+
+**Verified in production (2026-08-18, full run, all 595 registry markets):** 487 markets
+backfilled, 108 had no pre-tracking history (created after 2026-08-16, correctly nothing to
+backfill), 0 non-binary, 0 missing tokens, 0 errors. 62,273 snapshots added in 465s. Post-
+apply S3 verification: 63,641 total snapshots (62,273 `clob_backfill` + 1,368 `cycle`,
+arithmetic exact, zero collisions), 0 boundary violations, 0 cycle snapshots missing
+volume, 0 backfill snapshots carrying volume, chronological order and a clean price handoff
+confirmed on a spot-checked market (561980: 375 points spanning 2025-07-10 to today).
+
+**Depth achieved:** markets created as early as 2025-07-03 now have up to 375 daily
+snapshots (vs. the 1-6 cycle-only snapshots every market had before this ran) -- the
+time-series depth for those markets went from ~2 days to over a year.
+
+**Not yet decided (separate task, deliberately deferred until this backfill's output could
+be inspected first):** whether/how `ingest_polymarket` should fetch history automatically
+for markets newly entering the registry going forward, so they do not start with a
+cycle-only time-series the way every currently-tracked market did before today.
+
+**Revisit if:** a market later needs backfill and did not exist in the registry at the time
+this ran (see the deferred task above), or if Polymarket's CLOB `prices-history` endpoint
+changes shape/availability.
+
+---
+
+## Cycle Snapshots Explicitly Tagged source=cycle (implemented 2026-08-18)
+
+**Issue:** the CLOB backfill above (`source: "clob_backfill"`) introduced the odds
+time-series' first explicit provenance field. The ~1,368 pre-existing snapshots written by
+`ingest_polymarket` carry no `source` field at all, since at write time no second kind of
+snapshot existed.
+
+**Rejected shortcut:** leave existing snapshots untagged and treat absence of `source` as
+implicitly meaning cycle-origin. User explicitly rejected this, correctly, for the same
+reason the two-tier comment `link_type` was replaced by three tiers (see "Comments Source
+Replaces Bluesky" above) -- an implicit promise nobody writes down is one nobody can verify,
+and this project has already been burned by exactly that pattern once. Concretely: (1) a
+third provenance is already planned (history fetched by `ingest_polymarket` itself for
+future new entrants -- see the deferred task in the entry above), at which point "no source
+field" stops identifying anything specific; (2) it reads as null in Databricks, where
+`WHERE source = 'cycle'` is a far better query than `WHERE source IS NULL`; (3) it cannot
+distinguish "written by a cycle" from "written before the field existed," which are
+identical today but need not stay identical.
+
+**Fix:** `scripts/tag_cycle_snapshots.py`, run BEFORE the CLOB backfill so the two writes
+stay independently verifiable. Strictly additive -- adds one key per snapshot, changes no
+timestamp/price/volume/volume24hr/liquidity value, adds or removes no snapshot. Idempotent
+(a snapshot already carrying `source` is left untouched, which also means it cannot
+relabel a `clob_backfill` point as `cycle` if ever run out of order -- verified directly with
+a mixed-source test case before running against real data).
+
+**Verified in production:** dry run confirmed 595/595 files needing exactly 1,368 tags with
+0 errors; a before/after diff on one file confirmed every original key/value preserved with
+`source` as the only addition; `--apply` matched the dry run exactly. Post-apply S3 spot
+check (40-file random sample): all snapshots carry `source: "cycle"`, 0 untagged, volume/
+liquidity fields intact.
+
+**Revisit if:** a further provenance type is added later (e.g. the deferred
+`ingest_polymarket`-native history fetch above) -- confirm it also tags explicitly rather
+than reintroducing an implicit default.
