@@ -89,9 +89,6 @@ lambdas/
   ingest_comments/       Polymarket comments, entity grouping, comment_id dedup
   send_digest/           cross-source synthesis, JSON artifact + email
   watchdog_ingest_news/  stuck-cycle detection and retry
-retrieval/
-  time_window.py         timestamp-window retrieval over raw storage (Layer 2,
-                          contextual/temporal, complements explicit market_id linkage)
 terraform/                all AWS infrastructure as code
 .claude/
   claude_docs/            architecture_canon.md, tech_debt.md, session_ledger.md,
@@ -116,9 +113,14 @@ design.
 
 ## Pending / TODO
 
-- **RAG retrieval (Day 4)** — not started. `retrieval/time_window.py` exists as a
-  timestamp-window layer over raw storage; embeddings/semantic ranking within that
-  window is unbuilt.
+- **RAG retrieval (Day 4)** — in design. The earlier two-layer model (explicit
+  linkage + ambient time-window) was deprecated on 2026-08-18 and its implementation
+  (`retrieval/time_window.py`) deleted: the per-market News redesign left 100% of
+  articles linked to exactly one market, so the ambient pool it retrieved from is
+  empty. Current model is a single path — metadata filter (`market_id`, time, source)
+  plus semantic ranking. Chunking strategy, embedding model, and vector store are the
+  open decisions; embedding must be incremental within the ingestion chain, since the
+  corpus accumulates ~1M tokens per cycle.
 - **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
   is the closest existing precedent (multi-source context → Bedrock → synthesis) but
   there's no user-facing query interface yet. Includes an open, explicitly deferred

@@ -5,7 +5,13 @@ actualiza/sobreescribe conforme la arquitectura evoluciona -- no es una bitacora
 decisiones pasadas (eso vive en session_ledger.md) ni una lista de pendientes (eso
 vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
-Ultima actualizacion: 2026-08-16 (Comments reemplaza a Bluesky)
+Ultima actualizacion: 2026-08-18 (Dia 4 -- modelo de dos capas de retrieval deprecado)
+
+**Estado del corpus al 2026-08-18** (medido directo contra S3/DynamoDB, no estimado):
+5 ciclos completos (el ultimo, 2026-08-18 00:00 UTC), registry con 515 markets
+(445 open / 70 resolved) y 515 archivos de odds. Las cifras de 285 items / 4 ciclos
+que aparecen mas abajo en las notas de limpieza del 2026-08-17 son historicas y
+correctas para ESA fecha -- el registry crece cada ciclo con markets nuevos.
 
 ---
 
@@ -286,7 +292,7 @@ time-series). Cada snapshot: `timestamp`, `outcomePrices`, `volume`, `volume24hr
 nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
 `s3:GetObject`, ver nota IAM abajo), agrega el snapshot, reescribe.
 
-### Linkeo News/Comments -> market_id (Layer 1, alta confianza)
+### Linkeo News/Comments -> market_id
 
 - **News (rediseñado 2026-08-16, ver "News Source Redesign" en tech_debt.md):**
   `news_match_terms` y el AND-match ya NO se usan -- cada articulo se etiqueta
@@ -300,27 +306,38 @@ nuevo si no existe -- requiere `s3:ListBucket` a nivel bucket ademas de
   (`direct`, `shared_event`, `shared_series`) y por que no todo comentario es
   1:1 con un solo market.
 
-### Retrieval por Ventana Temporal (Layer 2, contextual -- `retrieval/time_window.py`)
+### Retrieval (Dia 4, en diseño 2026-08-18)
 
-**Limitacion reconocida del linkeo explicito:** solo captura correlacion DIRECTA
-(el texto menciona literalmente los terminos del market). Una noticia ambiental
-("sentimiento cripto se deteriora") puede mover el precio de un market de Bitcoin
-sin nunca mencionarlo explicitamente -- nunca quedaria linkeada. Ver tech_debt.md,
-"Known Limitation: Explicit ID-Linkage", para el razonamiento completo.
+**El modelo de dos capas (Layer 1 linkeado / Layer 2 ventana temporal ambiental)
+esta DEPRECADO**, junto con `retrieval/time_window.py` que lo implementaba (archivo
+borrado 2026-08-18). Razon: el rediseño de News a busqueda-por-market dejo a TODOS
+los articulos linkeados a exactamente un `market_id` por construccion (verificado
+con datos reales: 2,638 articulos en 4 ciclos, 100% linkeados, cero sin linkear) --
+el pool ambiental que Layer 2 existia para alcanzar quedo vacio. Ver tech_debt.md,
+"Known Limitation: Explicit ID-Linkage", seccion DEPRECATED, para el razonamiento
+completo y que limitacion real SIGUE abierta.
 
-**Mitigacion (disponible ya, sin esperar a embeddings del Dia 4):** todo item de
-News/Bluesky ya lleva timestamp de ingesta sin importar si matcheo algun market.
-`retrieval/time_window.py` responde "que se ingirio en el mundo mientras este
-market se movia" via filtro de rango de fechas sobre el raw storage existente --
-cero ML, disponible hoy. Combina Layer 1 (linkeado, alta confianza, mostrado
-primero) con Layer 2 (ventana temporal completa, señal mas ruidosa pero real,
-contexto secundario). El ranking semantico DENTRO de esa ventana ruidosa (no el
-descubrimiento de la ventana en si) es trabajo del Dia 4 (RAG/embeddings).
+**Modelo vigente: un solo camino -- filtro por metadata + ranking semantico.**
+El retrieval filtra por metadata del chunk (`market_id`, timestamp/ciclo, source) y
+rankea por similitud semantica dentro de ese subconjunto. El tiempo NO desaparece:
+sigue siendo central (la pregunta "por que se movio este market entre el ciclo 3 y
+el 4" es inherentemente acotada en tiempo), pero baja de ser una CAPA arquitectonica
+a ser un campo mas del envelope de metadata, aplicado como filtro.
 
-Verificado con datos reales (2026-08-15): para un market con 2 articulos
-linkeados, la ventana de 24h trajo 609 articulos + 839 posts adicionales sin
-linkear -- confirma que la mayoria de la senal ambiental se perderia sin esta
-segunda capa.
+**Corpus real medido (2026-08-18, 5 ciclos completos):** 2,638 articulos de News
+(~16.6M chars, ~4.15M tokens, mediana 4,015 chars por articulo) y 9,778 comentarios
+(~804K chars, ~200K tokens, mediana 44 chars, 47% bajo 40 chars). El corpus es
+ACUMULATIVO: crece ~1M tokens por ciclo, 2 ciclos/dia. Esto obliga a que el
+embedding sea incremental y automatizado dentro de la cadena de ingestion (solo
+chunks nuevos, nunca re-embedear el corpus), no un backfill manual -- el backfill
+sobre los ciclos ya existentes es un bootstrap de una sola vez, separado del camino
+de estado estable, mismo patron que tuvo el bootstrap del registry.
+
+**Decisiones abiertas (Dia 4):** estrategia de chunking (articulos son largos y
+necesitan split; comentarios son demasiado cortos para embeder individualmente),
+modelo de embeddings, y vector store -- candidatos en evaluacion: FAISS/numpy en S3
+cargado en memoria de Lambda, ChromaDB, Databricks Vector Search. OpenSearch
+Serverless descartado por costo (~$700/mes, incompatible con el budget).
 
 ### Verificado en produccion
 

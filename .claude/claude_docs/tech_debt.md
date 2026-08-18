@@ -236,6 +236,39 @@ boto3 direct is sufficient and the framework question resolves itself by not mat
 - Build runbooks as you go (deploy docs, rollback procedures)
 - Revisit project scope when learning goals are met
 
+**Update (2026-08-18): the CI/CD bullet above is no longer undifferentiated debt -- it has a
+scheduled home and explicit deferral reasoning.** Evaluated at the start of Day 4 (user asked
+directly whether to build it now) and moved into gerdau/sprint_plan.md as Day 5 block 6, with a
+dependency-ordered sub-list: remote Terraform state (S3 + DynamoDB lock) -> first real Python
+tests -> CI (lint/tests/`terraform validate`) -> CD (`terraform apply` via GitHub OIDC, no
+long-lived keys). Deferred out of Day 4 for three measured reasons: (1) CI cannot apply against
+a Terraform state file that lives in the Codespace and is gitignored, so remote state is a hard
+prerequisite, not a nice-to-have; (2) there is not a single Python test in the repo today, and
+CI without tests is `terraform validate` on a timer -- the repo's real failure mode has been
+logic bugs caught only by invoking live Lambdas (`NameError` after a half-finished rename, a
+nonexistent `article_count` field, an S3 key built from `now()` instead of `cycle_started_at`),
+all of which are catchable by tests that never touch AWS; (3) Day 4's retrieval work is what
+validates the project's thesis, and CI/CD improves deploy ergonomics without moving it. Note
+the old Day 6 block 2b framing (`aws lambda update-function-code` on push) was replaced, not
+just relocated -- it would have bypassed Terraform entirely and drifted state against IaC.
+**Also folded into that same block:** the alerting gap deliberately deferred in "Strict
+Ingestion Chaining" below (a cycle still stuck after watchdog retries notifies nobody) --
+arguably higher value than CD itself for a pipeline running unattended every 12h.
+
+A separate question raised the same day -- whether a dev/staging environment should exist so
+in-progress work stops being tested against live deployed Lambdas -- was answered as environment
+separation, NOT CI/CD (CI/CD automates how code moves; environments are where it lands, and one
+does not provide the other). Not adopted: a parallel `poly-rag-dev-*` stack would double Bedrock
+spend (~$8.85 -> ~$17.70/mo, since LLM calls dominate cost) and parameterize every Terraform
+resource, while a dev environment with small/synthetic data would have caught almost none of the
+bugs actually hit so far (the DynamoDB eventual-consistency `total_markets` bug, the 900s
+offset=0 timeout on slow outlets, the `shared_event` linkage discovery all required real
+registry scale and real network behavior). Cheaper alternatives preferred, in order: unit tests
+on pure functions, continued scoped `terraform apply -target` with a confirmed plan, and a
+`-dev` copy of only the single Lambda under active change. Full environment separation revisits
+if the project becomes collaborative or if a bad deploy actually corrupts the odds time-series
+(currently protected by S3 versioning + DynamoDB PITR, both enabled 2026-08-17).
+
 **Revisit if:** Project matures or external audience emerges.
 
 ---
@@ -479,9 +512,63 @@ Within layer 2's (often large, noisy) time window, semantic similarity (embeddin
 becomes useful for RANKING relevance — not for discovering the window itself, which timestamp
 filtering already does for free.
 
-**Revisit if:** Implementing this — building the time-window retrieval query is not blocked on
-anything else in the current redesign and could be done alongside or right after News/Bluesky
-keyword-reading (tasks 3/4 in progress as of 2026-08-15).
+---
+
+**DEPRECATED (2026-08-18, start of Day 4) — the two-layer framing above no longer describes
+this pipeline, and `retrieval/time_window.py` that implemented it has been deleted.** Kept
+above as historical record of the reasoning, not as current design.
+
+**Why it died — the premise was removed by a later redesign, not by a change of opinion.**
+Layer 2 was designed when News came from 10 curated RSS feeds: articles arrived with NO market
+association at all, so an ingestion timestamp was genuinely the only thing that could relate an
+article to a market, and a time window was the only available retrieval path for unlinked
+content. The News Source Redesign (see that entry above) replaced those feeds with one Google
+News search PER OPEN MARKET, using the market's `question` as the query. That means every
+article now enters the corpus already attached to exactly one `market_id` by construction.
+**Verified against real production data (2026-08-18): 2,638 articles across 4 cycles, 100%
+carrying exactly one `market_id`, zero unlinked.** There is no ambient pool for Layer 2 to
+retrieve from — the set it was invented to reach is empty, and the "Layer 1 vs Layer 2"
+distinction collapses because everything is Layer 1.
+
+**What replaces it: one retrieval path, not two — metadata filter + semantic rank.** Retrieval
+is filtered by chunk metadata (`market_id`, timestamp/cycle, source) and ranked by semantic
+similarity within that filtered set. Time is NOT deprecated as a concept — it remains
+load-bearing, since "why did market X move between cycle 3 and cycle 4?" is inherently a
+bounded-time question. What changes is its status: time goes from being an architectural LAYER
+to being one field in the chunk metadata envelope, sitting alongside `market_id`, applied as a
+filter rather than as a separate retrieval mechanism with its own confidence semantics.
+
+**`retrieval/time_window.py` deleted (2026-08-18), not repaired.** Beyond the dead framing, it
+had rotted against two intervening redesigns: it read the `bluesky/` S3 prefix (deleted
+2026-08-17, so it silently returned 0 posts and reported that as a real result rather than
+failing), and it never read `comments/` at all (the source that replaced Bluesky). Its entire
+return shape was built around the `layer1_linked`/`layer2_ambient` split. This is a concept
+that no longer exists, not a module with bugs — deleted rather than patched, same treatment
+given to `ingest_bluesky`'s source when its source was retired. Full history preserved in git
+(last touched in `ce64d34`) and in session_ledger.md.
+
+**The underlying limitation this entry originally raised is still REAL and now formally
+unaddressed — do not read this deprecation as "the problem went away."** The ambient/indirect
+correlation gap stands, and per-market search arguably makes it sharper: an article about
+"crypto market sentiment souring" that never names Bitcoin or a price threshold will never be
+FETCHED in the first place, because no market's `question`-derived Google News query would
+return it. Layer 2 was a bad answer (a time window over a pool that doesn't exist), but it was
+pointing at a genuine gap.
+
+**Successor path for that gap: cross-market semantic search over the accumulated corpus.**
+Once chunks are embedded, an article fetched FOR market A can surface as relevant to market B
+purely on semantic similarity, with no linkage between them ever having been recorded at
+ingestion time. That recovers indirect/ambient correlation at RETRIEVAL time rather than trying
+(and failing) to capture it at ingestion time. Note this only reaches content already in the
+corpus for some other market's sake — genuinely uncovered topics (nothing in the whole top-500
+would have surfaced them) stay out of reach, which is a real remaining boundary, not something
+embeddings fix.
+
+**Revisit if:** cross-market semantic retrieval, once measured against real questions (Day 4
+Block 4), turns out not to recover meaningful ambient signal in practice — at which point the
+gap needs a genuinely different answer (e.g. a broad topical news pull independent of any
+specific market's question, deliberately reintroducing an unlinked pool), rather than
+reinstating a time-window layer over content that is already 100% linked.
 
 ---
 
