@@ -1629,3 +1629,67 @@ market_id against Polymarket's per-id endpoint to see if it still exists under a
 registry status, or simply exclude `unknown_market` at query time and leave the raw data
 alone forever); or once "F" is executed, confirming `ingest_news`'s new per-article
 classification produces the same tier a human would expect for a market tracked from day one.
+
+---
+
+## Post-Resolution News Capture -- Design Closed, Data Tagged, Ingestion Extension Deferred (2026-08-18)
+
+**Issue (raised by the user, 2026-08-18):** the project has no way to capture how news/reaction
+looks in the days immediately after a market resolves -- `ingest_news` only ever searches for
+markets with `status == "open"` (see "News Source Redesign"), so the moment a market resolves,
+it stops being searched entirely. This blocks a real question the RAG should be able to answer:
+"how did people react when X resolved."
+
+**Decided (user, 2026-08-18):**
+- **Window: 4 fixed cycles = 48h post-resolution**, not a variable window. The cycle in which a
+  market resolves counts as post-resolution cycle #1 (so the window is resolution-cycle through
+  resolution-cycle+3).
+- **Trigger: `status == closed`.** `ingest_news` needs to widen its search to include markets
+  that resolved within the last 4 cycles, not just currently-open ones -- otherwise the exact
+  cycle a market resolves in is never searched at all (see the real corpus evidence below).
+- **Same search mechanism** -- Google News RSS with the market's `question` verbatim, no change
+  to how the search itself works.
+- **No new temporal tier.** The first proposal was a 4th tier (alongside 3.1/3.2/3.3) for
+  "post-resolution" articles -- rejected after discussion, correctly: an article published 30h
+  after resolution already satisfies `pubDate >= first_seen` and lands in 3.3 without any new
+  category. What actually differs is a SEPARATE axis -- whether the market could still move
+  when the article was published -- which does not belong inside `temporal_tier` any more than
+  `link_type` should have absorbed a second, unrelated fact (see "Comments Source Replaces
+  Bluesky" for the prior instance of this exact mistake with the two-tier `link_type`).
+
+**New field instead: `market_status_at_publish` (open/closed/unknown_market), computed from the
+registry's `resolution_date`, not the market's CURRENT status** -- current status answers "where
+is this market today," not "where was it when this specific article was published," and a
+market resolved by now could easily have been open when an old article was published. The
+retrieval-relevant combination is **`temporal_tier == "3.3" AND market_status_at_publish ==
+"open"`** for "can this explain an odds movement" vs. **`"3.3" AND "closed"`** for "reaction to
+an already-fixed outcome" -- two independent questions, two independent fields, queried
+together rather than merged into one.
+
+**Retroactive, same reasoning as every other tag this session:** `scripts/tag_news_market_status.py`,
+additive only (`market_status_at_publish` added, no other field touched), classifies by the
+MOST PERMISSIVE status among an article's `market_ids` when more than one applies (mirrors
+`tag_news_temporal_tier.py`'s most-confident-tier logic) -- an article is genuine open-market
+reporting for any linked market where that is true.
+
+**Real finding confirmed by running this against the full corpus, not assumed: 0 of 3,315
+articles are tagged `closed`.** This is the CORRECT result given today's ingestion design, not
+a bug in the script -- verified directly: 339 articles ARE linked to a market that has since
+resolved, but every single one was published BEFORE that market's `resolution_date` (Google
+News returns older, relevance-ranked coverage from while the market was still open and
+trending -- see the News staleness finding above). None were published after resolution,
+because `ingest_news` never searches a market once it leaves `status == "open"`. This is live
+proof, not just design reasoning, of the exact gap this feature exists to close.
+
+**Not yet implemented -- deferred to "F-lambdas"** (a batched, single-deploy set of
+`ingest_polymarket`/`ingest_news` changes for markets going forward, alongside the odds-history
+backfill extension and the `created_at` extension from the entry above): `ingest_news` needs to
+widen its candidate set from "open markets" to "open markets, plus markets whose
+`resolution_date` falls within the last 4 cycles," and `classify_market_status()` (written
+standalone in the tagging script, same reuse intent as `classify_temporal_tier()`) needs to be
+copied in to tag new articles as they're fetched.
+
+**Revisit if:** F-lambdas ships and the first real post-resolution cycle produces `closed`
+articles -- confirm the 4-cycle window in practice actually captures meaningful reaction rather
+than silence (Google News may have little to say about a market 12-48h after resolution if the
+underlying event itself isn't newsworthy beyond the market resolving).
