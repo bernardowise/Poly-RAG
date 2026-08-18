@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/scripts/block_lambda_invoke.sh"
+          }
+        ]
+      }
+    ],
     "FileChanged": [
       {
         "matchers": [

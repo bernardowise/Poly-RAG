@@ -64,6 +64,40 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | `memory_mirror/` | Git-tracked mirror of Claude Code's internal memory store, kept in sync via hooks (union sync, no deletions). |
 | `gerdau/` | Interview-prep sprint materials — gitignored, never tracked in version control. |
 
+## NUNCA invocar Lambdas de produccion sin confirmacion explicita
+
+**Regla dura, sin excepciones ni juicio propio.** Nunca ejecutar `aws lambda invoke`
+(ni ningun equivalente) contra `poly-rag-ingest-polymarket`, `poly-rag-ingest-news`,
+`poly-rag-ingest-comments`, `poly-rag-send-digest` ni `poly-rag-watchdog-ingest-news`
+sin que el usuario lo pida o lo autorice explicitamente en ese mismo momento. Esto
+incluye "solo para verificar que mi cambio quedo bien" -- **no existe una invocacion
+inofensiva de estas Lambdas**.
+
+**Por que:** `ingest_polymarket` es el punto de entrada de toda la cadena. Al
+terminar invoca News, que invoca Comments, que invoca send_digest, que **manda correo
+real al usuario via SES**. Y el costo no es lineal: incidente real del 2026-08-18,
+dos invocaciones manuales se amplificaron a 25 correos (x12.5) por un bug de
+doble-disparo en el fan-out de News, ademas de contaminar 9 lugares distintos entre
+S3 y DynamoDB -- incluyendo mutaciones invisibles (1,864 snapshots inyectados en
+archivos existentes, 36 markets marcados como resueltos fuera de ciclo, y las
+ventanas post-resolucion de 93 markets consumidas en minutos). Ver
+`.claude/claude_docs/runbook_manual_invocation_cleanup.md`.
+
+**Como verificar un cambio SIN invocar (en este orden):**
+1. `python3 -m py_compile lambdas/<x>/handler.py` -- sintaxis.
+2. Importar el handler localmente y probar funciones puras contra datos reales de
+   solo lectura (asi se validaron `fetch_clob_price_history`,
+   `decrement_post_resolution_counter` y `get_open_markets` el 2026-08-18 sin
+   disparar nada).
+3. Esperar el proximo ciclo automatico (00:00 / 12:00 UTC) y revisar CloudWatch Logs
+   -- si el cambio es correcto se ve ahi, sin costo ni riesgo.
+4. Si de verdad hace falta invocar: **pedirselo al usuario y esperar su respuesta**,
+   y proponer poner `send_digest` en concurrencia 0 antes, para que la cadena corra
+   sin mandar correo.
+
+El objetivo del deploy es dejar el codigo listo para el siguiente ciclo automatico,
+no comprobarlo en el momento.
+
 ## Timezone Convention
 
 Two clocks, deliberately. The split exists because the pipeline's day and the user's day

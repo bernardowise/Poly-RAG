@@ -1816,3 +1816,56 @@ confirmed populated with `clob_backfill` history automatically, including one (6
 2025-11-11) with 255 backfilled snapshots -- nearly 9 months of price history recovered the
 instant the market entered the registry, zero manual script involved. Second invocation (after
 the source fix) confirmed newly-written cycle snapshots now carry `source: "cycle"` natively.
+
+---
+
+## PRIORIDAD 1 SIGUIENTE SESION: Bug de Doble-Disparo en el Fan-Out de News (confirmado 2026-08-18)
+
+**Decision del usuario (2026-08-18): esto es lo PRIMERO que se arregla al retomar, antes de
+seguir con el Dia 4 (chunking/embedding/retrieval).** No es negociable ni se pospone otra vez --
+ya se pospuso una vez (ver "Strict Ingestion Chaining", nota de doble-disparo, donde se juzgo
+"solo ocurre por intervencion manual de debugging, no en operacion normal") y esa evaluacion
+resulto demasiado optimista.
+
+**El bug:** `merge_batch_payloads` en `lambdas/ingest_news/handler.py` es idempotente para
+ESCRIBIR el payload final (varios batches pueden hacer el merge y todos producen el mismo
+archivo, sin race). Pero NO tiene ninguna guarda sobre el paso siguiente:
+`invoke_next_stage(cycle_started_at)`. Cualquier batch que observe "ya existen todos los
+archivos `_batch<offset>.json`" invoca a `ingest_comments` -- y con N batches corriendo en
+paralelo, N pueden observar eso casi al mismo tiempo.
+
+**Evidencia real medida (incidente 2026-08-18, ver
+runbook_manual_invocation_cleanup.md):** 4 invocaciones de `ingest_polymarket` -> 80
+invocaciones de `ingest_news` (fan-out normal, ~20 batches cada una) -> **26 invocaciones de
+`ingest_comments`** -> **25 correos digest reales al usuario**. Factor de amplificacion x12.5
+sobre las 2 invocaciones manuales originales. Sin este bug habrian sido 4 correos: molesto,
+pero proporcional al error humano que lo origino.
+
+**Por que la evaluacion previa ("solo pasa con intervencion manual") era incorrecta:** el
+watchdog (`poly-rag-watchdog-ingest-news`, cron de 10 min) reinvoca offsets faltantes de forma
+AUTOMATICA, sin humano de por medio. Si reintenta un offset que en realidad seguia en vuelo (no
+hay guarda contra eso -- documentado como pendiente en "Strict Ingestion Chaining"), se produce
+exactamente la misma condicion de carrera: dos invocaciones del mismo offset, ambas terminan,
+ambas ven el set completo, ambas encadenan. El escenario no requiere que nadie invoque nada a
+mano.
+
+**Direcciones candidatas (ninguna evaluada aun -- decidir al implementar):**
+- **Lock/claim atomico en DynamoDB:** antes de `invoke_next_stage`, hacer un `put_item` con
+  `ConditionExpression="attribute_not_exists(pk)"` sobre una key tipo
+  `cycle_chain_advanced#<cycle_started_at>`. Solo el primero en escribir gana y encadena; los
+  demas reciben `ConditionalCheckFailedException` y no hacen nada. Es el mismo patron de guarda
+  condicional ya usado en `decrement_post_resolution_counter`, asi que no introduce un concepto
+  nuevo al proyecto.
+- **Marcar el cycle payload final como "ya encadenado"** (un campo en el propio JSON de S3) y
+  releerlo antes de invocar -- mas simple pero con race real entre leer y escribir, no es
+  atomico como DynamoDB.
+- **Que solo un offset designado encadene** (ej. el offset mas alto) -- simple, pero se rompe si
+  ese batch especifico falla o hace timeout, que es justo lo que el watchdog existe para cubrir.
+
+**Nota de alcance:** arreglar esto NO elimina la necesidad de la regla de CLAUDE.md ni del hook
+`block_lambda_invoke.sh` -- son defensas independientes. Este bug hace que un error humano se
+amplifique x12.5; la regla y el hook evitan el error humano en primer lugar. Ambos hacen falta.
+
+**Revisit if:** al implementar el lock, aparece un caso donde encadenar dos veces sea realmente
+inofensivo y la complejidad del lock no se justifique -- improbable dado que cada encadenamiento
+cuesta un correo real via SES y una llamada Bedrock completa (executive summary) por ciclo.
