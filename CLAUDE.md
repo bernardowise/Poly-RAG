@@ -64,6 +64,26 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | `memory_mirror/` | Git-tracked mirror of Claude Code's internal memory store, kept in sync via hooks (union sync, no deletions). |
 | `gerdau/` | Interview-prep sprint materials — gitignored, never tracked in version control. |
 
+## Timezone Convention
+
+Two clocks, deliberately. The split exists because the pipeline's day and the user's day
+are not the same day, and conflating them silently misfiles things.
+
+| Domain | Timezone | Why |
+|---|---|---|
+| **Corpus, RAG, data, infrastructure** | **UTC** (canon) | S3 partitions (`<source>/YYYY-MM-DD/HH.json`), cycle timestamps, odds snapshot `timestamp`, registry `first_seen`/`resolution_date`, EventBridge crons (`0 0,12 * * ? *`), CloudWatch logs. Never convert these -- a cycle is identified by its UTC hour and nothing else. |
+| **Conversation with the user** | **UTC-6 (Mexico City)** | When talking about when things happened -- today, yesterday, this morning, last night -- always mean the user's local time, not UTC. State the offset explicitly if a sentence could be read either way. |
+| **`session_ledger.md` entries** | **UTC-6 (Mexico City)** | The ledger is a log of the user's WORK SESSIONS, so its `## YYYY-MM-DD` headers must match the user's day. At UTC-6, anything worked on after 18:00 local falls on the NEXT UTC date -- dating the ledger by UTC would file an evening session under tomorrow. |
+
+**The trap to watch:** at UTC-6 the two dates disagree for six hours of every day (18:00-23:59
+local = 00:00-05:59 UTC of the following date). A ledger entry written at 20:00 Mexico City on
+the 17th belongs under `## 2026-08-17`, even though `date -u` says the 18th. Get the local date
+explicitly (e.g. `TZ=America/Mexico_City date +%F`) rather than assuming the environment's
+default date is the right one.
+
+Mexico City observes no DST as of 2022 (permanent UTC-6), so the offset is fixed year-round --
+no seasonal adjustment needed.
+
 ## Git & Commit Rules
 
 **Never commit on your behalf.** When you request a commit, I will provide the commit message only. You decide when and whether to run the actual commit.

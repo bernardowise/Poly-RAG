@@ -7,11 +7,11 @@ vive en tech_debt.md). Si algo aqui queda obsoleto, se reemplaza, no se acumula.
 
 Ultima actualizacion: 2026-08-18 (Dia 4 -- modelo de dos capas de retrieval deprecado)
 
-**Estado del corpus al 2026-08-18** (medido directo contra S3/DynamoDB, no estimado):
-5 ciclos completos (el ultimo, 2026-08-18 00:00 UTC), registry con 515 markets
-(445 open / 70 resolved) y 515 archivos de odds. Las cifras de 285 items / 4 ciclos
-que aparecen mas abajo en las notas de limpieza del 2026-08-17 son historicas y
-correctas para ESA fecha -- el registry crece cada ciclo con markets nuevos.
+**Estado del corpus al 2026-08-18 12:00 UTC** (medido directo contra S3/DynamoDB, no
+estimado): 6 ciclos completos, registry con 595 markets (502 open / 93 resolved) y 595
+archivos de odds. Las cifras de 285 items / 4 ciclos que aparecen mas abajo en las notas
+de limpieza del 2026-08-17 son historicas y correctas para ESA fecha -- el registry
+crece cada ciclo con markets nuevos.
 
 ---
 
@@ -324,14 +324,36 @@ sigue siendo central (la pregunta "por que se movio este market entre el ciclo 3
 el 4" es inherentemente acotada en tiempo), pero baja de ser una CAPA arquitectonica
 a ser un campo mas del envelope de metadata, aplicado como filtro.
 
-**Corpus real medido (2026-08-18, 5 ciclos completos):** 2,638 articulos de News
-(~16.6M chars, ~4.15M tokens, mediana 4,015 chars por articulo) y 9,778 comentarios
-(~804K chars, ~200K tokens, mediana 44 chars, 47% bajo 40 chars). El corpus es
-ACUMULATIVO: crece ~1M tokens por ciclo, 2 ciclos/dia. Esto obliga a que el
-embedding sea incremental y automatizado dentro de la cadena de ingestion (solo
-chunks nuevos, nunca re-embedear el corpus), no un backfill manual -- el backfill
-sobre los ciclos ya existentes es un bootstrap de una sola vez, separado del camino
-de estado estable, mismo patron que tuvo el bootstrap del registry.
+**Corpus real medido (2026-08-18 12:00 UTC, los 6 ciclos completos):**
+
+| | Total | Chars | ~Tokens | Mediana | Nota |
+|---|---|---|---|---|---|
+| Articulos (News) | 3,315 | 20.9M | ~5.22M | 3,974 chars | 100% con body_text, max 240K chars |
+| Comentarios | 12,711 | 1.04M | ~261K | 44 chars | 47% bajo 40 chars |
+
+**Linkeo verificado sobre el corpus completo:** los 3,315 articulos llevan EXACTAMENTE
+un `market_id` cada uno, cero sin linkear -- confirma sobre 6 ciclos lo que motivo
+deprecar el modelo de dos capas. Los comentarios son lo opuesto: mediana de 2
+`market_id` por comentario, media 3.8, maximo 49 (efecto de `shared_series`), con
+distribucion 4,362 `direct` / 4,031 `shared_event` / 4,318 `shared_series`.
+
+**El corpus es ACUMULATIVO, pero News y Comments crecen de forma MUY distinta -- y eso
+cambia el diseño de embedding por fuente:**
+- **News crece de verdad cada ciclo** (443 -> 666 -> 744 -> 785 -> 643 articulos): son
+  articulos nuevos, dedupeados por URL, ~600-800 por ciclo de forma sostenida.
+- **Comments se aplano casi por completo** (2,589 -> 2,831 -> 3,077 -> 3,441 -> 429 ->
+  344). NO es una falla: `markets_with_comments` siguio alto (438, 494) y
+  `entities_queried` normal (109, 126), sin fallos. Los primeros ciclos ingirieron el
+  back-catalogue historico completo de cada entidad; ya en estado estable, la tabla
+  `poly-rag-processed-comments` solo deja pasar comentarios genuinamente nuevos. El
+  volumen real de estado estable son ~350-450 comentarios/ciclo, no ~3,000.
+
+Esto obliga a que el embedding sea incremental y automatizado dentro de la cadena de
+ingestion (solo chunks nuevos, nunca re-embedear el corpus), no un backfill manual --
+el backfill sobre los ciclos ya existentes es un bootstrap de una sola vez, separado
+del camino de estado estable, mismo patron que tuvo el bootstrap del registry. El
+costo recurrente de embedding lo domina News (~5M tokens acumulados y creciendo
+~700 articulos/ciclo), no Comments (~261K tokens totales, y de crecimiento lento).
 
 **Decisiones abiertas (Dia 4):** estrategia de chunking (articulos son largos y
 necesitan split; comentarios son demasiado cortos para embeder individualmente),

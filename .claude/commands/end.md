@@ -24,7 +24,21 @@ la misma fecha). Si no existe, crea una nueva entrada:
 - bullet 2
 ...
 
-Usa la fecha actual real. No reescribas ni borres entradas anteriores.
+**La fecha del encabezado va en HORA LOCAL DEL USUARIO (UTC-6, Ciudad de Mexico), NO en
+UTC** -- ver "Timezone Convention" en CLAUDE.md. El ledger es la bitacora de las sesiones
+de trabajo del usuario, asi que su dia debe coincidir con el dia del usuario. Ojo con la
+trampa real: entre las 18:00 y 23:59 hora local, UTC ya avanzo al dia SIGUIENTE, asi que
+usar la fecha por defecto del entorno archivaria una sesion de la noche bajo el dia de
+manana. Obten la fecha local explicitamente:
+
+    TZ=America/Mexico_City date +%F
+
+Esto aplica SOLO a la fecha del encabezado del ledger. Cualquier timestamp de datos que se
+mencione DENTRO de un bullet (ciclos de ingestion, particiones de S3, corridas de
+EventBridge) se queda en UTC, que es canon para todo lo del corpus/pipeline -- si un bullet
+menciona ambos, deja explicito cual es cual.
+
+No reescribas ni borres entradas anteriores.
 
 **Ademas, antes de cerrar el bloque:** revisa si algo de lo que se hizo en este bloque
 de trabajo dejo desactualizado `.claude/claude_docs/tech_debt.md` (una fuente de datos

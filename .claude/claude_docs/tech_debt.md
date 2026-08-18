@@ -525,8 +525,10 @@ article to a market, and a time window was the only available retrieval path for
 content. The News Source Redesign (see that entry above) replaced those feeds with one Google
 News search PER OPEN MARKET, using the market's `question` as the query. That means every
 article now enters the corpus already attached to exactly one `market_id` by construction.
-**Verified against real production data (2026-08-18): 2,638 articles across 4 cycles, 100%
-carrying exactly one `market_id`, zero unlinked.** There is no ambient pool for Layer 2 to
+**Verified against real production data (2026-08-18, re-measured across all 6 complete cycles
+after the 12:00 UTC run: 3,315 articles, 100% carrying exactly one `market_id`, zero
+unlinked** -- the first measurement covered 4 cycles/2,638 articles and the ratio held exactly
+as the corpus grew). There is no ambient pool for Layer 2 to
 retrieve from — the set it was invented to reach is empty, and the "Layer 1 vs Layer 2"
 distinction collapses because everything is Layer 1.
 
