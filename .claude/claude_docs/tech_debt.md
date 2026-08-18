@@ -1528,3 +1528,104 @@ liquidity fields intact.
 **Revisit if:** a further provenance type is added later (e.g. the deferred
 `ingest_polymarket`-native history fetch above) -- confirm it also tags explicitly rather
 than reintroducing an implicit default.
+
+---
+
+## News Temporal Tiers (3.1/3.2/3.3) -- Registry created_at Backfilled, Articles Tagged (2026-08-18)
+
+**Issue:** classifying a News article's relationship to its market -- and therefore whether
+odds data even exists to correlate it against -- requires comparing the article's `pubDate`
+against TWO market dates: `created_at` (when Polymarket made the market) and `first_seen`
+(when WE started tracking it). Only `first_seen` existed in the registry before today.
+`created_at` was never stored, even though `ingest_polymarket` already reads it from the
+same Gamma API response used for everything else.
+
+**Tiers (decided by the user, 2026-08-18):**
+- **3.1** -- `pubDate < created_at`. Published before the market existed. No odds ever
+  existed for this window (nothing to correlate), but kept as legitimate market context
+  rather than discarded -- capped at 1 year before `created_at` (not before ingestion date),
+  beyond which an article is tagged `too_old` instead.
+- **3.2** -- `created_at <= pubDate < first_seen`. Published after the market existed but
+  before we tracked it. Rescued by the CLOB odds backfill (see the entry above) -- before
+  that backfill this window had zero odds to correlate against; now it has daily-resolution
+  price history.
+- **3.3** -- `pubDate >= first_seen`. Published while actively tracking, backed by full
+  cycle snapshots (volume/volume24hr/liquidity all present). Highest-confidence tier.
+
+**Two backfills, in dependency order:**
+1. `scripts/backfill_registry_created_at.py` -- one-off, additive (`UpdateItem` writing only
+   `created_at`), uses the `/markets/{id}` path endpoint (not `?id=`, which silently returns
+   an empty list for `closed=True` markets -- see the CLOB backfill entry above for the same
+   bug found the same day in a different script). Verified: 595/595 registry items backfilled,
+   0 errors, 0 missing `createdAt`, and a sanity check confirmed `created_at` never comes
+   after `first_seen` for any item (a market cannot be tracked before it exists).
+2. `scripts/tag_news_temporal_tier.py` -- one-off, additive (`temporal_tier` field added per
+   article, no other field touched, no article added/removed), classifies retroactively
+   rather than forward-only, consistent with "nothing gets deleted" from the odds-backfill
+   decision above: an article ingested yesterday deserves the same classification as one
+   ingested tomorrow, since the dates it depends on do not change after the fact. Classifies
+   by the HIGHEST-confidence tier among an article's `market_ids` when more than one applies
+   (3.3 > 3.2 > 3.1 > too_old), though the current News design links every article to exactly
+   one market by construction (see "News Source Redesign"), so this only matters if that
+   changes later.
+
+**Not yet wired into `ingest_news` for new articles going forward -- deliberately deferred as
+part of "F"** (a batched, single-deploy set of `ingest_polymarket`/`ingest_news` extensions
+for new registry entrants, alongside teaching `ingest_polymarket` to fetch odds history for
+newly-tracked markets). Reasoning: two Lambda changes discovered on the same day, for
+different reasons, are batched into one deploy with one verified plan, rather than deploying
+twice. `classify_temporal_tier()` in the tagging script is written standalone (no S3/DynamoDB
+dependency, plain datetimes in/out) specifically so the eventual `ingest_news` change can
+reuse it directly -- this repo has no shared `lib/` between Lambdas, so the intended path is a
+direct copy, not an import.
+
+**Verified in production (2026-08-18, full run, all 6 news cycles, 3,315 articles):**
+
+| Tier | Count | % |
+|---|---|---|
+| 3.2 (correlatable via CLOB backfill) | 1,858 | 56% |
+| 3.1 (pre-market, capped at 1yr) | 860 | 26% |
+| unknown_market (see below) | 305 | 9% |
+| 3.3 (full cycle-snapshot backing) | 167 | 5% |
+| too_old (>1yr before created_at) | 125 | 4% |
+
+**Real orphan-data finding surfaced by this run, deliberately NOT fixed yet (user's explicit
+call, 2026-08-18): `unknown_market` -- 305 articles referencing a `market_id` no longer
+present in the registry at all.** Root cause confirmed, not assumed: the 2026-08-17 registry
+cleanup (see "Pendiente para completar el ciclo de ingestion" in architecture_canon.md) purged
+329 legacy registry items tied to the pre-redesign Bluesky/keyword pipeline, but that cleanup
+only ever touched the registry and `odds/` -- it never touched `news/` or `comments/`, so
+articles referencing those now-deleted market_ids survived untouched in `news/` files older
+than the cleanup. Confirmed via the actual per-cycle breakdown that this is fully historical,
+not an ongoing leak: `unknown_market` rate was 85% (08-16 01:00) -> 21% -> 13% -> 12% -> **0%
+starting 08-18 00:00**, exactly the day after the cleanup stabilized. Every orphan predates
+2026-08-17; zero new ones are being created.
+
+**User's decision: leave `unknown_market` articles exactly as tagged, do not delete, revisit
+later -- possibly at query time through the RAG itself** rather than as another one-off
+cleanup pass right now. Explicitly different from the earlier registry/odds cleanup
+precedent (which deleted debug-run data from a design that no longer exists) -- these are
+legitimately-ingested articles under the CURRENT pipeline design, just pointing at a market
+id retired for an unrelated reason.
+
+**On the 5% 3.3 figure -- validated reasoning, corrected on one point (user + assistant
+discussion, 2026-08-18):** the low 3.3 share is expected and is NOT primarily a function of
+how many markets existed before cycle 1 (most did). It is a function of CORPUS AGE -- News has
+only run 6 cycles (3 days) at all, so no article can be 3.3 (`pubDate >= first_seen`) unless it
+was published within roughly the last 3 days, regardless of how old or new its market is. The
+initial framing ("new markets will always be 3.3") was corrected: a market's FIRST post-tracking
+Google News pull mostly returns older, relevance-ranked coverage (see the News staleness
+finding above -- only ~23% of any pull is <=1 day old), which lands in 3.1/3.2, not 3.3. What
+is true: as a market stays tracked and cycles keep running, ITS SUBSEQUENT pulls increasingly
+surface genuinely same-day news, which does land in 3.3. So 3.3 grows with PIPELINE OPERATING
+TIME (calendar days the chain has been running), not with registry size -- an honest metric,
+since it is measuring real-time correlation actually observed, which cannot be backfilled or
+accelerated by any means already used elsewhere in this project (CLOB history, registry
+scans), only by continuing to run.
+
+**Revisit if:** `unknown_market` articles need a real resolution before Day 4/5 retrieval work
+depends on clean market-scoped queries (candidate approaches: drop them, re-resolve their
+market_id against Polymarket's per-id endpoint to see if it still exists under a different
+registry status, or simply exclude `unknown_market` at query time and leave the raw data
+alone forever); or once "F" is executed, confirming `ingest_news`'s new per-article
+classification produces the same tier a human would expect for a market tracked from day one.
