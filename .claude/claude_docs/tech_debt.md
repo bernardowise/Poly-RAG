@@ -1710,14 +1710,22 @@ script was written for this -- the regular `ingest_news` cycle picks these 93 up
 through the same widened `get_open_markets` query, so there is no duplicate search/decode/
 extract/dedup logic to maintain.
 
-**Cleanup reminder: delete `scripts/start_legacy_post_resolution_windows.py` on 2026-08-19**
-(tomorrow, Mexico City date), once the next 1-2 real ingest_news cycles have run and consumed
-all 93 legacy windows (4 cycles = 48h, so by the 2026-08-20 12:00 UTC cycle every one of the 93
-counters will have reached 0 through normal operation). The script's own docstring already warns
-against re-running it later with an updated/live market list -- once its one-time job is done,
-the file itself is dead code, not a reusable tool, and should be removed rather than left as a
-trap for a future session that might reach for it again against a different set of resolved
-markets.
+**Update (2026-08-19): user decided to KEEP the script, do not delete it, even once the 93
+counters reach 0.** Superseding the original "delete once consumed" plan below. Checked live:
+counters are at 2/4 (armed by this script during incident cleanup on 2026-08-18, decremented
+twice by the normal 2026-08-19T00 and T12 automatic cycles -- the mechanism is working exactly
+as designed, no special-case code in ingest_news, it just sees counter>0 and decrements). Two
+more automatic decrements remain (2026-08-20T00 and T12) before reaching 0. The script's job
+(arming the counter) is already done regardless -- nothing will invoke it again -- but it stays
+in the repo as a record of which 93 market_ids were manually caught up and why, rather than
+being deleted once functionally inert.
+
+Original reasoning (kept for context, no longer the decision): once its one-time job is done,
+the file is dead code with no reuse path (its own docstring warns against re-running it with a
+different market list), so the instinct was to remove it rather than leave it as a trap for a
+future session. That reasoning was sound in isolation but the user's call overrides it --
+keeping a well-documented record of a manual intervention has value independent of whether the
+code is ever executed again.
 
 **Revisit if:** the first real post-resolution cycles (starting with the 93 legacy markets)
 produce meaningful `closed`-tagged articles -- confirm the 4-cycle window in practice actually
