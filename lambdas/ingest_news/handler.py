@@ -62,7 +62,8 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import boto3
 import trafilatura
@@ -97,6 +98,11 @@ BLOCKLIST_THRESHOLD = 5
 # under Lambda's 900s hard maximum with margin for Bedrock enrichment + S3 I/O.
 BATCH_SIZE = 35
 
+# News temporal tiers (see tech_debt.md, "News Temporal Tiers") -- 1 year before
+# a market's created_at, an article is too old to be useful context even though
+# nothing gets deleted for it.
+CAP_DAYS = 365
+
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime")
@@ -130,14 +136,23 @@ def get_open_markets(table):
     (see decrement_post_resolution_counter). A resolved market with the
     counter already at 0 is excluded, same as before this change existed.
     Same small-table full-scan approach used elsewhere in the pipeline --
-    revisit if the registry grows large enough for this to matter."""
+    revisit if the registry grows large enough for this to matter.
+
+    Also carries created_at/first_seen/resolution_date -- needed to classify
+    each article's temporal_tier and market_status_at_publish at fetch time
+    (see classify_temporal_tier/classify_market_status above and
+    tech_debt.md, "News Temporal Tiers") -- projected here so no per-market
+    lookup is needed later in the batch loop."""
     scan_kwargs = {
         "FilterExpression": (
             "#s = :open OR post_resolution_cycles_remaining > :zero"
         ),
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {":open": "open", ":zero": 0},
-        "ProjectionExpression": "market_id, question, #s, post_resolution_cycles_remaining",
+        "ProjectionExpression": (
+            "market_id, question, #s, post_resolution_cycles_remaining, "
+            "created_at, first_seen, resolution_date"
+        ),
     }
     markets = []
     resp = table.scan(**scan_kwargs)
@@ -146,7 +161,14 @@ def get_open_markets(table):
         resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **scan_kwargs)
         markets.extend(resp.get("Items", []))
     return [
-        (m["market_id"], m["question"], m.get("status"))
+        {
+            "market_id": m["market_id"],
+            "question": m["question"],
+            "status": m.get("status"),
+            "created_at": m.get("created_at"),
+            "first_seen": m.get("first_seen"),
+            "resolution_date": m.get("resolution_date"),
+        }
         for m in markets
         if m.get("question")
     ]
@@ -169,6 +191,39 @@ def decrement_post_resolution_counter(table, market_id):
         )
     except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
         pass  # already at 0 -- nothing to decrement, market simply won't be re-selected next cycle
+
+
+def classify_temporal_tier(pub_date, created_at, first_seen):
+    """Return one of "too_old", "3.1", "3.2", "3.3" for a single market_id.
+
+    Copied verbatim from scripts/tag_news_temporal_tier.py, per that script's
+    own docstring intent -- it was written standalone specifically so this
+    Lambda could copy it directly once F-lambdas landed. See tech_debt.md,
+    "News Temporal Tiers", for the full design and the real gap this closes:
+    without this, every article ingested after 2026-08-18 had neither field,
+    growing by ~900 articles/cycle until retro-tagged by hand.
+    """
+    cap = created_at - timedelta(days=CAP_DAYS)
+    if pub_date < cap:
+        return "too_old"
+    if pub_date < created_at:
+        return "3.1"
+    if pub_date < first_seen:
+        return "3.2"
+    return "3.3"
+
+
+def classify_market_status(pub_date, resolution_date):
+    """"open" or "closed" as of pub_date -- from resolution_date, NOT the
+    market's current status (see tech_debt.md, "Post-Resolution News
+    Capture" for why: current status answers "where is this market today,"
+    not "where was it when this article published"). Copied verbatim from
+    scripts/tag_news_market_status.py, same reuse intent as
+    classify_temporal_tier above.
+    """
+    if resolution_date is None:
+        return "open"
+    return "closed" if pub_date >= resolution_date else "open"
 
 
 def sanitize_query(question):
@@ -258,7 +313,7 @@ def record_domain_result(table, domain, success):
         )
 
 
-def process_market_news(market_id, question, processed_urls_table, domain_failures_table):
+def process_market_news(market, processed_urls_table, domain_failures_table):
     """Searches Google News for this market's question verbatim, decodes
     and dedups results, and extracts full article text -- returns up to
     RESULTS_TARGET_PER_MARKET items. A result only counts toward the target
@@ -268,7 +323,29 @@ def process_market_news(market_id, question, processed_urls_table, domain_failur
     Domains with BLOCKLIST_THRESHOLD+ consecutive extraction failures
     (tracked in poly-rag-domain-failures) are skipped without attempting
     the request at all -- e.g. egamersworld.com, confirmed failing 100%
-    of the time across many distinct markets in production."""
+    of the time across many distinct markets in production.
+
+    Each article is tagged with temporal_tier and market_status_at_publish
+    at fetch time now (see tech_debt.md, "News Temporal Tiers") -- closes
+    the real gap where articles ingested after 2026-08-18 had neither field
+    until retro-tagged by hand."""
+    market_id = market["market_id"]
+    question = market["question"]
+
+    try:
+        created_at = datetime.fromisoformat(market["created_at"].replace("Z", "+00:00"))
+        first_seen = datetime.fromisoformat(market["first_seen"])
+    except (KeyError, TypeError, ValueError):
+        # Missing/malformed created_at or first_seen -- should not happen for
+        # any market this Lambda reaches (both are written at registry entry
+        # by ingest_polymarket), but never let a classification input crash
+        # the fetch itself.
+        created_at = first_seen = None
+    resolution_date_raw = market.get("resolution_date")
+    resolution_date = (
+        datetime.fromisoformat(resolution_date_raw) if resolution_date_raw else None
+    )
+
     try:
         search_results = search_google_news(question)
     except Exception as e:
@@ -298,6 +375,20 @@ def process_market_news(market_id, question, processed_urls_table, domain_failur
         if not body_text:
             continue  # extraction failed (paywall/block) -- discard, don't count as coverage
 
+        try:
+            pub_date = parsedate_to_datetime(result["pubDate"])
+        except (KeyError, TypeError, ValueError):
+            pub_date = None
+
+        if pub_date is not None and created_at is not None:
+            temporal_tier = classify_temporal_tier(pub_date, created_at, first_seen)
+        else:
+            temporal_tier = "unparseable_date"
+        if pub_date is not None:
+            market_status_at_publish = classify_market_status(pub_date, resolution_date)
+        else:
+            market_status_at_publish = "unparseable_date"
+
         articles.append({
             "market_ids": [market_id],
             "title": result["title"],
@@ -305,6 +396,8 @@ def process_market_news(market_id, question, processed_urls_table, domain_failur
             "url": real_url,
             "pubDate": result["pubDate"],
             "body_text": body_text,
+            "temporal_tier": temporal_tier,
+            "market_status_at_publish": market_status_at_publish,
         })
         mark_url_processed(processed_urls_table, real_url)
 
@@ -525,7 +618,8 @@ def lambda_handler(event, context):
     batch_articles = []
     batch_markets_failed = []
 
-    for market_id, question, status in batch:
+    for market in batch:
+        market_id = market["market_id"]
         # Decrement BEFORE checking for a search error -- a resolved market
         # was still included and counted against its post-resolution window
         # this cycle regardless of whether the search succeeded. Fixed
@@ -536,10 +630,10 @@ def lambda_handler(event, context):
         # markets carry a post-resolution counter to begin with (see
         # get_open_markets) -- open markets are excluded here by
         # construction, not by an extra status check on every market.
-        if status == "resolved":
+        if market.get("status") == "resolved":
             decrement_post_resolution_counter(registry_table, market_id)
 
-        articles, error = process_market_news(market_id, question, processed_urls_table, domain_failures_table)
+        articles, error = process_market_news(market, processed_urls_table, domain_failures_table)
         if error:
             batch_markets_failed.append(error)
             continue

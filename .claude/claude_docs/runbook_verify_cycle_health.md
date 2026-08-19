@@ -148,15 +148,34 @@ for mid in [i['market_id'] for i in nuevos[:5]]:
 
 ---
 
-## Paso 5 -- News: articulos con clasificacion completa (si ya se conecto el tagging)
+## Paso 5 -- News: articulos con clasificacion completa
 
-**Nota de alcance vigente al 2026-08-19:** `temporal_tier` y `market_status_at_publish`
-NO se calculan nativamente en `ingest_news` todavia -- solo existen en los articulos
-etiquetados retroactivamente hasta el 2026-08-18. Si ese trabajo ya se conecto a la
-Lambda (ver tech_debt.md, "News Temporal Tiers", nota de F-lambdas), agregar aqui la
-verificacion de que los articulos de ESTE ciclo ya traen ambos campos. Mientras no se
-conecte, este paso se salta -- no es un chequeo real todavia, es un recordatorio de
-que sigue pendiente.
+**Este paso FALLA, no se salta, si el campo falta.** La primera version de este
+runbook (2026-08-19) tenia esto como "nota de alcance" en vez de chequeo real --
+literalmente decia "mientras no se conecte, este paso se salta". Eso permitia un
+runbook 4/4 verde mientras 1,798 articulos (2 ciclos completos) no tenian ninguno
+de los dos campos, y el corpus no estaba listo ni para empezar a diseñar chunking.
+El usuario lo detecto en vivo, no el runbook. Correccion: un runbook de salud no
+debe tener una clausula de "esto no cuenta todavia" -- si el campo es requerido,
+su ausencia es una falla, punto.
+
+```python
+import boto3, json
+s3 = boto3.client('s3'); B = 'poly-rag-369970405415'
+n = json.loads(s3.get_object(Bucket=B, Key=f'news/{DAY}/{HH}.json')['Body'].read())
+sin_tier = sum(1 for a in n['articles'] if 'temporal_tier' not in a)
+sin_status = sum(1 for a in n['articles'] if 'market_status_at_publish' not in a)
+print(f'sin temporal_tier: {sin_tier}/{len(n["articles"])}')
+print(f'sin market_status_at_publish: {sin_status}/{len(n["articles"])}')
+assert sin_tier == 0, f'FALLA: {sin_tier} articulos sin temporal_tier este ciclo'
+assert sin_status == 0, f'FALLA: {sin_status} articulos sin market_status_at_publish este ciclo'
+```
+
+Cerrado 2026-08-19: `classify_temporal_tier`/`classify_market_status` se copiaron
+verbatim de los scripts one-off directo a `lambdas/ingest_news/handler.py` (mismo
+patron que las funciones standalone ya preveian), asi que desde el proximo deploy
+todo articulo nuevo sale ya clasificado. Si este paso vuelve a fallar en el futuro,
+es una regresion real -- no un gap de diseño conocido.
 
 ---
 

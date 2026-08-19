@@ -1630,6 +1630,44 @@ registry status, or simply exclude `unknown_market` at query time and leave the 
 alone forever); or once "F" is executed, confirming `ingest_news`'s new per-article
 classification produces the same tier a human would expect for a market tracked from day one.
 
+**CLOSED 2026-08-19 -- retroactive gap closed, and the deferred `ingest_news` connection now
+live.** Two things happened, in order:
+
+1. **Gap discovered:** while building a Day 4 chunking checklist, confirmed that
+   `temporal_tier`/`market_status_at_publish` only existed on articles ingested through
+   2026-08-18 -- the connection to `ingest_news` was explicitly deferred out of the F-lambdas
+   deploy the same day, and nobody had come back for it. Measured precisely: the 2026-08-19T00
+   and T12 cycles had **1,798 articles with neither field** (0/922, 0/876), growing by roughly
+   900/cycle. The user asked directly whether this would have been caught by
+   `runbook_verify_cycle_health.md` -- it would NOT have: that runbook's own Paso 5 explicitly
+   said "skip this check until the tagging is connected," so a runbook run against either
+   gapped cycle would have reported 4/4 green with a grey note, not a failure. Corrected the
+   runbook the same day (see its own changelog) to assert on missing fields instead of skipping.
+2. **Retrofill + native connection, in that order** (dry run confirmed both scripts correctly
+   skipped the 6 already-tagged cycles and only touched the 2 gapped ones -- `already tagged: 6`,
+   `articles tagged: 1798`, 0 errors -- then applied):
+   `scripts/tag_news_temporal_tier.py --apply` and `scripts/tag_news_market_status.py --apply`
+   closed the retroactive gap; all 8 cycle files now carry both fields on 100% of articles.
+   First real evidence of the post-resolution capture design actually working: **144 articles
+   tagged `closed`** in the two 08-19 cycles (0 in the entire corpus before F-lambdas) --
+   confirms markets are genuinely being searched after resolving now.
+
+**Then `classify_temporal_tier`/`classify_market_status` copied verbatim into
+`lambdas/ingest_news/handler.py`**, exactly as both scripts' own docstrings said they were
+written to allow. `get_open_markets`'s return shape changed from a 3-tuple to a dict (adding
+`created_at`/`first_seen`/`resolution_date`, needed for classification) -- the one call site
+(`process_market_news`) updated to match, now tags each article at fetch time instead of
+needing a follow-up script ever again. Deployed via `terraform plan`/`apply -target` (plan
+`1 to add, 1 to change, 1 to destroy` -- same `null_resource` dependency-rebuild pattern as
+every prior handler-only deploy this project has done, no IAM or table changes needed since
+this only adds fields to article JSON). Verified post-deploy: downloaded the actual deployed
+zip from `Code.Location` and diffed `handler.py` against the repo -- byte-identical. No Lambda
+invoked to confirm; the next automatic cycle is the first real test.
+
+**Revisit if:** the next automatic cycle's `news/*.json` doesn't carry both fields on 100% of
+its articles (per the corrected `runbook_verify_cycle_health.md`, Paso 5 -- that would now be a
+real regression, not a known gap).
+
 ---
 
 ## Post-Resolution News Capture -- Design Closed, Data Tagged, Ingestion Extension Deferred (2026-08-18)
