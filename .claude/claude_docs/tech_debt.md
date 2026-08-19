@@ -1955,3 +1955,96 @@ primera auditoria que resultaron sobre-reportados al verificarlos a mano).
 
 **Revisit if:** el ciclo automatico expone un caso no cubierto por el lock (ej. dos cycle_started_at
 distintos colisionando, que no deberia pasar dado que cada ciclo real tiene un timestamp unico).
+
+---
+
+## Digest Fidelity Audit and Redesign Backlog (2026-08-19)
+
+**Trigger:** the "Bespoke Digest Redesign" entry above explicitly flagged this as a revisit
+condition -- "the RAG ingestion work (Day 4/5) reveals the digest JSON schema needs different
+fields... not validated yet against actual retrieval needs." That's what happened here: while
+designing Day 4 chunking strategy and a proposed "Capa 0" retrieval layer that would reuse
+`send_digest`'s already-computed artifacts (`executive_summary`, `top_volatility`,
+`world_snapshot`) as a cheap first lookup before falling back to deep odds/news/comments
+retrieval, the user correctly insisted this couldn't be trusted without first measuring the
+LLM output's own fidelity -- an error in send_digest's synthesis would otherwise propagate
+into anything built on top of it.
+
+**Fidelity audit method:** compared 3 real digest emails (2026-08-16 01:00 and 12:00 UTC, plus
+one more) against the raw JSON in `digest/*.json`, section by section, not from memory or
+assumption.
+
+**Finding: 7 of 8 digest sections are 100% structured data, never touched by an LLM.**
+`newly_tracked_markets`, `resolved_markets`, `top_volatility`, `world_snapshot`
+(`top_conviction`/`most_disputed`), `quotes`, and the per-source item counts are all computed
+deterministically and copied verbatim into the email -- zero hallucination risk, confirmed
+number-for-number against the source JSON across all 3 digests checked. Only
+`executive_summary` is genuinely LLM-authored prose; in the one instance reviewed in detail it
+was numerically correct with one causal inference ("likely prompted by...") that was
+appropriately hedged, not asserted as fact. **Practical implication for the Capa 0 design:**
+the 5 structured fields can be used as a retrieval source immediately, with no LLM evaluation
+required -- only `executive_summary` needs the kind of fidelity evaluation originally planned
+for "the digest's LLM."
+
+**Real bug found and confirmed in code, not just observed in emails:** the user had already
+independently noticed that `News Highlights`/`Trader Comments` repeat identical content across
+consecutive cycles (verified: 2026-08-16 01:00 and 12:00 UTC emails show the exact same 3
+trader comments verbatim, despite the comment pool growing from 2,589 to 2,831 in between).
+Root cause confirmed in `lambdas/send_digest/handler.py`, `extract_quotes`: it does
+`payload.get(source, [])[:QUOTE_COUNT_PER_SOURCE]` -- a plain positional slice of the first 3
+items, no ranking, no relevance criterion, no dedup against what a prior cycle already showed.
+If the upstream array's ordering is stable (e.g. Comments grouped by entity in a consistent
+order), the same leading items surface every cycle regardless of how much new content arrived.
+User noted this self-corrects partially in later cycles (observed, not yet root-caused why),
+but the underlying selection logic is still broken.
+
+**Second real bug found in code: `world_snapshot`'s ranking criterion (`volume24hr`) is
+computed and stored but never rendered.** `compute_world_snapshot` populates `volume24hr` on
+every `top_conviction`/`most_disputed` entry (confirmed present in the real JSON), but the HTML
+template (`lambdas/send_digest/handler.py` lines ~393-411) only reads `question` and `price`
+when building the email -- the number that justifies the ranking is computed, stored, and then
+silently discarded before reaching the reader. A `0%` price with no volume next to it can't
+distinguish a real $400K-volume conviction bet from a $50 ghost market.
+
+**Redesign backlog collected with the user, not yet implemented (design/mock only):**
+1. Daily/Week/Month range tabs -- real constraint identified: SES/Gmail can't run JS, so an
+   actual email must default to a static Daily view with a "View full trends" link to a hosted
+   web page for Week/Month, not live in-email tab switching. Weekly/monthly aggregation logic
+   (sum deltas vs. net movement) is explicitly unresolved, flagged as its own open question.
+2. New Markets: show odds + `volume24hr` (bet size) per market, not just the question text.
+3. Resolved: show the pre-resolution price/momentum, not just the binary `outcome_prices` --
+   a coin-flip resolving is not news, a 95%-favorite losing is.
+4. Biggest Moves -- reviewed, no changes needed.
+5. Fix the quote-repetition bug above -- real selection criterion (e.g. engagement, dedup
+   against recently-shown items) instead of positional slicing.
+6. Top 5 newest markets by `volume24hr` get linked News context inline -- feasible TODAY using
+   the existing 1:1 `market_ids` linkage (no retrieval/embedding dependency, unlike an earlier
+   version of this idea that assumed it needed Day 4 retrieval to exist first).
+7. New Markets section: only show top 10 by volume, collapse the rest (79 new markets in one
+   real digest is unreadable) -- overlaps with #2/#6, likely merges into one section redesign
+   at implementation time rather than three separate changes.
+8. Render `volume24hr` in `world_snapshot` (fix the discarded-data bug above) AND add a
+   one-line caption explaining each section's ranking criterion, since a bare percentage with
+   no stated basis doesn't communicate why those 5 markets were chosen.
+
+**Mock built and published** (HTML artifact, fake but domain-realistic data, `artifact-design`
+skill loaded first since this is a utilitarian/memo treatment for a real transactional email,
+not an editorial page) demonstrating all 8 items together -- cool "data terminal" palette
+instead of the generic warm-cream default, tabular-nums monospace for all figures so columns
+of prices/volumes align like a ledger, and an explicit "Synthesized narrative" label on the
+LLM-authored summary paragraph to visually separate it from the surrounding structured (fully
+fidelity-verified) sections -- the same distinction the fidelity audit itself established.
+
+**Capa 0 design decision (for later, Day 4 block G):** if built, it must be an isolated,
+independently-toggleable function (e.g. `query_digest_layer()` behind a `USE_DIGEST_LAYER` env
+var, same pattern as the existing `USE_LLM_ENRICHMENT` flag) so an A/B test against going
+straight to deep odds/news/comments retrieval doesn't require refactoring either path. Whether
+it's actually worth the extra hop is explicitly deferred to Day 4 block H (real evaluation with
+real metrics) -- not decided here, per this project's own "measure, don't guess" discipline.
+
+**Not yet implemented -- none of the 8 backlog items or the Capa 0 layer have been coded.**
+This entry is the design/discovery record; implementation is future work.
+
+**Revisit if:** implementation begins on any of the 8 backlog items -- start with #5 (the
+quote-repetition bug) and #8 (the discarded volume24hr) since both are confirmed code defects,
+not just design preferences, and are the cheapest fixes in the list.

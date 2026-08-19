@@ -121,6 +121,26 @@ ventanas post-resolucion de 93 markets consumidas en minutos). Ver
 El objetivo del deploy es dejar el codigo listo para el siguiente ciclo automatico,
 no comprobarlo en el momento.
 
+## Nunca lanzar subagents sin autorizacion explicita
+
+**Regla dura, con doble seguro incluso si la idea fue del usuario.** Antes de cualquier
+llamada a `Agent()`, preguntar en el chat: que tarea se va a delegar, por que necesita
+un subagente (no un tool directo), y una estimacion aproximada de costo/tokens. Esperar
+confirmacion explicita antes de disparar -- que el usuario haya sugerido la idea primero
+no exime este paso, el punto es frenar el impulso de spawnear sin medir el costo, no
+adivinar de quien fue la idea.
+
+**Por que:** 2026-08-20, el usuario reporto consumo de tokens fuera de lo esperado, con
+datos reales de Anthropic sobre su uso de 24h: 96% del consumo vino de sesiones
+subagent-heavy, 92% con mas de 150k de contexto. Cada `Agent()` dispara su propia cadena
+de requests con su propio contexto -- el costo no siempre es obvio antes de lanzarlo.
+
+**Mecanica:** hay un hook (`.claude/hooks/block_agent_spawn.sh`, PreToolUse sobre Agent)
+que bloquea cualquier `Agent()` cuyo campo `description` no empiece exactamente con
+`"AUTORIZADO: "`. Solo se agrega ese prefijo despues de que el usuario confirme en el
+chat -- el hook no valida que la confirmacion realmente ocurrio (igual que el hook de
+Lambdas), pero exige un paso consciente y deliberado en vez de spawnear por inercia.
+
 ## Timezone Convention
 
 Two clocks, deliberately. The split exists because the pipeline's day and the user's day

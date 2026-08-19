@@ -18,6 +18,15 @@
             "command": "/workspaces/Poly-RAG/.claude/hooks/block_new_repo_files.sh"
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/hooks/block_agent_spawn.sh"
+          }
+        ]
       }
     ],
     "FileChanged": [
