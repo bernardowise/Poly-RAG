@@ -91,6 +91,17 @@ data "aws_iam_policy_document" "ingest_lambda_permissions" {
   }
 
   statement {
+    # Chain-advance lock, added 2026-08-19 -- see dynamodb.tf,
+    # aws_dynamodb_table.cycle_chain_locks for why. PutItem only: ingest_news
+    # claims the right to advance the chain, never reads or updates it back.
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
+    ]
+    resources = [aws_dynamodb_table.cycle_chain_locks.arn]
+  }
+
+  statement {
     effect  = "Allow"
     actions = ["bedrock:InvokeModel"]
     resources = [

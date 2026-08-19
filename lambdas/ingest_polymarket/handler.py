@@ -442,11 +442,35 @@ def backfill_odds_history_for_new_market(market, now):
     if not snapshots:
         return
 
+    # Merge with whatever is already at this key rather than overwriting --
+    # fixed 2026-08-19 (found in an independent audit, the other real bug
+    # both audits caught): a plain put_object here would destroy a market's
+    # entire cycle history if it were ever purged and re-entered the
+    # registry (see tech_debt.md, "News Temporal Tiers", the first_seen-
+    # reset finding -- this has already happened to 104 markets). Same
+    # merge-on-timestamp logic as scripts/backfill_odds_history.py's
+    # merge_snapshots: existing snapshots always win a timestamp collision,
+    # since a real cycle snapshot must never be replaced by a thinner
+    # backfilled one.
     key = f"odds/{market['id']}.json"
+    try:
+        existing = json.loads(s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read())
+        existing_snapshots = existing.get("snapshots", [])
+    except s3.exceptions.ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code not in ("NoSuchKey", "AccessDenied", "404", "403"):
+            raise
+        existing_snapshots = []
+
+    by_timestamp = {s["timestamp"]: s for s in snapshots}
+    for s in existing_snapshots:
+        by_timestamp[s["timestamp"]] = s
+    merged = [by_timestamp[ts] for ts in sorted(by_timestamp)]
+
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
-        Body=json.dumps({"market_id": market["id"], "snapshots": snapshots}),
+        Body=json.dumps({"market_id": market["id"], "snapshots": merged}),
         ContentType="application/json",
     )
     # append_odds_snapshot (called later in lambda_handler for every open

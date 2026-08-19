@@ -75,6 +75,32 @@ resource "aws_dynamodb_table" "processed_comments" {
   }
 }
 
+resource "aws_dynamodb_table" "cycle_chain_locks" {
+  # Fixes the real double-trigger incident of 2026-08-19 (see tech_debt.md,
+  # "PRIORIDAD 1"): merge_batch_payloads is idempotent for WRITING the final
+  # cycle payload (any batch can safely overwrite it with the same result),
+  # but had no guard on the NEXT step -- invoking Comments. With N parallel
+  # News batches, more than one could see "all batch files exist" at once
+  # and each invoked Comments, which cascaded to N digests/emails. One item
+  # per cycle claims the right to advance the chain; ConditionExpression
+  # attribute_not_exists(pk) in ingest_news means only the first writer wins,
+  # everyone else gets ConditionalCheckFailedException and does nothing. No
+  # TTL, same reasoning as processed_urls/processed_comments -- pay-per-
+  # request doesn't charge for idle storage of a few small items per day.
+  name         = "poly-rag-cycle-chain-locks"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}
+
 resource "aws_dynamodb_table" "domain_failures" {
   # Dynamic blocklist for outlets that consistently fail extraction (see
   # tech_debt.md, "News Source Redesign" -- domains like egamersworld.com

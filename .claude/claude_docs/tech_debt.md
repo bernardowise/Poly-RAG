@@ -1819,7 +1819,7 @@ the source fix) confirmed newly-written cycle snapshots now carry `source: "cycl
 
 ---
 
-## PRIORIDAD 1 SIGUIENTE SESION: Bug de Doble-Disparo en el Fan-Out de News (confirmado 2026-08-18)
+## Bug de Doble-Disparo en el Fan-Out de News (confirmado 2026-08-18, CERRADO 2026-08-19)
 
 **Decision del usuario (2026-08-18): esto es lo PRIMERO que se arregla al retomar, antes de
 seguir con el Dia 4 (chunking/embedding/retrieval).** No es negociable ni se pospone otra vez --
@@ -1869,3 +1869,43 @@ amplifique x12.5; la regla y el hook evitan el error humano en primer lugar. Amb
 **Revisit if:** al implementar el lock, aparece un caso donde encadenar dos veces sea realmente
 inofensivo y la complejidad del lock no se justifique -- improbable dado que cada encadenamiento
 cuesta un correo real via SES y una llamada Bedrock completa (executive summary) por ciclo.
+
+**CERRADO 2026-08-19.** Implementada la primera direccion candidata (lock atomico en DynamoDB),
+en el mismo deploy que otros dos bugs reales encontrados por dos auditorias independientes (ver
+"News Temporal Tiers" arriba para el hallazgo de `first_seen`-reset que motivo el fix del
+backfill nativo):
+
+1. **Lock de encadenamiento** -- tabla nueva `poly-rag-cycle-chain-locks` (hash key `pk`,
+   `terraform/dynamodb.tf`), un item por `cycle_started_at`. `claim_chain_advance()` en
+   `lambdas/ingest_news/handler.py` hace `put_item` con
+   `ConditionExpression="attribute_not_exists(pk)"` antes de `invoke_next_stage` -- solo el
+   primer batch que reclame la key encadena a Comments, el resto recibe
+   `ConditionalCheckFailedException` y no hace nada. `invoke_next_stage(cycle_started_at)` ahora
+   vive detras de `if claim_chain_advance(cycle_started_at):`.
+2. **Decrement antes del error, no despues** -- `decrement_post_resolution_counter` se movio
+   antes de la llamada a `process_market_news` en el loop de `lambda_handler`, para que un
+   fallo transitorio de busqueda consuma la ventana post-resolucion en vez de extenderla
+   silenciosamente.
+3. **Backfill nativo con merge, no overwrite** -- `backfill_odds_history_for_new_market` en
+   `lambdas/ingest_polymarket/handler.py` ahora lee el archivo `odds/<id>.json` existente (si
+   hay), mergea por timestamp con los puntos nuevos (existentes ganan colision, mismo patron que
+   `merge_snapshots` en `scripts/backfill_odds_history.py`), y escribe el resultado combinado --
+   antes hacia `put_object` directo, lo cual habria destruido la historia de ciclo completa de
+   cualquier market que saliera y regresara al registry (ver el hallazgo de `first_seen`-reset).
+
+**Desplegado via dos `terraform apply -target` separados, planes verificados en ambos** (`2 to
+add, 3 to change, 1 to destroy` para la tabla+IAM+ambas Lambdas; `0 to add, 1 to change, 0 to
+destroy` para un fix de seguimiento -- la variable de entorno `CYCLE_CHAIN_LOCKS_TABLE` no se
+habia declarado en Terraform para `ingest_news`, funcionaba por el default hardcoded en el
+codigo pero rompia la convencion del proyecto de declarar cada nombre de tabla explicitamente).
+Ningun otro recurso tocado (send_digest, ingest_comments, EventBridge, tablas existentes). No se
+invoco ninguna Lambda para verificar -- el ciclo automatico de las 00:00 UTC es la primera
+prueba real.
+
+**Origen de los dos bugs de #2 y #3:** encontrados de forma INDEPENDIENTE por dos auditorias
+distintas (subagentes sin contexto compartido) el 2026-08-19, y coincidieron exacto en ambos --
+señal fuerte de que eran reales y no ruido de auditoria (a diferencia de otros 3 hallazgos de la
+primera auditoria que resultaron sobre-reportados al verificarlos a mano).
+
+**Revisit if:** el ciclo automatico expone un caso no cubierto por el lock (ej. dos cycle_started_at
+distintos colisionando, que no deberia pasar dado que cada ciclo real tiene un timestamp unico).

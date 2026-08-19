@@ -77,14 +77,15 @@ resource "aws_lambda_function" "ingest_news" {
 
   environment {
     variables = {
-      S3_BUCKET             = aws_s3_bucket.poly_rag_data.bucket
-      METRICS_TABLE         = aws_dynamodb_table.architecture_metrics.name
-      REGISTRY_TABLE        = aws_dynamodb_table.market_registry.name
-      PROCESSED_URLS_TABLE  = aws_dynamodb_table.processed_urls.name
-      DOMAIN_FAILURES_TABLE = aws_dynamodb_table.domain_failures.name
-      BEDROCK_MODEL_ID      = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-      USE_LLM_ENRICHMENT    = "true"
-      NEXT_LAMBDA_NAME      = aws_lambda_function.ingest_comments.function_name
+      S3_BUCKET               = aws_s3_bucket.poly_rag_data.bucket
+      METRICS_TABLE           = aws_dynamodb_table.architecture_metrics.name
+      REGISTRY_TABLE          = aws_dynamodb_table.market_registry.name
+      PROCESSED_URLS_TABLE    = aws_dynamodb_table.processed_urls.name
+      DOMAIN_FAILURES_TABLE   = aws_dynamodb_table.domain_failures.name
+      CYCLE_CHAIN_LOCKS_TABLE = aws_dynamodb_table.cycle_chain_locks.name
+      BEDROCK_MODEL_ID        = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+      USE_LLM_ENRICHMENT      = "true"
+      NEXT_LAMBDA_NAME        = aws_lambda_function.ingest_comments.function_name
     }
   }
 

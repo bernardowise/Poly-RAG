@@ -72,6 +72,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 PROCESSED_URLS_TABLE = os.environ.get("PROCESSED_URLS_TABLE", "poly-rag-processed-urls")
+CYCLE_CHAIN_LOCKS_TABLE = os.environ.get("CYCLE_CHAIN_LOCKS_TABLE", "poly-rag-cycle-chain-locks")
 DOMAIN_FAILURES_TABLE = os.environ.get("DOMAIN_FAILURES_TABLE", "poly-rag-domain-failures")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 USE_LLM_ENRICHMENT = os.environ.get("USE_LLM_ENRICHMENT", "true").lower() == "true"
@@ -465,6 +466,32 @@ def merge_batch_payloads(cycle_started_at, total_markets, expected_offsets):
     }
 
 
+def claim_chain_advance(cycle_started_at):
+    """Atomic claim on advancing the chain to Comments for this cycle.
+
+    Fixes the real incident of 2026-08-19 (see tech_debt.md, "PRIORIDAD 1"):
+    merge_batch_payloads is idempotent for WRITING the final payload (any
+    batch can safely overwrite it with the same result), but had no guard on
+    invoking the next stage. With N parallel batches, more than one could see
+    "all batch files exist" at the same time and each called Comments --
+    which cascaded into duplicate digests and real emails.
+
+    ConditionExpression=attribute_not_exists(pk) means only the first writer
+    succeeds; every other concurrent caller gets
+    ConditionalCheckFailedException and is told NOT to advance the chain.
+    Same guarded-write pattern already used by decrement_post_resolution_counter.
+    """
+    table = dynamodb.Table(CYCLE_CHAIN_LOCKS_TABLE)
+    try:
+        table.put_item(
+            Item={"pk": cycle_started_at},
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+        return True
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+
+
 def lambda_handler(event, context):
     registry_table = dynamodb.Table(REGISTRY_TABLE)
     processed_urls_table = dynamodb.Table(PROCESSED_URLS_TABLE)
@@ -499,16 +526,24 @@ def lambda_handler(event, context):
     batch_markets_failed = []
 
     for market_id, question, status in batch:
+        # Decrement BEFORE checking for a search error -- a resolved market
+        # was still included and counted against its post-resolution window
+        # this cycle regardless of whether the search succeeded. Fixed
+        # 2026-08-19 (found in an independent audit): the decrement used to
+        # sit after `continue` on error, so a transient search failure
+        # silently EXTENDED the window instead of consuming it, one of the
+        # two real bugs both audits found independently. Only resolved
+        # markets carry a post-resolution counter to begin with (see
+        # get_open_markets) -- open markets are excluded here by
+        # construction, not by an extra status check on every market.
+        if status == "resolved":
+            decrement_post_resolution_counter(registry_table, market_id)
+
         articles, error = process_market_news(market_id, question, processed_urls_table, domain_failures_table)
         if error:
             batch_markets_failed.append(error)
             continue
         batch_articles.extend(articles)
-        if status == "resolved":
-            # Only resolved markets carry a post-resolution counter to begin
-            # with (see get_open_markets) -- open markets are excluded here
-            # by construction, not by an extra status check on every market.
-            decrement_post_resolution_counter(registry_table, market_id)
 
     fetch_latency_ms = int((time.time() - fetch_start) * 1000)
 
@@ -572,8 +607,13 @@ def lambda_handler(event, context):
         # Strict chaining (2026-08-16, see tech_debt.md "Strict Ingestion
         # Chaining"): only the batch that actually completes the cycle
         # advances the chain -- an intermediate batch finishing must not
-        # trigger Comments early.
-        invoke_next_stage(cycle_started_at)
+        # trigger Comments early. The merge itself is idempotent (any batch
+        # can safely re-write the same final payload), but advancing to the
+        # next stage is NOT -- claim_chain_advance is the guard that stops
+        # more than one batch from invoking Comments (see its docstring for
+        # the 2026-08-19 incident this fixes).
+        if claim_chain_advance(cycle_started_at):
+            invoke_next_stage(cycle_started_at)
 
     return {
         "statusCode": 200,
