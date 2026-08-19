@@ -27,13 +27,18 @@ PHILOSOPHY=$(sed -n '/^## Hook Design Philosophy$/,$p' "$DOCS")
 generate_hooks() {
   local settings_json="$1"
 
-  # Use jq to extract hook data
+  # Use jq to extract hook data. Two matcher shapes exist in this repo:
+  # FileChanged entries use "matchers" (array, our own convention); PreToolUse
+  # entries use "matcher" (single string, Claude Code's standard field for
+  # that event). Normalize both to an array before rendering so one template
+  # covers both -- without this, PreToolUse entries (matchers == null) crash
+  # the whole regeneration and truncate hooks.md (see incident 2026-08-19).
   jq -r '.hooks | to_entries[] |
     .key as $event |
     .value[] |
-    .matchers as $matchers |
+    ((.matchers // [.matcher]) | map(select(. != null))) as $matchers |
     .hooks[0] as $handler |
-    "### \($event): \($matchers[0])\n\n**Event:** `\($event)`\n**Trigger:** \($matchers | join(", "))\n**Handler:** Shell command\n**Script:** `\($handler.command)`\n\n**Purpose:**\n(Add description here)\n"
+    "### \($event): \($matchers[0] // "*")\n\n**Event:** `\($event)`\n**Trigger:** \($matchers | join(", "))\n**Handler:** Shell command\n**Script:** `\($handler.command)`\n\n**Purpose:**\n(Add description here)\n"
   ' "$settings_json"
 }
 

@@ -284,7 +284,7 @@ if the project becomes collaborative or if a bad deploy actually corrupts the od
 
 **Mitigation:**
 - Design corpus schema to track doc versions by commit (`.claude/corpus/manifest.json` or similar)
-- Build ingestion script (`.claude/scripts/build_corpus.sh`) to parse git history and extract doc snapshots
+- Build ingestion script (`scripts/build_corpus.sh`) to parse git history and extract doc snapshots -- lives in the repo-root `scripts/` (one-off tooling), not `.claude/hooks/` (hook handlers only, see infra_design.md)
 - Define query interface (MCP server? embedding store? simple search?)
 - Start ingesting incrementally as project history accumulates (revisit after 1-2 months of commits)
 

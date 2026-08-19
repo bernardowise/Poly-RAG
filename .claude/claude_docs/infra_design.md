@@ -104,27 +104,52 @@ realmente hacen:
 
 ## `.claude/settings.json` -- hooks activos
 
-Dos hooks `FileChanged`, ambos con handler tipo shell command:
+**`.claude/hooks/` guarda EXCLUSIVAMENTE handlers de hooks** (renombrado desde
+`.claude/scripts/` el 2026-08-19, para no confundirse con `scripts/` en la raiz del
+repo, que son herramientas one-off del proyecto -- backfills, tagging -- sin relacion
+con el ciclo de vida de Claude Code. Ver CLAUDE.md, "Nunca crear archivos nuevos en
+el repo sin autorizacion".
 
-1. **Sync de memoria** (`.claude/scripts/sync_memory.sh`) -- dispara cuando cambia
-   algo en `.claude/claude_docs/memory_mirror/**` O en el memory store interno de
-   Claude Code (`/home/codespace/.claude/projects/-workspaces-Poly-RAG/memory/**`).
-   El script hace un `rsync -a --update` **bidireccional** entre ambos directorios --
-   semantica de union: nunca borra, solo agrega/actualiza en cualquiera de los dos
-   sentidos. Efecto practico: lo que Claude recuerda entre sesiones queda tambien
-   versionado en git (via `memory_mirror/`), y lo que se edite a mano en el mirror
-   dentro del repo se propaga de vuelta al store interno.
-2. **Regeneracion de docs de hooks** (`.claude/scripts/update_hooks_docs.sh`) --
-   dispara cuando cambia `.claude/settings.json` mismo. Parsea el JSON con `jq` y
-   reescribe la seccion "Active Hooks" de `hooks.md`, preservando a mano la intro, la
-   filosofia de diseño, y la seccion de candidatos futuros (solo esa seccion se
-   regenera, el resto del archivo es contenido escrito por humano). Es literalmente
-   auto-documentacion: este mismo hook es la razon por la que `hooks.md` nunca queda
-   desactualizado respecto a `settings.json` -- si agregas un hook nuevo, la doc se
-   reescribe sola al guardar.
+Cuatro hooks activos, dos `FileChanged` y dos `PreToolUse`:
 
-No hay hooks de `PreToolUse`/`PostToolUse`/`UserPromptSubmit` en este repo todavia --
-`hooks.md` los lista como "candidatos futuros", no implementados.
+1. **Sync de memoria** (`.claude/hooks/sync_memory.sh`, `FileChanged`) -- dispara
+   cuando cambia algo en `.claude/claude_docs/memory_mirror/**` O en el memory store
+   interno de Claude Code
+   (`/home/codespace/.claude/projects/-workspaces-Poly-RAG/memory/**`). El script hace
+   un `rsync -a --update` **bidireccional** entre ambos directorios -- semantica de
+   union: nunca borra, solo agrega/actualiza en cualquiera de los dos sentidos. Efecto
+   practico: lo que Claude recuerda entre sesiones queda tambien versionado en git
+   (via `memory_mirror/`), y lo que se edite a mano en el mirror dentro del repo se
+   propaga de vuelta al store interno.
+2. **Regeneracion de docs de hooks** (`.claude/hooks/update_hooks_docs.sh`,
+   `FileChanged`) -- dispara cuando cambia `.claude/settings.json` mismo. Parsea el
+   JSON con `jq` y reescribe la seccion "Active Hooks" de `hooks.md`, preservando a
+   mano la intro, la filosofia de diseño, y la seccion de candidatos futuros (solo esa
+   seccion se regenera, el resto del archivo es contenido escrito por humano). Es
+   literalmente auto-documentacion: este mismo hook es la razon por la que `hooks.md`
+   nunca queda desactualizado respecto a `settings.json` -- si agregas un hook nuevo,
+   la doc se reescribe sola al guardar.
+3. **Bloqueo de invocaciones a Lambdas de produccion**
+   (`.claude/hooks/block_lambda_invoke.sh`, `PreToolUse` sobre `Bash`) -- agregado
+   2026-08-18/19 tras un incidente real: dos invocaciones manuales de
+   `poly-rag-ingest-polymarket` (para "solo verificar" un fix) dispararon la cadena
+   completa hasta `send_digest`, y un bug de doble-disparo lo amplifico a 25 correos
+   reales. Bloquea `aws lambda invoke` (o equivalentes) contra las 5 Lambdas de
+   produccion sin importar la razon -- no depende del juicio de Claude en el momento,
+   es una barrera mecanica. Escape hatch solo para el usuario:
+   `POLYRAG_ALLOW_LAMBDA_INVOKE=1 <comando>`. Ver CLAUDE.md, "NUNCA invocar Lambdas de
+   produccion sin confirmacion explicita", y
+   `.claude/claude_docs/runbook_manual_invocation_cleanup.md`.
+4. **Bloqueo de archivos nuevos sin autorizacion**
+   (`.claude/hooks/block_new_repo_files.sh`, `PreToolUse` sobre `Write`) -- agregado
+   2026-08-19 tras otro caso real: se creo un directorio (`evals/`) sin preguntar y el
+   usuario perdio el hilo de la estructura de su propio repo. Bloquea CREAR archivos
+   nuevos dentro de `/workspaces/Poly-RAG` (editar archivos existentes SI esta
+   permitido, no genera desorden nuevo). Escape hatch: `POLYRAG_ALLOW_NEW_FILE=1`. Ver
+   CLAUDE.md, "Nunca crear archivos nuevos en el repo sin autorizacion".
+
+No hay hooks de `PostToolUse`/`UserPromptSubmit` en este repo todavia -- `hooks.md`
+los lista como "candidatos futuros", no implementados.
 
 ---
 

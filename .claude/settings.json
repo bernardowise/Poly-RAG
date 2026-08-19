@@ -6,7 +6,16 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/workspaces/Poly-RAG/.claude/scripts/block_lambda_invoke.sh"
+            "command": "/workspaces/Poly-RAG/.claude/hooks/block_lambda_invoke.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/hooks/block_new_repo_files.sh"
           }
         ]
       }
@@ -20,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/workspaces/Poly-RAG/.claude/scripts/sync_memory.sh"
+            "command": "/workspaces/Poly-RAG/.claude/hooks/sync_memory.sh"
           }
         ]
       },
@@ -31,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/workspaces/Poly-RAG/.claude/scripts/update_hooks_docs.sh"
+            "command": "/workspaces/Poly-RAG/.claude/hooks/update_hooks_docs.sh"
           }
         ]
       }

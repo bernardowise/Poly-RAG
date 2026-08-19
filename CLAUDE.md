@@ -64,6 +64,29 @@ Guided by Chip Huyen's *AI Engineering* book. This is a long-term side project, 
 | `memory_mirror/` | Git-tracked mirror of Claude Code's internal memory store, kept in sync via hooks (union sync, no deletions). |
 | `gerdau/` | Interview-prep sprint materials — gitignored, never tracked in version control. |
 
+## Nunca crear archivos nuevos en el repo sin autorizacion
+
+**Antes de crear cualquier archivo o directorio que no exista ya dentro de
+`/workspaces/Poly-RAG`, preguntar al usuario.** Editar o sobrescribir archivos
+existentes no requiere permiso -- la regla es solo sobre CREAR cosas nuevas.
+
+**Por que:** cada archivo nuevo es una decision de arquitectura pequeña (donde vive,
+como se llama, si se trackea en git) y esas decisiones son del usuario, no mias. Sin
+esta regla empiezan a aparecer archivos sueltos por todo el repo y el usuario pierde
+el hilo de su propia estructura. Caso real que origino la regla (2026-08-19): se creo
+un directorio `evals/` con un documento de handoff sin preguntar; el usuario lo pidio
+borrar.
+
+**Al preguntar, decir:** que archivo, donde, para que sirve, y si deberia trackearse
+en git o ir al `.gitignore`.
+
+**Para archivos temporales de trabajo** (analisis, scripts de un solo uso, dumps):
+usar el scratchpad de la sesion en `/tmp`, no el repo. Eso no requiere permiso.
+
+Hay un hook (`.claude/hooks/block_new_repo_files.sh`) que bloquea la ruta por
+defecto. Cuando el usuario autoriza, el archivo se crea con
+`POLYRAG_ALLOW_NEW_FILE=1 cat > ruta <<'EOF' ... EOF`.
+
 ## NUNCA invocar Lambdas de produccion sin confirmacion explicita
 
 **Regla dura, sin excepciones ni juicio propio.** Nunca ejecutar `aws lambda invoke`
