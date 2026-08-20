@@ -2503,3 +2503,48 @@ shared architecture concept:
 **Revisit when:** Qdrant and LanceDB integrations are actually coded (Day 6 store cloning) --
 confirm Qdrant's collection limits at that point, don't assume the Pinecone namespace pattern
 transfers as-is.
+
+---
+
+## Orphan Comments From the 2026-08-17 Registry Cleanup -- Found and Purged (2026-08-20)
+
+**Issue:** while building the Day 4 block F chunking bootstrap (`scripts/bootstrap_chunk_corpus.py`),
+found 3,080 comments across 4 cycle files (`comments/2026-08-16/01.json`, `2026-08-16/12.json`,
+`2026-08-17/00.json`, `2026-08-17/12.json`) referencing `market_id`s that no longer exist in the
+registry at all -- 22 distinct market_ids for `direct` comments, 38 for `shared_event`/
+`shared_series`, 60 total. Root cause: these 4 cycles ran BEFORE the 2026-08-17 registry cleanup
+(see "limpieza mayor del registry" in architecture_canon.md) that purged 329 pre-redesign markets --
+that cleanup was explicitly scoped to registry + odds, and never touched `comments/*.json` (per its
+own stated scope: "esos payloads son historial de CICLO, no datos de registry/odds ligados a un
+market_id"). The comment data was correct for its own cycle at ingestion time; it only became
+orphaned once the markets it references were purged days later. Same underlying pattern as the
+already-documented `unknown_market` finding for News (see "Known Limitation: Explicit ID-Linkage"),
+but a real gap in the FIRST investigation pass: checking only `comment_group_key`'s
+`shared_event`/`shared_series` path found 1,337 orphan comments (38 markets) and initially missed
+that `direct` comments can be orphaned too (`direct` groups by its own market_id without ever
+checking the registry) -- a second, correct check (`is_orphan`, validating every link_type against
+the real registry) found the true total of 3,080 (60 markets). Caught and corrected before deciding
+anything, not after.
+
+**Decision, different from `unknown_market`'s "leave it, revisit later":** the user explicitly
+chose to purge these now, not defer -- unlike an orphaned News article (which still has real
+standalone content even without a resolvable market), an orphan comment's only purpose in this
+corpus is grouping by market/entity for the Comments chunking design (`chunk_comments` in
+`bootstrap_chunk_corpus.py`), and it has none once its market_id is gone. It was actively getting
+in the way of that design, not just inert legacy data.
+
+**Purged via `scripts/purge_orphan_comments.py`** (new script, the only one in `scripts/` that
+deletes data rather than only adding -- see `scripts/README.md`), dry-run verified before
+`--apply`. Strictly scoped: only the 4 affected cycle files touched, only comments where EVERY
+`market_id` fails to resolve removed (a comment with at least one still-valid market_id is kept
+untouched), `comment_count` recomputed to match the real post-filter array length (avoiding the
+count/array mismatch bug class already fixed once in `eda_mio_3`, see session_ledger.md
+2026-08-17). Does NOT touch `poly-rag-processed-comments` (the dedup table) -- deliberately, so a
+purged `comment_id` stays deduped forever rather than risking re-ingestion if it ever reappeared
+from the live API. Result: 3,080 orphans removed, 8,858 legitimate comments preserved
+byte-for-byte, verified 0 orphans remain across the ENTIRE comments corpus (all 10 cycle files,
+not just the 4 affected) after the purge.
+
+**Revisit if:** a future registry cleanup again purges markets without also checking Comments for
+newly-orphaned references -- this was a one-time catch-up, not a recurring maintenance task with
+its own schedule.
