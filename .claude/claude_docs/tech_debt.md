@@ -2042,9 +2042,21 @@ straight to deep odds/news/comments retrieval doesn't require refactoring either
 it's actually worth the extra hop is explicitly deferred to Day 4 block H (real evaluation with
 real metrics) -- not decided here, per this project's own "measure, don't guess" discipline.
 
-**Not yet implemented -- none of the 8 backlog items or the Capa 0 layer have been coded.**
-This entry is the design/discovery record; implementation is future work.
+**Implemented 2026-08-20:** items #2/#5/#6/#7/#8 (both real bugs plus New Markets and Resolved
+redesign), verified by running the modified pure functions locally against real S3 data for the
+2026-08-19 12:00 UTC cycle (not invoked as a Lambda -- see CLAUDE.md rule on manual invocation).
+`schema_version` bumped to v2. Item #1 (Daily/Week/Month tabs) intentionally NOT implemented --
+still blocked on the unresolved weekly/monthly aggregation question and the separate hosted-page
+requirement. Deploy (terraform apply / zip) left for the next automatic cycle to pick up, not
+verified live yet.
 
-**Revisit if:** implementation begins on any of the 8 backlog items -- start with #5 (the
-quote-repetition bug) and #8 (the discarded volume24hr) since both are confirmed code defects,
-not just design preferences, and are the cheapest fixes in the list.
+**Status 2026-08-20: _digest is canon, treated as the MVP retrieval/RAG artifact for now.**
+Explicit user decision -- stop polishing this in isolation. The 4 implemented fixes above close
+the confirmed defects and the most unreadable gaps (79 new markets with no context, discarded
+ranking signal); further refinement is deferred until real usage at the end of the pipeline
+(Day 4/5 retrieval, Capa 0 if built) surfaces what's actually missing, instead of guessing more
+improvements now. If a real bug shows up in a future _digest email, it gets reported ad hoc and
+fixed then -- this entry is closed as "good enough MVP," not reopened for polish on its own.
+
+**Revisit if:** a real fidelity/rendering bug is reported in a live _digest email, or Day 4/5
+retrieval work reveals the schema itself (not just the email rendering) needs different fields.

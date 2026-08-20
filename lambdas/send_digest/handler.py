@@ -61,10 +61,12 @@ SOURCE_LIST_FIELDS = {
 
 TOP_VOLATILITY_COUNT = 5
 QUOTE_COUNT_PER_SOURCE = 3
+QUOTE_CANDIDATE_POOL = 20
 SNAPSHOT_VOLUME_COUNT = 5
 SNAPSHOT_UNCERTAIN_COUNT = 5
 SNAPSHOT_UNCERTAIN_LOW = 0.40
 SNAPSHOT_UNCERTAIN_HIGH = 0.60
+NEW_MARKETS_SHOWN = 10
 
 s3 = boto3.client("s3")
 ses = boto3.client("ses")
@@ -220,25 +222,59 @@ def compute_world_snapshot(loaded_markets):
     }
 
 
-def extract_quotes(source, payload):
+def get_previous_digest(cycle_started_at):
+    """Reads the digest JSON from the cycle immediately before this one (12h
+    back), used only to dedup quotes against what was already shown -- not a
+    general lookback mechanism. Returns None if there is no prior cycle or
+    it never wrote a digest (first cycle ever, or a prior failure)."""
+    try:
+        cycle_dt = datetime.fromisoformat(cycle_started_at)
+    except ValueError:
+        return None
+    prev_dt = datetime.fromtimestamp(cycle_dt.timestamp() - 12 * 3600, tz=timezone.utc)
+    key = f"digest/{prev_dt.strftime('%Y-%m-%d')}/{prev_dt.strftime('%H')}.json"
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.ClientError:
+        return None
+
+
+def extract_quotes(source, payload, previously_shown_texts):
     """Pulls a handful of real, verbatim text snippets per source -- not
     LLM-paraphrased -- so the digest keeps some human voice, not just
-    generated prose."""
+    generated prose.
+
+    Fixed 2026-08-20 (see tech_debt.md, "Digest Fidelity Audit"): the
+    original version was a plain positional slice of the first
+    QUOTE_COUNT_PER_SOURCE items, with no ranking and no dedup -- if the
+    upstream array's ordering was stable cycle to cycle (e.g. Comments
+    grouped by entity), the exact same items surfaced every cycle
+    regardless of how much new content arrived. Now scans a wider candidate
+    pool and skips any text already shown in the immediately prior digest,
+    falling back to the plain slice if every candidate was already shown
+    (e.g. a genuinely quiet cycle) rather than returning nothing."""
     if not payload:
         return []
     if source == "news":
-        articles = payload.get("articles", [])[:QUOTE_COUNT_PER_SOURCE]
-        return [
+        candidates = [
             {"text": a.get("title", ""), "source": a.get("source", ""), "url": a.get("url", "")}
-            for a in articles
+            for a in payload.get("articles", [])[:QUOTE_CANDIDATE_POOL]
         ]
-    if source == "comments":
-        comments = payload.get("comments", [])[:QUOTE_COUNT_PER_SOURCE]
-        return [
+    elif source == "comments":
+        candidates = [
             {"text": c.get("text", ""), "source": c.get("author", ""), "url": None}
-            for c in comments
+            for c in payload.get("comments", [])[:QUOTE_CANDIDATE_POOL]
         ]
-    return []
+    else:
+        return []
+
+    if not candidates:
+        return []
+
+    fresh = [q for q in candidates if q["text"] not in previously_shown_texts]
+    pool = fresh if fresh else candidates
+    return pool[:QUOTE_COUNT_PER_SOURCE]
 
 
 def synthesize_executive_summary(digest_data):
@@ -310,21 +346,83 @@ def synthesize_executive_summary(digest_data):
     }
 
 
-def build_digest_data(registry_table, now_iso):
+def get_latest_odds_snapshot(market_id):
+    """Reads a market's own odds/<market_id>.json and returns its latest
+    snapshot's price + volume24hr, or None if the file/snapshot is missing.
+    Shared by the New Markets (current bet size) and Resolved (pre-resolution
+    price) sections below -- for a resolved market this IS the pre-resolution
+    snapshot, since append_odds_snapshot is never called again once a market
+    is marked closed (see ingest_polymarket lambda_handler)."""
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=f"odds/{market_id}.json")
+        snapshots = json.loads(obj["Body"].read()).get("snapshots", [])
+    except s3.exceptions.ClientError:
+        return None
+    if not snapshots:
+        return None
+    latest = snapshots[-1]
+    try:
+        price = float(json.loads(latest["outcomePrices"])[0])
+    except (ValueError, IndexError, KeyError, TypeError):
+        return None
+    return {"price": round(price, 4), "volume24hr": float(latest.get("volume24hr", 0) or 0)}
+
+
+def enrich_newly_tracked_markets(newly_tracked, news_payload):
+    """Adds current price/volume24hr (bet size) to each newly-tracked market
+    and, using the existing 1:1 News->market_id linkage (no retrieval/
+    embedding dependency), a couple of linked article titles if any exist
+    this cycle. Sorted by volume24hr descending -- 79 new markets in one
+    real digest is unreadable without a size signal to prioritize by (see
+    tech_debt.md, "Digest Fidelity Audit")."""
+    articles_by_market = {}
+    for article in (news_payload or {}).get("articles", []):
+        for market_id in article.get("market_ids", []):
+            articles_by_market.setdefault(market_id, []).append(article.get("title", ""))
+
+    enriched = []
+    for m in newly_tracked:
+        odds = get_latest_odds_snapshot(m["market_id"]) or {"price": None, "volume24hr": 0}
+        enriched.append({
+            **m,
+            "price": odds["price"],
+            "volume24hr": odds["volume24hr"],
+            "linked_news": articles_by_market.get(m["market_id"], [])[:2],
+        })
+    enriched.sort(key=lambda x: x["volume24hr"], reverse=True)
+    return enriched
+
+
+def enrich_resolved_markets(resolved):
+    """Adds the pre-resolution price to each resolved market -- a coin-flip
+    resolving is not news, a 95%-favorite losing is, and the bare binary
+    outcome_prices field can't tell the two apart (see tech_debt.md,
+    'Digest Fidelity Audit')."""
+    enriched = []
+    for m in resolved:
+        odds = get_latest_odds_snapshot(m["market_id"])
+        enriched.append({**m, "pre_resolution_price": odds["price"] if odds else None})
+    return enriched
+
+
+def build_digest_data(registry_table, now_iso, previously_shown_texts):
     """Assembles the structured JSON that's the source of truth for this
     digest -- written to S3 before anything else, independent of whether
     the email send succeeds."""
     source_payloads = {source: fetch_source_payload(source) for source in SOURCE_LIST_FIELDS}
     polymarket_payload = source_payloads.get("polymarket") or {}
 
-    newly_tracked = polymarket_payload.get("newly_tracked_markets", [])
-    resolved = polymarket_payload.get("resolved_markets", [])
+    newly_tracked = enrich_newly_tracked_markets(
+        polymarket_payload.get("newly_tracked_markets", []),
+        source_payloads.get("news"),
+    )
+    resolved = enrich_resolved_markets(polymarket_payload.get("resolved_markets", []))
     loaded_markets = _load_open_market_odds(registry_table)
     top_volatility = compute_top_volatility(loaded_markets)
     world_snapshot = compute_world_snapshot(loaded_markets)
 
     quotes = {
-        source: extract_quotes(source, payload)
+        source: extract_quotes(source, payload, previously_shown_texts.get(source, set()))
         for source, payload in source_payloads.items()
         if source in ("news", "comments")
     }
@@ -362,19 +460,49 @@ def build_email_html(digest_data, executive_summary):
         </div>""")
 
     if digest_data["newly_tracked_markets"]:
-        rows = "".join(
-            f'<li style="margin-bottom:4px;">{escape(m["question"])}</li>'
-            for m in digest_data["newly_tracked_markets"]
-        )
+        all_new = digest_data["newly_tracked_markets"]
+        shown, rest = all_new[:NEW_MARKETS_SHOWN], all_new[NEW_MARKETS_SHOWN:]
+
+        def render_new_market(m):
+            price_str = f'{m["price"]:.0%}' if m["price"] is not None else "?"
+            news_html = ""
+            if m["linked_news"]:
+                news_html = "".join(
+                    f'<br><span style="color:#666;font-size:11px;">&mdash; {escape(t)}</span>'
+                    for t in m["linked_news"]
+                )
+            return (
+                f'<li style="margin-bottom:6px;">{escape(m["question"])} '
+                f'<span style="color:#666;">({price_str}, ${m["volume24hr"]:,.0f} vol24h)</span>'
+                f'{news_html}</li>'
+            )
+
+        rows = "".join(render_new_market(m) for m in shown)
+        rest_html = ""
+        if rest:
+            rest_rows = "".join(
+                f'<li style="margin-bottom:2px;color:#666;">{escape(m["question"])}</li>' for m in rest
+            )
+            rest_html = f"""
+            <details style="margin-top:8px;font-size:12px;color:#666;">
+              <summary style="cursor:pointer;">+{len(rest)} more</summary>
+              <ul style="margin:8px 0 0;padding-left:20px;">{rest_rows}</ul>
+            </details>"""
         sections.append(f"""
-        <h3 style="color:#2563eb;font-size:14px;margin:20px 0 8px;">New Markets ({len(digest_data["newly_tracked_markets"])})</h3>
-        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
+        <h3 style="color:#2563eb;font-size:14px;margin:20px 0 4px;">New Markets ({len(all_new)})</h3>
+        <p style="margin:0 0 8px;font-size:11px;color:#999;">Top {len(shown)} by 24h volume (bet size), rest collapsed</p>
+        <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>{rest_html}""")
 
     if digest_data["resolved_markets"]:
-        rows = "".join(
-            f'<li style="margin-bottom:4px;">{escape(m["question"])} &rarr; <code>{escape(str(m["outcome_prices"]))}</code></li>'
-            for m in digest_data["resolved_markets"]
-        )
+        def render_resolved(m):
+            pre = m.get("pre_resolution_price")
+            pre_str = f' &nbsp;<span style="color:#666;">(was {pre:.0%})</span>' if pre is not None else ""
+            return (
+                f'<li style="margin-bottom:4px;">{escape(m["question"])} &rarr; '
+                f'<code>{escape(str(m["outcome_prices"]))}</code>{pre_str}</li>'
+            )
+
+        rows = "".join(render_resolved(m) for m in digest_data["resolved_markets"])
         sections.append(f"""
         <h3 style="color:#16a34a;font-size:14px;margin:20px 0 8px;">Resolved ({len(digest_data["resolved_markets"])})</h3>
         <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
@@ -393,21 +521,25 @@ def build_email_html(digest_data, executive_summary):
     if snapshot.get("top_conviction"):
         rows = "".join(
             f'<li style="margin-bottom:4px;">{escape(m["question"])}: '
-            f'<strong>{m["price"]:.0%}</strong></li>'
+            f'<strong>{m["price"]:.0%}</strong> '
+            f'<span style="color:#666;">(${m["volume24hr"]:,.0f} vol24h)</span></li>'
             for m in snapshot["top_conviction"]
         )
         sections.append(f"""
-        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 8px;">Highest-Conviction Bets</h3>
+        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 4px;">Highest-Conviction Bets</h3>
+        <p style="margin:0 0 8px;font-size:11px;color:#999;">Ranked by 24h volume -- most real money placed</p>
         <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
 
     if snapshot.get("most_disputed"):
         rows = "".join(
             f'<li style="margin-bottom:4px;">{escape(m["question"])}: '
-            f'<strong>{m["price"]:.0%}</strong></li>'
+            f'<strong>{m["price"]:.0%}</strong> '
+            f'<span style="color:#666;">(${m["volume24hr"]:,.0f} vol24h)</span></li>'
             for m in snapshot["most_disputed"]
         )
         sections.append(f"""
-        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 8px;">Most Disputed Bets</h3>
+        <h3 style="color:#0891b2;font-size:14px;margin:20px 0 4px;">Most Disputed Bets</h3>
+        <p style="margin:0 0 8px;font-size:11px;color:#999;">Ranked by closeness to 50/50 -- market genuinely split</p>
         <ul style="margin:0;padding-left:20px;font-size:13px;color:#333;">{rows}</ul>""")
 
     for source, label in (("news", "News Highlights"), ("comments", "Trader Comments")):
@@ -452,13 +584,19 @@ def lambda_handler(event, context):
     # cycle context.
     cycle_started_at = event.get("cycle_started_at") or now_iso
 
-    digest_data = build_digest_data(registry_table, now_iso)
+    previous_digest = get_previous_digest(cycle_started_at)
+    previously_shown_texts = {
+        source: {q["text"] for q in (previous_digest or {}).get("quotes", {}).get(source, [])}
+        for source in ("news", "comments")
+    }
+
+    digest_data = build_digest_data(registry_table, now_iso, previously_shown_texts)
     exec_summary_result = synthesize_executive_summary(digest_data)
     executive_summary = exec_summary_result["text"] if exec_summary_result else None
     digest_data["executive_summary"] = executive_summary
 
     digest_data["metadata"] = {
-        "schema_version": "v1",
+        "schema_version": "v2",
         "lambda_name": context.function_name,
         "lambda_request_id": context.aws_request_id,
         "llm_used": exec_summary_result is not None,
