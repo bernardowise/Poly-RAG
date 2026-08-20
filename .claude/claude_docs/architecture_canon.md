@@ -371,10 +371,16 @@ Comments).
   resolverse", asi que solo haria falta re-embeder si `description`/`question` cambian tras
   la resolucion (caso raro, no verificado si aplica en la practica).
 - Metadata: `market_id`, `status`, `end_date`/`resolution_date`.
-- **Pendiente de decidir (no resuelto 2026-08-20/21):** si `question` y `description` van
-  en un solo embedding combinado (mas contexto junto, mas simple) o separados (busqueda mas
-  precisa contra el titulo corto sin diluirse en el texto largo de reglas, pero duplica
-  vectores por market).
+- **Decidido 2026-08-20: `question` y `description` van COMBINADOS en un solo embedding**
+  (`f"{question}\n\n{description}"`), no separados. Razon: el proposito de este indice es
+  resolver texto libre -> `market_id`, y una pregunta tipica del usuario va a coincidir con
+  el tema del market (lo que ya esta en `question`, corto y semanticamente denso) mas que con
+  el vocabulario tecnico de las reglas de resolucion (`description`, mas largo). Separar en
+  dos embeddings arriesgaba que el vector de `description` compitiera/diluyera el ranking sin
+  aportar señal real, y duplicaba vectores por market sin necesidad -- combinado, `question`
+  sigue dominando la señal semantica mientras `description` aporta contexto extra sin ser una
+  entidad separada que mantener. Mantiene el diseño de `chunk_registry` simple: sigue siendo
+  1 vector por `market_id`, no 2.
 
 ### Linkeo News/Comments -> market_id
 
@@ -576,6 +582,56 @@ aqui es logico (Fase 2 no comparte codigo/responsabilidad con Fase 1, se puede
 tocar sin riesgo de romper la cadena de ingesta), no temporal -- no hay delay
 agendado ni cron aparte. Fase 2 corre despues del envio del correo (ultimo paso,
 no bloquea nada previo), pero en la misma corrida de la cadena.
+
+**Arquitectura de Lambdas de Fase 2, decidida 2026-08-20, revisada el mismo dia a
+4 niveles -- aislamiento por fuente, por modelo, Y por store, no una Lambda por
+combinacion completa.** Explicitamente rechazado: 1 Lambda por cada una de las 6
+combinaciones de corpus (2 chunking x 3 embedding) -- cada una repetiria la lectura
+de las 4 fuentes de S3 sin ganar aislamiento real (un fallo leyendo News no se
+aisla mejor por tener 6 Lambdas leyendolo igual). En vez de eso, aislamiento por
+los ejes que realmente varian:
+
+1. **`poly-rag-embed-orchestrator`** (Lambda mama) -- invocada por `send_digest`
+   al terminar (ver trigger arriba). Dispara las 5 Lambdas de chunking en
+   paralelo via `lambda.invoke()` asincrono, mismo patron de fan-out ya usado por
+   `ingest_news` para sus batches (ver seccion News arriba, "Batching").
+2. **5 Lambdas de chunking, una por fuente (no por combinacion):**
+   `chunk_registry`, `chunk_news_paragraph`, `chunk_news_article`,
+   `chunk_comments`, `chunk_digest`. Cada una lee su propia fuente de S3
+   (registry, `news/YYYY-MM-DD/HH.json`, `comments/YYYY-MM-DD/HH.json`,
+   `digest/YYYY-MM-DD/HH.json`), produce chunks de texto, escribe a su propio
+   prefijo S3 (ej. `chunks/news_paragraph/<cycle>.json`). Terminan
+   independientemente entre si -- un fallo en `chunk_news_article` no bloquea ni
+   se entera `chunk_comments`. Las dos variantes de News NO son alternativas
+   donde se elige una -- ambas corren siempre, en paralelo, cada una produciendo
+   su propio conjunto de chunks.
+3. **Paso de merge + 6 Lambdas de embedding, SOLO texto -> vector, store-agnostic**
+   (mismo patron que `merge_batch_payloads` de News) -- detecta cuando las 5
+   Lambdas de chunking terminaron, arma 2 corpus completos (`registry + comments
+   + digest + news_paragraph` vs. `registry + comments + digest +
+   news_article`), y dispara 3 Lambdas de embedding (`embed_titan`,
+   `embed_cohere`, `embed_voyage`) por cada uno de los 2 corpus -- 6 invocaciones
+   totales. **Deliberadamente NO escriben a ningun vector store directamente** --
+   cada una calcula sus vectores y los persiste a S3
+   (`vectors/<variante>/<modelo>.json`), igual que cualquier otra Lambda de
+   Fase 1 escribe su output a S3 antes que nada mas pase. Cada Lambda de
+   embedding aisla fallos por MODELO -- si Cohere esta caido o Voyage falla por
+   su API key, Titan sigue funcionando sin bloquearse.
+4. **Lambdas de escritura a store, separadas y desacopladas del calculo del
+   vector -- decision explicita 2026-08-20, ver tech_debt.md.** El paso de
+   "guardar el vector en un store" es la unica parte de Fase 2 que NO es
+   agnostica (cada store tiene su propia API/modelo de organizacion: namespaces
+   en Pinecone, collections en Qdrant, archivos Lance en S3 para LanceDB -- ver
+   tech_debt.md, "Vector Store Choice", para el detalle de cada uno). Aislarlo en
+   su propia Lambda (`write_to_pinecone` hoy; `write_to_qdrant`/
+   `write_to_lancedb` en Dia 6) significa que agregar un store nuevo es agregar
+   codigo nuevo, CERO cambios a las 3 Lambdas de embedding ya probadas -- y si el
+   store falla o se cambia de proveedor, los vectores ya calculados (el trabajo
+   caro) siguen intactos en S3, reintentar la escritura no repite el embedding.
+
+Consistente con el patron de cadena estricta ya establecido en Fase 1
+(`cycle_started_at` heredado en cada paso) -- aqui el fan-out es simplemente mas
+ancho (5 en paralelo, luego 6), no un mecanismo nuevo.
 
 **Modelo de embeddings, decidido 2026-08-20 (ver tech_debt.md, "Embedding Model
 Choice", para el pricing/disponibilidad verificados via AWS CLI real):** Amazon

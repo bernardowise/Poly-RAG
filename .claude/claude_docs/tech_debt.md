@@ -2338,6 +2338,35 @@ against Cohere v4.
 
 ---
 
+## Voyage AI Free Tier Spend Alert -- Pending, Not Designed (2026-08-20)
+
+**Issue:** Voyage AI (now owned by MongoDB, confirmed 2026-08-20, still has a standalone API
+separate from Atlas) offers a real free tier -- 200M tokens for general text models, 50M tokens
+specifically for `voyage-finance-2` (the domain-tuned model this project cares about, more than
+enough for the current ~5M-token News corpus). The user is adding a credit card to reach Usage
+Tier 1, which raises rate limits (confirmed via Voyage's real rate-limit docs, 2026-08-20 --
+Tier 1 limits are in the thousands of RPM / millions of TPM depending on model, not the
+restrictive no-card default) -- rate limiting is a non-issue for this project's bootstrap volume
+at Tier 1. But adding a card also means usage can silently start being billed once the 50M/200M
+free token allocation runs out, with no guardrail today -- that's the real open item, not rate
+limits.
+
+**Not yet designed:** an alert or hard stop on the `embed_voyage` Lambda (see the 3-level Fase 2
+Lambda architecture above) for when the Voyage free-tier token allocation is close to exhausted
+or exceeded. Needs a mechanism to track cumulative Voyage token usage against the 50M/200M free
+ceiling and either alert (email/CloudWatch) or hard-stop invocations before real spend starts --
+same spirit as the project's existing $10 AWS Budget Deny-policy guardrail, but for a
+non-AWS vendor with no equivalent automatic mechanism (Voyage's billing lives outside AWS
+Budgets entirely, so the existing guardrail doesn't cover it).
+
+**Explicitly deferred:** flagged by the user as a pending item to design later, not now -- do not
+design the actual mechanism (CloudWatch alarm vs. DynamoDB counter vs. Voyage's own dashboard
+alerts, if they have one) until Day 4 block F implementation actually begins.
+
+**Revisit when:** `embed_voyage` is actually being built.
+
+---
+
 ## Vector Store Choice (Day 4 block F, not yet decided, 2026-08-20)
 
 **Issue:** the embedding model is decided (Titan v2 default, Cohere v4 + Voyage as Day 6 A/B),
@@ -2427,3 +2456,50 @@ retrieval-quality comparison described above, without re-embedding anything.
 **Revisit when:** a starting store is picked (see the LanceDB/Qdrant leaning discussion above) --
 this sequencing note removes the earlier open question about whether the store axis explodes the
 combinatorial count; it doesn't, because it's a post-hoc clone, not a build-time multiplier.
+
+**Pinecone Starter plan limits, confirmed 2026-08-20 (account created, real pricing page):**
+- **Up to 5 indexes** -- directly relevant, since the project already committed to 6 corpus
+  indices (2 chunking methods x 3 embedding models, see the Day 6 combinatorial entry above).
+  6 > 5 on the Starter plan. Likely mitigation, not yet designed: use **namespaces** instead of
+  separate indexes (Starter allows up to 100 namespaces per index, free) -- i.e. 1 Pinecone
+  index with 6 namespaces (one per corpus variant) rather than 6 separate indexes. Changes how
+  the embedding Lambdas need to address Pinecone (namespace parameter per write/query, not a
+  different index endpoint), not yet reflected in the Lambda architecture design above.
+- **Write Units: up to 2M/month, Read Units: up to 1M/month.** Real formula confirmed 2026-08-20
+  (Pinecone's own docs): 1 WU per 1 KB of the full upsert payload (vector + ID + metadata), min 5
+  WU per request -- NOT per-vector or per-token, per KB of payload size. Rough estimate using
+  this project's real corpus numbers (News: 3,315 articles, mediana ~4,000 chars -> ~5-8
+  paragraphs each -> ~20-26K paragraph chunks vs. ~3,315 whole-article chunks; registry: ~767
+  markets; Comments/Digest: low hundreds): ~7 KB/chunk (1536-dim Titan vector ~6KB + metadata) ->
+  roughly 21K chunks x ~7 WU for each paragraph-chunked variant, ~4.3K chunks x ~7 WU for each
+  whole-article variant, summed across all 6 corpus variants -> **~530K WU estimated total for
+  the full bootstrap, well under the 2M/month ceiling (~4x headroom).** This is a rough estimate
+  with rounded numbers, not a measurement -- before trusting it for the real production
+  bootstrap, still worth an empirical dry run (a small real batch, check Pinecone's Console
+  Metrics dashboard) to confirm actual payload size with this project's real metadata, same
+  discipline already used for `scripts/backfill_odds_history.py`'s dry-run-before-write pattern.
+- Storage capped at 2GB, 1 project, up to 2 users -- not a blocker for a solo project at current
+  corpus size, noted for completeness only.
+
+**Revisit before running the bootstrap:** run a small empirical batch to confirm the ~7KB/chunk
+estimate against Pinecone's real Console Metrics before the full 6-variant bootstrap, and decide
+namespace-vs-index addressing before the embedding Lambdas are actually coded (affects their
+Pinecone client calls directly).
+
+**Clarified 2026-08-20: the 5-index-limit workaround is per-store, not a universal pattern to
+copy across Pinecone/Qdrant/LanceDB.** Each store organizes multi-tenancy differently -- this is
+a decision that lives inside each of the 3 embedding Lambdas' own store-client calls, not a
+shared architecture concept:
+- **Pinecone:** namespaces (as above) -- 1 index, 6 namespaces (`1a_titan`, `1a_cohere`,
+  `1a_voyage`, `1b_titan`, `1b_cohere`, `1b_voyage`).
+- **Qdrant:** the conceptual equivalent is **collections**, not namespaces -- either 1 collection
+  per variant, or 1 collection with a `variant` metadata field to filter. Whether Qdrant Cloud's
+  free tier caps the number of collections has NOT been checked -- needs verifying when Qdrant
+  integration is actually coded, not assumed to work like Pinecone's namespace model.
+- **LanceDB:** no account-level limit applies (it's an embedded library writing to S3, not a
+  multi-tenant cloud service) -- likely just 6 separate Lance tables/files in S3, constrained
+  only by S3 cost at this scale, not a hard cap like Pinecone/Qdrant.
+
+**Revisit when:** Qdrant and LanceDB integrations are actually coded (Day 6 store cloning) --
+confirm Qdrant's collection limits at that point, don't assume the Pinecone namespace pattern
+transfers as-is.
