@@ -430,11 +430,95 @@ del camino de estado estable, mismo patron que tuvo el bootstrap del registry. E
 costo recurrente de embedding lo domina News (~5M tokens acumulados y creciendo
 ~700 articulos/ciclo), no Comments (~261K tokens totales, y de crecimiento lento).
 
-**Decisiones abiertas (Dia 4):** estrategia de chunking (articulos son largos y
-necesitan split; comentarios son demasiado cortos para embeder individualmente),
-modelo de embeddings, y vector store -- candidatos en evaluacion: FAISS/numpy en S3
-cargado en memoria de Lambda, ChromaDB, Databricks Vector Search. OpenSearch
-Serverless descartado por costo (~$700/mes, incompatible con el budget).
+**Chunking de News, cerrado 2026-08-20 (ver tech_debt.md, Dia 6, para las alternativas
+diferidas a A/B test):** unidad de embedding = parrafo (split de `body_text` por parrafo,
+no por tamano fijo de tokens ni por articulo completo). Mecanismo de "vecino" = indice de
+parrafo, no deteccion semantica ni por oracion -- dado un chunk con `paragraph_index = i`
+del mismo `article_id`, el vecino anterior/siguiente es una consulta directa por
+`paragraph_index` +/- 1, sin re-parsear texto. Al momento de retrieval, la busqueda
+semantica ocurre a nivel parrafo (precision), pero el contexto devuelto al LLM es el
+parrafo ganador MAS sus vecinos inmediatos (parent-child retrieval) -- no el articulo
+completo, para mantener costo de tokens acotado sin importar el largo del articulo
+(mediana ~4,000 chars, maximo 240K chars).
+
+**Metadata por chunk:**
+- Heredado del articulo padre (identico en todos los chunks de un mismo articulo):
+  `market_id`, `temporal_tier`, `market_status_at_publish`, `pubDate`, `source` (outlet),
+  y `article_id` -- decision 2026-08-20: se usa la `url` del articulo como `article_id`,
+  no un id sintetico nuevo, porque ya es unica por diseno (es la misma dedup key de
+  `poly-rag-processed-urls`) y no requiere mantener un mapeo articulo->id aparte.
+- Propio del chunk: `chunk_id` (`{article_id}#{paragraph_index}`), `paragraph_index`
+  (0-indexed), `paragraph_count` (total de parrafos del articulo, para saber si el chunk
+  es el primero/ultimo y no tiene vecino de ese lado), y el texto del parrafo (lo que se
+  embede).
+
+**Chunking de Comments, cerrado 2026-08-20:** demasiado cortos para embeder
+individualmente (mediana 44 chars, 47% bajo 40 chars). Unidad de chunk = comentarios
+del mismo `link_type` concatenados hasta un tope de tokens (overflow a multiples
+chunks igual que un articulo largo de News), NUNCA por ventana de tiempo abierta
+(rechazado -- un chunk que sigue creciendo cada ciclo mientras el market este abierto
+rompe el patron "solo lo nuevo, nunca re-embedear", mismo problema que ya tuvo el
+read-modify-write de `odds/<market_id>.json`). La unidad depende de `link_type`, no es
+uniforme:
+
+```
+if link_type == "direct":
+    unidad de chunk = market_id           # 1:1 real, nada que compartir
+elif link_type in ("shared_event", "shared_series"):
+    unidad de chunk = comment_entity_id   # 1 solo stream para TODOS los markets
+                                           # que comparten esa entidad
+```
+
+**Por que por entidad y no por market en los casos compartidos:** un comment
+`shared_series` puede aplicar a hasta 49 `market_ids` (dato real del corpus, ver
+seccion Comments arriba) -- chunkear por market_id habria significado re-embeder el
+mismo texto hasta 49 veces por el mismo contenido. En vez de eso, el chunk vive UNA
+sola vez anclado a la entidad compartida (Event o Series), y los markets que la
+comparten simplemente apuntan al mismo chunk -- sin duplicar embedding, storage, ni
+arriesgar que dos markets terminen leyendo copias distintas del mismo stream.
+
+**Indice reusado, no nuevo:** el lookup `market_id -> comment_entity_id` ya existe --
+es el mismo campo `comment_entity_type`/`comment_entity_id` que `ingest_polymarket`
+ya escribe en el registry (ver seccion Comments arriba), sin LLM, extraido de
+`events[]` en la respuesta de la Gamma API. El retrieval, dado un `market_id`, hace
+lookup de su `comment_entity_id` en el registry y busca chunks por esa entidad --
+no requiere una tabla de indexacion nueva.
+
+**Tres streams resultantes, mismo mecanismo para el bootstrap one-off y el
+incremental por ciclo** (unico cambio entre ambos: el alcance de comentarios que
+entra -- todo el historico vs. solo lo nuevo del ciclo, mismo patron ya usado en
+bootstrap del registry/odds vs. estado estable):
+- `comments_direct` -- 1 chunk por `market_id` (+overflow si excede el tope de tokens)
+- `comments_shared_event` -- 1 chunk por `comment_entity_id` tipo Event
+- `comments_shared_series` -- 1 chunk por `comment_entity_id` tipo Series
+
+**Metadata por chunk:** `link_type`, `comment_entity_type`, `comment_entity_id` (o
+`market_id` en el caso `direct`), `cycle_started_at` (o rango de ciclos si el chunk
+viene del bootstrap one-off), `chunk_id` (`{comment_entity_id o market_id}#{ciclo}`),
+texto = comentarios concatenados de esa unidad para ese alcance.
+
+**Fase de embedding, desacoplada de la cadena de ingesta (decision 2026-08-20):**
+corrige la nota anterior de este documento que decia "el embedding tiene que ser...
+automatizado dentro de la cadena de ingestion" -- eso queda OBSOLETO. El proyecto
+tiene dos fases separadas: Fase 1 = ingesta (EventBridge -> polymarket -> news ->
+comments -> digest, sin cambios en su logica de negocio), Fase 2 = embedding
+(proceso independiente que lee lo que Fase 1 ya escribio en S3, nunca modifica
+Fase 1).
+
+**Trigger de Fase 2, decidido 2026-08-20: encadenado, ultimo eslabon de la cadena
+existente.** `send_digest` invoca Fase 2 al terminar, mismo mecanismo
+(`lambda.invoke()`, `cycle_started_at` heredado) que ya usa cada eslabon de la
+cadena hoy (polymarket -> news -> comments -> digest) -- la cadena simplemente
+crece un eslabon mas (digest -> embedding), no un mecanismo nuevo. "Desacoplado"
+aqui es logico (Fase 2 no comparte codigo/responsabilidad con Fase 1, se puede
+tocar sin riesgo de romper la cadena de ingesta), no temporal -- no hay delay
+agendado ni cron aparte. Fase 2 corre despues del envio del correo (ultimo paso,
+no bloquea nada previo), pero en la misma corrida de la cadena.
+
+**Decisiones abiertas (Dia 4):** modelo de embeddings, y vector store -- candidatos
+en evaluacion: FAISS/numpy en S3 cargado en memoria de Lambda, ChromaDB, Databricks
+Vector Search. OpenSearch Serverless descartado por costo (~$700/mes, incompatible
+con el budget).
 
 ### Verificado en produccion
 

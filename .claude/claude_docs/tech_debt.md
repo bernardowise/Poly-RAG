@@ -2060,3 +2060,74 @@ fixed then -- this entry is closed as "good enough MVP," not reopened for polish
 
 **Revisit if:** a real fidelity/rendering bug is reported in a live _digest email, or Day 4/5
 retrieval work reveals the schema itself (not just the email rendering) needs different fields.
+
+---
+
+## Guardrails Against Unbounded Structured Queries (Day 5, not yet designed)
+
+**Issue:** the odds retrieval design (Day 4 block E, see architecture_canon.md "Retrieval")
+treats odds as deterministic filter/aggregation, not semantic search -- F1-F5 all assume a
+selective filter (`market_id`, a bounded time range, `source`) that lets partitioning/indexing
+keep the query cheap regardless of how large the underlying corpus grows. That guarantee holds
+only if every query is actually selective. When Day 5's synthesis agent starts translating a
+user's natural-language question into one of these structured queries (prompt/context
+engineering, deciding which F-path and which filters to apply), nothing yet stops it from
+generating the equivalent of a full scan -- e.g. no market_id and no date bound, effectively
+SELECT * across every market's entire history.
+
+**Debt:** at current corpus size (hundreds of markets, tens of thousands of snapshots) an
+unbounded query is just slow/wasteful, not dangerous. But the whole point of designing odds as
+partition-friendly (see the petabyte-scale discussion, 2026-08-20 -- worth archiving to
+knowledge.md too) is that cost stays proportional to the answer, not the table. An LLM-generated
+query path can silently defeat that if nothing enforces selectivity, and the failure mode gets
+worse exactly as the corpus grows, not better.
+
+**Mitigation (not yet designed, flagged for Day 5):** when prompt/context engineering for the
+synthesis agent is built, it needs an explicit guardrail layer that rejects or rewrites
+structured queries lacking a bounded filter -- e.g. require at least one of market_id or a
+capped date range before a query is allowed to execute, same spirit as the project's existing
+cost guardrails (AWS Budget Deny policy, USE_LLM_ENRICHMENT toggles) but applied to query shape
+instead of spend. Not designed yet -- no schema, no enforcement point (agent-side prompt
+constraint vs. a query-layer validator) decided. Explicitly out of scope for Day 4 (retrieval
+design itself), scoped to Day 5 (synthesis agent) per user, 2026-08-20.
+
+**Revisit when:** Day 5 synthesis agent design begins and the structured-query path (F1-F5) gets
+an actual query-generation mechanism, not just the conceptual F1-F5 taxonomy that exists today.
+
+---
+
+## Day 6: A/B Tests Deferred From Day 4/5 Design Decisions (new day added 2026-08-20)
+
+**Issue:** several Day 4/5 design choices are being made as a single default path now (paragraph
+chunking, digest-as-Capa-0), not because they're proven best, but because measuring every
+alternative before building anything would stall the project -- consistent with this project's
+own "measure, don't guess" discipline, but that discipline needs an actual measurement point,
+not just a decision point. Day 6 is that point: a dedicated backlog of A/B tests against the
+defaults chosen today, run once the pipeline (Day 4 retrieval + Day 5 synthesis agent) exists
+end-to-end and can produce comparable output for the same query under different configurations.
+
+**Backlog, collected as decisions were made:**
+1. **News chunking granularity -- paragraph+neighbors (chosen 2026-08-20) vs. whole-article
+   chunk.** Today's path: split News articles by paragraph for embedding/search precision, but
+   return the winning paragraph plus its immediate neighbors (prev+next) as LLM context, not the
+   whole article -- bounded token cost regardless of article length (see architecture_canon.md,
+   "Retrieval" section once updated). Deferred alternative: skip chunking entirely, embed each
+   article as one unit (median ~1,000 tokens, so it fits most context windows whole) -- better
+   context in the common case, worse semantic precision for multi-topic articles, and unbounded-
+   ish token cost on the ~240K-char outliers. User's own framing: measure retrieval quality with
+   and without the digest (Capa 0) layer, AND paragraph-chunk vs. whole-article chunk, as
+   related-but-separate axes of the same evaluation, once there's a real query interface to
+   measure against.
+2. **Capa 0 (digest-as-retrieval-layer) on vs. off** -- already flagged in the "Bespoke Digest
+   Redesign" / "Digest Fidelity Audit" entries above (behind `USE_DIGEST_LAYER`, same isolation
+   pattern as `USE_LLM_ENRICHMENT`), folded into this same Day 6 backlog rather than a separate
+   evaluation pass, since the user wants both axes measured together, not sequentially.
+
+**Explicitly not decided yet:** the evaluation metric(s) themselves (retrieval precision/recall,
+answer quality via LLM-as-judge, latency, cost per query, some combination) -- that's Day 4 block
+H's job (real evaluation with real metrics), which Day 6 depends on and reuses, not a parallel
+metric design.
+
+**Revisit when:** Day 4 (retrieval) and Day 5 (synthesis agent) are both functional end-to-end,
+so a real query can be run under each configuration and compared -- not before, since there's
+nothing to A/B test against yet.
