@@ -2096,38 +2096,334 @@ an actual query-generation mechanism, not just the conceptual F1-F5 taxonomy tha
 
 ---
 
-## Day 6: A/B Tests Deferred From Day 4/5 Design Decisions (new day added 2026-08-20)
+## Day 6: A/B Tests as a Live, User-Facing Feature -- 4 Corpus Indices x Query-Time Capa 0 Toggle (revised 2026-08-20)
 
-**Issue:** several Day 4/5 design choices are being made as a single default path now (paragraph
-chunking, digest-as-Capa-0), not because they're proven best, but because measuring every
-alternative before building anything would stall the project -- consistent with this project's
-own "measure, don't guess" discipline, but that discipline needs an actual measurement point,
-not just a decision point. Day 6 is that point: a dedicated backlog of A/B tests against the
-defaults chosen today, run once the pipeline (Day 4 retrieval + Day 5 synthesis agent) exists
-end-to-end and can produce comparable output for the same query under different configurations.
+**Reframed 2026-08-20, changes the design, not just the backlog.** Originally scoped as a
+deferred measurement pass ("decide a default now, A/B it later"). The user clarified the real
+target audience for this portfolio project (Pienza's successor): not primarily the trader
+end-user, but **technical recruiters/interviewers who will interact with the RAG directly** --
+the demonstrated design/evaluation PROCESS is the actual product, not a single optimized answer
+path. Explicit user framing: "el chiste no es demostrar el chatbot funcionando... sino que es mas
+importante ver el proceso creativo," imagining the same question run across all 8 combinations
+with visible per-combination metrics side by side. Budget stance, also explicit: "si este dinero
+saliera de mi bolsa no lo haria... dado que estamos en el free tier de 160 usd, vamos probando" --
+deliberately spending the promotional credit buffer on this, accepting that hitting a spend
+guardrail is itself useful signal, not a failure to avoid.
 
-**Backlog, collected as decisions were made:**
-1. **News chunking granularity -- paragraph+neighbors (chosen 2026-08-20) vs. whole-article
-   chunk.** Today's path: split News articles by paragraph for embedding/search precision, but
-   return the winning paragraph plus its immediate neighbors (prev+next) as LLM context, not the
-   whole article -- bounded token cost regardless of article length (see architecture_canon.md,
-   "Retrieval" section once updated). Deferred alternative: skip chunking entirely, embed each
-   article as one unit (median ~1,000 tokens, so it fits most context windows whole) -- better
-   context in the common case, worse semantic precision for multi-topic articles, and unbounded-
-   ish token cost on the ~240K-char outliers. User's own framing: measure retrieval quality with
-   and without the digest (Capa 0) layer, AND paragraph-chunk vs. whole-article chunk, as
-   related-but-separate axes of the same evaluation, once there's a real query interface to
-   measure against.
-2. **Capa 0 (digest-as-retrieval-layer) on vs. off** -- already flagged in the "Bespoke Digest
-   Redesign" / "Digest Fidelity Audit" entries above (behind `USE_DIGEST_LAYER`, same isolation
-   pattern as `USE_LLM_ENRICHMENT`), folded into this same Day 6 backlog rather than a separate
-   evaluation pass, since the user wants both axes measured together, not sequentially.
+**Consequence: this is no longer a deferred backlog -- it's a day-1 requirement for blocks F/G/H.**
+Three independent binary toggles, full combinatorial (2^3 = 8), each user-selectable (frontend
+toggle target, not just an internal eval script):
+
+- **Axis 1 -- corpus variant, named after the one source that actually differs between them:**
+  1A = full corpus (News chunked paragraph+neighbors, PLUS Comments, Digest, and the
+  question/description registry index unchanged) vs. 1B = full corpus (News chunked as
+  whole-article instead, everything else identical to 1A). Comments, Digest, and the registry
+  semantic index each have exactly ONE chunking method (see architecture_canon.md) -- they don't
+  branch inside axis 1, they just travel unchanged inside both 1A and 1B. Axis 1 is a corpus-level
+  label, not a per-source toggle -- resolved explicitly 2026-08-20 after initial confusion trying
+  to fold Comments/Digest into a chunking axis they don't have.
+- **Axis 2 -- Capa 0, NOT part of the combinatorial below, applied at query time instead:**
+  2A digest-as-retrieval-layer on vs. 2B off (straight to deep odds/news/comments retrieval).
+  Behind `USE_DIGEST_LAYER`, same isolation pattern as `USE_LLM_ENRICHMENT`. Confirmed 2026-08-20:
+  this toggle doesn't change what's stored in the vector store, only whether retrieval consults
+  the Digest index first -- it applies on top of whichever of the 4 corpus indices (below) answers
+  a query, not as a 5th build-time axis.
+- **Axis 3 -- embedding model, widened 2026-08-20 from binary to 3-way:** 3A Titan v2 (shipped
+  default, zero friction, already authorized), 3B Cohere Embed v4 (verified real pricing ~$0.12/M
+  input tokens, ~6x Titan), 3C **Voyage AI** (`voyage-finance-2`, Anthropic's recommended
+  embeddings partner, tuned specifically for finance/news -- a good domain fit for Poly-RAG's
+  actual content). Voyage was originally excluded from the Day 4 block F comparison for requiring
+  an external API key outside AWS IAM -- the user pointed out 2026-08-20 that this exclusion was
+  an inferred pattern, not an actual project rule (CLAUDE.md has no stated IAM-only requirement;
+  it emerged from every other credential in the project happening to be AWS-native, not from a
+  deliberate decision to avoid external secrets). Re-added on that basis. Concrete new
+  requirement this creates, not yet designed: Voyage needs an API key stored somewhere (Secrets
+  Manager, or a Lambda env var) -- the project currently has zero live secrets (the old Bluesky
+  credentials are dead), so this would be the first one, and needs its own storage/injection
+  design before Voyage can actually be tested, not just listed as a candidate. Bifurcating this
+  axis for real means storing THREE full parallel embedded copies of the corpus (Titan, Cohere,
+  and Voyage-embedded), not just a code branch, since vector similarity only makes sense within
+  one embedding space.
+
+**Actual build-time combinatorial: 2x3 = 6 corpus indices (axis 1 x axis 3), not 2^3 = 8, not
+2x2 = 4 anymore either.** Axis 2 (Capa 0) is a query-time flag applied on top of any of the 6,
+not a build-time multiplier:
+
+```
+1A3A -- full corpus (News paragraph+neighbors + Comments + Digest + registry), Titan-embedded
+1A3B -- same corpus,                                                            Cohere-embedded
+1A3C -- same corpus,                                                            Voyage-embedded
+1B3A -- full corpus (News whole-article  + Comments + Digest + registry),      Titan-embedded
+1B3B -- same corpus,                                                            Cohere-embedded
+1B3C -- same corpus,                                                            Voyage-embedded
+```
+
+Each of the 6 indices can then be queried with Capa 0 on or off (axis 2) -- giving 12 answerable
+configurations at query time, but only 6 things to actually build/store in the vector store.
+
+**Design implications this forces on blocks F/G/H (not deferred, needed for the 8-way comparison
+to exist at all):**
+- Block F (vector store): must hold both embedding spaces (Titan + Cohere) from day one, not add
+  a second index later as an afterthought.
+- Block G (retrieval function): must accept all 3 toggles as parameters from the start, so a
+  single query can be run through all 8 configurations and return 8 comparable results, not one.
+- Block H (evaluation): must produce metrics PER combination, not one aggregate score -- the
+  side-by-side comparison view (same question, 8 answers, 8 metric sets) is itself part of the
+  product surface, not an internal debugging artifact.
+
+**Cost/latency must also be tracked PER SOURCE, not just per corpus index (2026-08-20).**
+Explicit user requirement: even though the 4 corpus indices are each built from the full corpus
+as one unit (registry + News + Comments + Digest all feeding the same Titan or Cohere embedding
+pass), every individual embedding call must log which source it came from --
+`source: "registry" | "news_paragraph" | "news_article" | "comments" | "digest"` -- alongside
+`embedding_model` (titan_v2 / cohere_v4), `tokens_in`, `latency_ms`, and `estimated_cost_usd`.
+
+**New table, not reused: `poly-rag-embedding-metrics` (decided 2026-08-20), separate from
+`poly-rag-architecture-metrics`.** The existing metrics table has one row shape for the 4
+ingestion Lambdas (Fase 1); forcing embedding rows (with their own `source`/`embedding_model`
+fields, N rows per Fase 2 invocation instead of 1) into that same table would mix two different
+row shapes and make the existing table harder to query cleanly. A dedicated table keeps Fase 2
+as cleanly separated at the data layer as it already is at the code/trigger layer (see "Fase de
+embedding, desacoplada de la cadena de ingesta" in architecture_canon.md). Same infra pattern as
+every other project table: pay-per-request, PITR enabled, added via Terraform when block F is
+built -- not created ad hoc.
+
+Without this, there's no way to later answer "how much did embedding Comments cost with Cohere
+vs. Titan" without re-deriving it from an aggregate that already mixed all 4 sources together.
+This is a Block F requirement regardless of whether the project ends up shipping with only Titan
+in production -- the per-source breakdown is what makes the Day 6 comparison legible, not an
+optional nice-to-have metric.
+
+**Experimental design note, resolved:** considered vary-one-axis-at-a-time (4 runs against a
+baseline) as cheaper and sufficient absent suspected interaction between axes -- user does not
+suspect real interaction, but wants the full cube anyway because the demonstration value (a
+recruiter freely toggling any combination) matters more here than experimental minimalism. Not a
+scientific-rigor decision -- a portfolio-product decision.
+
+**Cost guardrail still applies unchanged:** the existing $10 Deny-policy guardrail (see CLAUDE.md)
+remains the backstop if the 2x embedding storage + 8-way eval runs spend faster than expected --
+explicitly accepted as "useful information," not a scenario to design around defensively.
 
 **Explicitly not decided yet:** the evaluation metric(s) themselves (retrieval precision/recall,
-answer quality via LLM-as-judge, latency, cost per query, some combination) -- that's Day 4 block
-H's job (real evaluation with real metrics), which Day 6 depends on and reuses, not a parallel
-metric design.
+answer quality via LLM-as-judge, latency, cost per query, some combination -- see "RAG Evaluation
+Metrics Landscape" entry above for the Ragas/RAG-Triad option) -- that's still Day 4 block H's
+job, which this reframing depends on more directly now, not less.
 
-**Revisit when:** Day 4 (retrieval) and Day 5 (synthesis agent) are both functional end-to-end,
-so a real query can be run under each configuration and compared -- not before, since there's
-nothing to A/B test against yet.
+**Revisit when:** Day 4 block F (vector store) design begins -- the dual-embedding-space
+requirement needs to be in the initial schema, not retrofitted.
+
+---
+
+## RAG Evaluation Metrics Landscape (for Day 5 block H, sourced from Chip Huyen's book, 2026-08-20)
+
+**Issue:** Day 4 block H (real evaluation with real metrics) and the Day 6 A/B test backlog above
+both assume some evaluation method exists, but nothing concrete has been chosen yet -- prior
+entries only say "LLM-as-judge" generically. While reading the relevant chapter of Chip Huyen's
+*AI Engineering* (this project's primary reference, see CLAUDE.md), the user surfaced a
+chronological map of what actually superseded BERTScore (2019, embedding-similarity baseline) as
+the field's evaluation approach, worth archiving here so Day 5 doesn't reinvent this research from
+scratch. Not yet decided which of these Poly-RAG will actually use -- this entry is the landscape,
+not a decision.
+
+**2020-2022, models trained against human judgment (not just embedding similarity):**
+- **BLEURT** (Google) -- BERT-based, pretrained on millions of artificially corrupted sentences
+  (typos, deletions, negations) and calibrated directly against human ratings.
+- **COMET** -- the de facto standard for machine translation quality, combines source text +
+  model output + human reference.
+
+**2022-2023, NLI-based models (moved from measuring similarity to measuring logical
+contradiction):**
+- **SummaC** (2022) -- NLI-based metric built specifically to catch hallucination in document
+  summarization.
+- **AlignScore** (2023) -- trained across 7 distinct logical-inference tasks to verify factual
+  consistency (detects when a candidate asserts something not present in the source).
+
+**2023-2025, LLM-as-judge:**
+- **G-Eval** (2023) -- uses GPT-4 with chain-of-thought reasoning, weights token probabilities to
+  assign a 1-5 score against a detailed rubric.
+- **Prometheus 2** (2024) -- best-known open-source model (7B/8x7B) trained specifically to judge
+  other LLMs' quality/format/accuracy.
+
+**2024-2025, RAG-specific frameworks -- most directly relevant to Poly-RAG's Day 5 block:**
+- **Ragas / DeepEval / TruLens** -- don't rely on one metric, evaluate the **RAG Triad**:
+  - **Faithfulness (groundedness):** does the answer come 100% from the retrieved chunks, or did
+    the model hallucinate beyond them?
+  - **Answer relevance:** did it actually answer the user's question?
+  - **Context precision/recall:** did the retriever pull the right chunks in the first place?
+
+**Why this matters for Poly-RAG specifically:** the RAG Triad separates retrieval quality
+(context precision/recall) from generation quality (faithfulness, answer relevance) -- directly
+useful for the Day 6 A/B backlog above (paragraph-vs-whole-article chunking, Capa 0 on/off),
+since those changes affect retrieval, not generation, and a metric that conflates the two would
+hide which layer actually caused a quality change.
+
+**Not decided:** whether Poly-RAG adopts one of these frameworks (Ragas is the most commonly
+cited for production RAG) or builds a narrower custom LLM-as-judge pass using Bedrock (consistent
+with the project's existing all-Bedrock-via-IAM pattern, avoiding a new external dependency).
+
+**Revisit when:** Day 5 synthesis agent design begins and Day 4 block H (evaluation) needs an
+actual method, not just this landscape.
+
+---
+
+## Embedding Model Choice (Day 4 block F, DECIDED 2026-08-20 -- Titan v2 shipped, 3-way A/B vs Cohere v4 and Voyage in Day 6)
+
+**Issue:** chunking (block E) is closed for all 3 sources, but nothing has been chosen yet for
+turning chunk text into vectors -- that choice is separate from the vector store (which only
+stores/searches vectors already produced, see knowledge.md if archived). Four candidates on the
+table, not yet verified against real AWS/Bedrock docs -- treat every pricing/quality claim below
+as a starting point to confirm, not a decided fact:
+
+1. **Cohere Embed v3 via Bedrock** (`cohere.embed-english-v3` or multilingual) -- claimed to
+   outperform Titan on financial/political news retrieval, and to expose an explicit
+   `input_type` param (`search_document` vs `search_query`) that could meaningfully improve hit
+   rate. Same IAM/billing pattern as the rest of the project (no new API key) IF it's actually
+   available in us-east-1 -- unverified as of 2026-08-20.
+2. **Amazon Titan Embeddings v2** (`amazon.titan-embed-text-v2:0`) -- simplest, most consistent
+   with the rest of the stack (same pattern as Claude Sonnet 4.5 via Bedrock), claimed cheapest
+   (~$0.02/M tokens) and supports configurable output dimensions (256/512/1024) to trade
+   precision for storage. Claimed weaker semantic precision on niche domains (crypto, fine-
+   grained political probabilities) -- exactly Poly-RAG's actual content, so this tradeoff
+   matters more here than in a generic use case, if the claim holds up.
+3. **Self-hosted in Lambda via fastembed (ONNX/Rust, not PyTorch)**, e.g.
+   `BAAI/bge-small-en-v1.5` -- claimed ~30MB package (fits Lambda's 250MB limit, unlike
+   sentence-transformers+torch which reportedly exceeds it), sub-100ms cold start, zero
+   marginal cost per call. Only self-hosted path considered viable given the project's Lambda-
+   only compute constraint (CLAUDE.md explicitly avoids always-on compute).
+4. **Voyage AI** (`voyage-3-lite` or `voyage-finance-2`, the latter finance-news-tuned) --
+   Anthropic's recommended embeddings partner. Requires an external API key outside AWS, which
+   breaks the project's established IAM-only/no-new-secrets pattern (same reasoning that already
+   ruled out separate API keys for Claude itself) -- would need a strong quality justification to
+   accept that tradeoff.
+
+**What matters most for Poly-RAG specifically, given the project's own constraints:** (a) IAM-
+consistent auth/billing is an explicit existing value, ruling out Voyage unless quality gain is
+large; (b) real $5/month budget with ~5M accumulated News tokens and growing means per-token
+embedding cost matters more here than it did for the one-off executive_summary call -- favors
+Titan or self-hosted; (c) fastembed/ONNX is the only viable self-hosted path given Lambda-only
+compute (plain sentence-transformers+torch would blow both the package-size and cold-start
+budgets the project has already had to tune around, e.g. News's 900s timeout).
+
+**Verified 2026-08-20, real AWS CLI queries against this account/region (not invoking any
+model -- `list-foundation-models`, `get-foundation-model`,
+`list-foundation-model-agreement-offers`, `get-foundation-model-availability`, all read-only):**
+
+| Model | Region availability | Account authorization | Real input pricing (USE1) |
+|---|---|---|---|
+| `amazon.titan-embed-text-v2:0` | AVAILABLE | AUTHORIZED, no agreement required | not returned by API (no agreement gate at all) but known ~$0.02/M tokens |
+| `cohere.embed-english-v3` | AVAILABLE | AUTHORIZED, but marketplace agreement `NOT_AVAILABLE` -- needs an extra acceptance step before it can be invoked | $0.10/M input tokens (confirmed real) |
+| `cohere.embed-v4:0` | AVAILABLE (also supports IMAGE input, life-of-model since 2025-10-02, newer than v3) | not individually checked, same Cohere agreement gate expected | $0.12/M input tokens (confirmed real) |
+
+The `input_type` (search_document/search_query) claim was NOT verifiable via CLI -- it lives in
+the invocation payload format, not the model catalog, so it can only be confirmed by reading
+Cohere's Bedrock invocation docs or a real test call. Still unconfirmed.
+
+**Decision, 2026-08-20:** ship with **Titan Embeddings v2** now -- zero friction (already
+authorized, no agreement to accept), consistent with the project's existing all-Bedrock-via-IAM
+pattern, and cheap at current corpus size (~5M News tokens accumulated: Titan bootstrap cost is
+roughly $0.10 total vs. Cohere v3's ~$0.50, not dramatic today but scales worse if the corpus
+grows 10x). The claimed weaker semantic precision on niche domains (crypto, fine-grained
+political odds) is accepted as an open risk, not resolved -- exactly what the Day 6 A/B test
+below exists to measure instead of guessing.
+
+**Day 6 backlog, new item added:** A/B test Titan v2 vs. **Cohere Embed v4** (not v3 -- v4 is
+Cohere's current model, no reason to benchmark against their prior generation) once Day 4/5 have
+a real query interface to compare against. Folded into the same Day 6 evaluation pass as the
+paragraph-vs-whole-article chunking and Capa 0 on/off axes (see the Day 6 entry above) -- same
+reasoning: measure real quality difference before paying the 5-6x cost premium, rather than
+deciding off spec sheets.
+
+**Revisit when:** Day 6 evaluation work begins and there's a real query interface to A/B Titan
+against Cohere v4.
+
+---
+
+## Vector Store Choice (Day 4 block F, not yet decided, 2026-08-20)
+
+**Issue:** the embedding model is decided (Titan v2 default, Cohere v4 + Voyage as Day 6 A/B),
+chunking is closed for all 4 sources, but nothing has been chosen for WHERE the resulting vectors
+actually get stored and searched. OpenSearch Serverless was already ruled out long ago
+(~$700/month, incompatible with the project's budget, see architecture_canon.md). Four real
+candidates on the table as of 2026-08-20, none of the specific claims below verified against
+real docs yet -- same discipline as the embedding-model landscape entry above, treat as a
+starting point to confirm, not a decided fact:
+
+1. **LanceDB, stored directly in S3** -- an embedded vector library (runs inside the Lambda
+   process, no external service) that writes its index in the Lance columnar format, claimed to
+   be append-only-friendly: new chunks land as new fragment files in S3 rather than triggering a
+   full index rewrite. If the claim holds, this directly fixes the read-modify-write problem that
+   has already bitten this project twice for real (odds snapshots, News batch files) -- growing
+   the index would no longer mean reading the whole thing into Lambda memory, appending, and
+   rewriting. Zero new accounts, zero new secrets, cost is S3 storage only. Open question, not yet
+   verified: packaging `lancedb` into a Lambda (Layer or Docker image) given the project's
+   already-tuned Lambda limits (e.g. News's 900s timeout, existing package-size constraints).
+2. **Qdrant** (managed cloud, free tier: a permanent 1GB cluster, or self-hostable) -- Rust-based,
+   claimed sub-10ms latency, and specifically optimized for inline metadata filtering during HNSW
+   graph traversal rather than filtering results after the vector search runs. This matches
+   Poly-RAG's actual retrieval pattern directly: every query already starts with a structured
+   filter (`market_id`, `temporal_tier`, `link_type`) before any semantic search happens (see the
+   F1-F5 odds design and the News/Comments chunk metadata above) -- a store built around
+   filter-during-search, not filter-after, fits that shape better than a generic vector DB would.
+   Requires an external account + API key (real but trivial setup cost, same as setting up SES or
+   an S3 bucket the first time -- not the friction the project first assumed for Voyage AI either,
+   see "Embedding Model Choice" entry above).
+3. **Pinecone** (managed cloud, serverless free tier) -- the most widely recognized vector DB,
+   simplest SDK, but its filtering is post-search rather than inline like Qdrant's, which fits
+   this project's filter-first retrieval pattern less precisely. Same external-account/API-key
+   setup cost as Qdrant, without Qdrant's filtering advantage for this specific use case.
+4. **Databricks Vector Search** -- would connect Delta Lake/Unity Catalog (already built in Day 3,
+   currently an isolated exploration layer, never invoked from the live pipeline) to the real
+   retrieval path for the first time -- the strongest portfolio narrative of the four (same data,
+   two cloud platforms, a real cross-platform design decision to defend in an interview). Also
+   introduces real cross-cloud latency (AWS Lambda invoking Databricks) and a new AWS<->Databricks
+   auth path that doesn't exist today (all Databricks access so far has been notebook-side,
+   read-only exploration).
+   **Verified 2026-08-20: Free Edition DOES support Vector Search** (branded Mosaic AI Vector
+   Search / Databricks AI Search), but with a concrete hard limit -- **only 1 active vector search
+   endpoint per account at a time**, plus small/shared compute under a fair-use policy, and no
+   support for advanced online tables or commercial use. This is a likely disqualifying constraint
+   for THIS project's specific Day 6 design: 6 corpus indices (2 chunking methods x 3 embedding
+   models) need to be queryable side-by-side for the recruiter-facing comparison, and it's not
+   confirmed whether Databricks allows multiple named indices under a single endpoint (which would
+   route around the limit) or whether the limit caps the whole use case at 1 index total. Needs
+   this specific question answered -- not just "does Free Edition support Vector Search" -- before
+   Databricks can be seriously compared against the other three for Day 6's actual requirement.
+
+**Databricks Vector Search ruled out, 2026-08-20.** Verified support exists in Free Edition, but
+the 1-endpoint-per-account limit is a real blocker for this project's specific Day 6 shape (6
+corpus indices need to be queryable side-by-side) -- not worth pursuing further given the other
+three candidates have no equivalent hard cap.
+
+**Initially considered rejecting a 3-way parallel build (Pinecone/Qdrant/LanceDB) as overkill,
+then REVERSED, 2026-08-20 -- this IS the point, not scope creep.** First pass reasoning
+(rejected): the vector store is invisible infrastructure, a recruiter never sees which store
+answered a query, so tripling integration work multiplies engineering surface without
+multiplying anything demonstrable. **User's correction, and the actual reasoning that stands:**
+that argument silently assumed its own conclusion -- it assumed retrieval quality is invariant
+across stores (Qdrant's inline metadata filtering vs. Pinecone's post-search filtering) without
+ever measuring it. If quality genuinely doesn't differ across stores on this project's real
+corpus, that itself is the finding -- it means the theoretical architecture argument (filter-
+during-search vs. filter-after) was engineering noise, not a real quality driver, and that's
+worth knowing rather than assuming. This is the same "measure, don't guess" discipline already
+applied to LLM-in-ingestion, the odds backfill, and the embedding model choice -- a falsifiable
+hypothesis about this project's own corpus, not a benchmark borrowed from someone else's.
+
+**Decision: build all 3 (Pinecone, Qdrant, LanceDB) eventually, but SEQUENCED, not in parallel
+from day one -- resolved 2026-08-20, real asymmetry with the chunking/embedding axes.** Ship with
+ONE store now (get to Day 5/6 faster) and clone the already-computed vectors into the other 2
+stores later, during Day 6 itself -- not a 4th combinatorial axis multiplying build cost like
+paragraph-vs-whole-article chunking does. The two situations are NOT the same shape: chunking
+happens BEFORE embedding, so changing it means re-processing raw text and re-running the
+(expensive) embedding pass -- no shortcut, must run the whole pipeline again per variant. Vector
+store is only the DESTINATION for vectors that already exist once the 6 corpus indices (2
+chunking x 3 embedding models) are built -- moving/cloning them into a different backend is an
+infra operation (read vectors+metadata, insert into another store), not a recompute. The
+expensive work (embedding) is paid once and never repeated across stores.
+
+**Practical sequencing:** pick one store now to unblock Day 4 block F and reach Day 5/6 sooner;
+in Day 6, clone the 6 already-vectorized indices into the other 2 store backends to run the same
+retrieval-quality comparison described above, without re-embedding anything.
+
+**Revisit when:** a starting store is picked (see the LanceDB/Qdrant leaning discussion above) --
+this sequencing note removes the earlier open question about whether the store axis explodes the
+combinatorial count; it doesn't, because it's a post-hoc clone, not a build-time multiplier.

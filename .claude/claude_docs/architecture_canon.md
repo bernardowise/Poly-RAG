@@ -345,6 +345,37 @@ News RSS no soporta busqueda por rango de fecha arbitrario, asi que hacerlo seri
 proyecto aparte, no una extension de este. El backfill de odds es "lo mas atras que
 vamos a ir" -- ver tech_debt.md para el razonamiento completo.
 
+### Capa semantica de Polymarket: `question`/`description` del registry (cerrado 2026-08-20)
+
+**No es una cuarta fuente -- es la mitad semantica de la MISMA fuente Polymarket** (odds es
+la mitad estructurada). El registry (`poly-rag-market-registry`) tiene exactamente dos
+campos de texto libre en lenguaje natural: `question` (titulo del market, ej. "Will the
+price of Bitcoin be above $66,000 on August 20?") y `description` (contenido exacto aun sin
+confirmar contra un item real -- presumiblemente reglas/criterio de resolucion). Todo lo
+demas del registry es estructurado (fechas, status, IDs, outcome).
+
+**Por que hace falta:** F1-F5 (filtro estructurado de odds) asumen que ya se tiene el
+`market_id` exacto. Pero una pregunta como "dame los markets de Bitcoin" no trae un
+`market_id` -- es texto libre. Sin un indice semantico sobre `question`/`description`, no
+hay forma de resolver esa pregunta a un `market_id` sin que el usuario ya lo supiera de
+antemano. Este indice es el paso 1 (texto libre -> `market_id`(s)) que habilita luego el
+paso 2 (filtro exacto F1-F5 sobre odds, o los indices semanticos ya filtrados de News/
+Comments).
+
+**Diseño:**
+- Unidad de embedding = 1 vector por `market_id`, SIN chunking -- `question`/`description`
+  son texto corto por market, no articulos largos que necesiten split.
+- Trigger = evento, no cadencia de ciclo: se embede cuando el market entra al registry por
+  primera vez (`newly_tracked_markets` de un ciclo), no se re-embede en cada ciclo -- el
+  registry mismo dice que estos campos "cambian poco, una vez al crearse, una vez al
+  resolverse", asi que solo haria falta re-embeder si `description`/`question` cambian tras
+  la resolucion (caso raro, no verificado si aplica en la practica).
+- Metadata: `market_id`, `status`, `end_date`/`resolution_date`.
+- **Pendiente de decidir (no resuelto 2026-08-20/21):** si `question` y `description` van
+  en un solo embedding combinado (mas contexto junto, mas simple) o separados (busqueda mas
+  precisa contra el titulo corto sin diluirse en el texto largo de reglas, pero duplica
+  vectores por market).
+
 ### Linkeo News/Comments -> market_id
 
 - **News (rediseñado 2026-08-16, ver "News Source Redesign" en tech_debt.md):**
@@ -497,6 +528,37 @@ bootstrap del registry/odds vs. estado estable):
 viene del bootstrap one-off), `chunk_id` (`{comment_entity_id o market_id}#{ciclo}`),
 texto = comentarios concatenados de esa unidad para ese alcance.
 
+**Chunking/embedding de Digest (Capa 0), cerrado 2026-08-20 -- quinta fuente de
+embedding, simetrica con Polymarket/News/Comments.** Reemplaza el diseño anterior
+(lookup estructurado directo sobre los campos JSON del digest) -- decision explicita
+del usuario: el `_digest` completo se embede como texto, no solo se consulta como
+data estructurada, para que Capa 0 sea una fuente de retrieval real, buscable por
+lenguaje natural (ej. "que paso este ciclo"), no solo alcanzable via un `market_id`
+ya resuelto de antemano.
+
+- **Input:** el JSON de `digest/YYYY-MM-DD/HH.json` (la fuente de verdad, escrita
+  ANTES del correo -- ver seccion Email Digest arriba), nunca el HTML del correo
+  (que trae markup/estilos sin valor para el embedding).
+- **Conversion a texto, template deterministico, sin llamada LLM nueva:** una
+  funcion (`digest_to_text(digest_data)`) arma un solo bloque de texto narrativo por
+  ciclo a partir de TODOS los campos (`newly_tracked_markets`, `resolved_markets`,
+  `top_volatility`, `world_snapshot`, `quotes`, `executive_summary`) -- mismo
+  formato que el mock en texto plano ya construido y mostrado al usuario. Codigo
+  puro (f-strings/template), consistente con la disciplina del proyecto de no
+  agregar llamadas Bedrock nuevas cuando la conversion es mecanica y sin
+  ambiguedad -- `executive_summary` es el unico campo ya generado por LLM, el resto
+  es JSON estructurado 100% fiel (ver tech_debt.md, "Digest Fidelity Audit").
+- **Unidad de embedding = 1 digest completo = 1 chunk, sin split por parrafo** -- un
+  digest es corto (resumen de un ciclo, no un articulo largo), fragmentarlo seria
+  sobre-ingenieria para su tamano real.
+- **Metadata del chunk:** `cycle_started_at`, `digest_s3_key`, `market_ids_mentioned`
+  (lista de todos los `market_id` que aparecen en `newly_tracked`/`resolved`/
+  `top_volatility`/`world_snapshot` de ese digest -- permite filtrar "digests que
+  mencionaron el market X" sin depender solo de similitud semantica).
+- **Bootstrap + incremental, mismo mecanismo que las otras 3 fuentes:** ~8-10
+  digests historicos a la fecha (bootstrap trivial por volumen), 1 nuevo por ciclo
+  en adelante -- mismo trigger encadenado descrito abajo.
+
 **Fase de embedding, desacoplada de la cadena de ingesta (decision 2026-08-20):**
 corrige la nota anterior de este documento que decia "el embedding tiene que ser...
 automatizado dentro de la cadena de ingestion" -- eso queda OBSOLETO. El proyecto
@@ -515,10 +577,22 @@ tocar sin riesgo de romper la cadena de ingesta), no temporal -- no hay delay
 agendado ni cron aparte. Fase 2 corre despues del envio del correo (ultimo paso,
 no bloquea nada previo), pero en la misma corrida de la cadena.
 
-**Decisiones abiertas (Dia 4):** modelo de embeddings, y vector store -- candidatos
-en evaluacion: FAISS/numpy en S3 cargado en memoria de Lambda, ChromaDB, Databricks
-Vector Search. OpenSearch Serverless descartado por costo (~$700/mes, incompatible
-con el budget).
+**Modelo de embeddings, decidido 2026-08-20 (ver tech_debt.md, "Embedding Model
+Choice", para el pricing/disponibilidad verificados via AWS CLI real):** Amazon
+Titan Embeddings v2 como default de produccion (sin friccion, ya autorizado en la
+cuenta, mas barato). Cohere Embed v4 y Voyage AI (`voyage-finance-2`) quedan como
+comparacion A/B en Dia 6, no descartados -- ver tech_debt.md para el razonamiento
+completo, incluyendo la correccion de que excluir Voyage por "romper un patron
+IAM-only" nunca fue una regla real del proyecto.
+
+**Vector store, decision inicial + secuencia para Dia 6 (2026-08-20, ver
+tech_debt.md, "Vector Store Choice"):** Databricks Vector Search descartado
+(limite real de 1 endpoint activo por cuenta en el Free Edition, incompatible con
+necesitar 6 indices consultables en paralelo). Se construye con **Pinecone** para
+arrancar Dia 4 bloque F mas rapido -- Qdrant y LanceDB se clonan del corpus ya
+vectorizado en Dia 6 (operacion de infraestructura, no un re-embedding, dado que
+mover vectores ya calculados a otro backend no repite el trabajo caro). OpenSearch
+Serverless sigue descartado por costo (~$700/mes, incompatible con el budget).
 
 ### Verificado en produccion
 
