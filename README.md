@@ -43,6 +43,16 @@ same cycle's date/hour partition, regardless of how long an earlier stage took. 
 separate watchdog Lambda (`poly-rag-watchdog-ingest-news`, 10-min cron) detects a
 stuck News cycle and retries only the missing batches.
 
+Everything above is **Phase 1 (ingestion)**. **Phase 2 (embedding)** is designed
+but not built: a separate set of Lambdas that reads what Phase 1 already wrote to
+S3 and never modifies it — an orchestrator invoked by `send_digest` as one more
+link in the same chain, fanning out to per-source chunking Lambdas, then to
+embedding Lambdas that only turn text into vectors and persist them to S3, and
+finally to store-write Lambdas kept deliberately separate so adding a new vector
+store touches none of the already-proven embedding code. Only the one-off
+bootstrap scripts exist so far; none of these Lambdas are written yet. See
+architecture_canon.md.
+
 **Data flow, per cycle:**
 1. **Registry** (DynamoDB, `poly-rag-market-registry`) — one item per market, updated
    in place. A market enters only after an LLM verifiability check (does its outcome
@@ -111,7 +121,8 @@ lambdas/
   send_digest/           cross-source synthesis, JSON artifact + email
   watchdog_ingest_news/  stuck-cycle detection and retry
 scripts/                  one-off scripts, run manually, not part of the 12h chain
-                           (odds/registry backfills, News temporal/status tagging)
+                           (odds/registry backfills, News temporal/status tagging,
+                           corpus chunking + embedding bootstrap — see its README)
 terraform/                all AWS infrastructure as code
 .claude/
   claude_docs/            architecture_canon.md, tech_debt.md, session_ledger.md,
@@ -134,38 +145,65 @@ markets under the current (post-2026-08-16) design only — an early-pipeline cl
 removed all registry/odds data tied to the deprecated Bluesky + keyword-matching
 design.
 
-**Corpus, as of 2026-08-18 (6 complete cycles, registry growing every cycle):**
-595+ registry markets, 3,315 news articles (~5.2M tokens, 100% linked to exactly
-one market_id, all classified by temporal tier and market status at publish time),
-12,711 comments (~261K tokens — News keeps growing steadily per cycle, Comments
-flattened to steady-state volume once its dedup table caught up), and 63,641+ odds
-snapshots (a growing mix of `cycle` and `clob_backfill` provenance — most markets
-now carry history back to their real creation date, not just since we started
-tracking them).
+**Corpus, as of 2026-08-21 (11 complete cycles, registry growing every cycle):**
+981 registry markets, 7,429 news articles (100% linked to exactly one market_id,
+all classified by temporal tier and market status at publish time), 8,858
+comments (News keeps growing steadily per cycle, Comments flattened to
+steady-state volume once its dedup table caught up — 3,080 orphaned comments
+referencing markets purged in an earlier registry cleanup were removed on
+2026-08-20 by `scripts/purge_orphan_comments.py`), and 63,641+ odds snapshots (a
+growing mix of `cycle` and `clob_backfill` provenance — most markets now carry
+history back to their real creation date, not just since we started tracking
+them).
+
+Chunked and ready for embedding in `chunks/`: 981 registry + 120,568
+news_paragraph + 7,429 news_article + 681 comments + 11 digest. Nothing is
+embedded yet — see Day 4 below.
 
 ## Pending / TODO
 
-- **RAG retrieval (Day 4)** — corpus-enrichment groundwork done; chunking/embedding/
-  retrieval itself not started. Completed so far: the earlier two-layer retrieval
-  model (explicit linkage + ambient time-window) was deprecated and its
-  implementation (`retrieval/time_window.py`) deleted — the per-market News
-  redesign left 100% of articles linked to exactly one market, so the ambient pool
-  it retrieved from was empty. Current model is a single path — metadata filter
-  (`market_id`, time, source) plus semantic ranking, still to be built. Odds
-  history now reaches back to each market's creation (CLOB backfill, both one-off
-  and native going forward), unblocking correlation against older news. News
-  articles are classified by `temporal_tier` and `market_status_at_publish`
-  (capped at 1 year relative to the market's `created_at`, not ingestion date —
-  see architecture_canon.md). Post-resolution News capture (4 cycles / 48h after a
-  market resolves) is live in `ingest_news`. A real orphan-data finding (305
-  articles referencing markets purged in an earlier cleanup) was found and
-  deliberately left untouched, to be handled later, possibly at query time.
-  **Still open:** chunking strategy (articles are long and need splitting;
-  comments are too short to embed individually), embedding model, and vector
-  store (candidates: FAISS-in-S3, ChromaDB, Databricks Vector Search — OpenSearch
-  Serverless ruled out on cost). Embedding must be incremental within the
-  ingestion chain, since the corpus accumulates roughly 1M tokens per cycle from
-  News alone.
+- **RAG retrieval (Day 4)** — chunking **done and written to S3**; embedding
+  **blocked**; retrieval not started.
+  - **Chunking (step 1, complete):** strategy closed for all sources and executed
+    by `scripts/bootstrap_chunk_corpus.py` over the full existing corpus. News
+    splits by paragraph (with a whole-article variant kept as a comparison axis),
+    Comments group by `link_type` (`direct` → `market_id`, shared → the
+    `comment_entity_id` from the registry, so one stream is never re-embedded per
+    market), the registry's `question`+`description` become one vector per market
+    (the semantic half of the Polymarket source, next to odds as the structured
+    half), and each digest becomes one chunk via a deterministic text template —
+    no new LLM call. Live counts in `chunks/`: 981 registry, 120,568
+    news_paragraph, 7,429 news_article, 681 comments, 11 digest.
+  - **Embedding (step 2, blocked — no model has completed a corpus).** Every
+    candidate hit a real, verified account limit. Titan v2 was **dropped from the
+    project**: its Bedrock API has no batch field at all and the account cap is
+    600 req/min, which would bottleneck every future incremental cycle, not just
+    the bootstrap. Voyage (`voyage-finance-2`) was the one model that actually
+    worked (122K vectors in ~30 min, no throttling) but a single run consumed
+    56.5% of its 50M free tier, projecting exhaustion in ~4 days at current
+    ingestion rate. Cohere v4 is throttled at ~15-20 rejections/min against 1-2
+    successful calls/min, and neither exponential backoff nor fixed pacing moved
+    it. Leading unverified hypothesis: the **daily** 8.1M-token cap (already 65%
+    consumed that day), not the per-minute one. Full detail, including the real
+    CLI/CloudWatch evidence for each limit, in tech_debt.md, "Phase 2 Embedding
+    Bootstrap BLOCKED".
+  - **Design context that still holds:** retrieval is a single path — metadata
+    filter (`market_id`, time, source) plus semantic ranking. The earlier
+    two-layer model (explicit linkage + ambient time-window) is deprecated and
+    its implementation deleted: the per-market News redesign left 100% of
+    articles linked to exactly one market, so the ambient pool it read from was
+    empty. Odds history reaches back to each market's creation (CLOB backfill),
+    unblocking correlation against older news; News carries `temporal_tier` and
+    `market_status_at_publish`; post-resolution News capture (4 cycles / 48h) is
+    live. A real orphan-data finding (305 articles referencing purged markets)
+    was left untouched by choice, to be handled at query time.
+  - **Vector store: still undecided, and the constraint changed.** Databricks
+    Vector Search had been ruled out for allowing only 1 active endpoint per
+    account — a blocker only under the earlier plan of many parallel indices, and
+    one that no longer applies now that the design has collapsed toward a single
+    model. Pinecone and Qdrant accounts exist (keys in `.secrets`, gitignored);
+    LanceDB-in-S3 remains a candidate. OpenSearch Serverless stays out on cost
+    (~$700/month).
 - **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
   is the closest existing precedent (multi-source context → Bedrock → synthesis) but
   there's no user-facing query interface yet. Includes an open, explicitly deferred

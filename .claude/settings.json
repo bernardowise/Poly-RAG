@@ -27,6 +27,15 @@
             "command": "/workspaces/Poly-RAG/.claude/hooks/block_agent_spawn.sh"
           }
         ]
+      },
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/workspaces/Poly-RAG/.claude/hooks/block_ask_user_question.sh"
+          }
+        ]
       }
     ],
     "FileChanged": [

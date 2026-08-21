@@ -585,8 +585,9 @@ no bloquea nada previo), pero en la misma corrida de la cadena.
 
 **Arquitectura de Lambdas de Fase 2, decidida 2026-08-20, revisada el mismo dia a
 4 niveles -- aislamiento por fuente, por modelo, Y por store, no una Lambda por
-combinacion completa.** Explicitamente rechazado: 1 Lambda por cada una de las 6
-combinaciones de corpus (2 chunking x 3 embedding) -- cada una repetiria la lectura
+combinacion completa.** Explicitamente rechazado: 1 Lambda por cada una de las 4
+combinaciones de corpus (2 chunking x 2 embedding, ver nota 2026-08-21 sobre
+Titan mas abajo) -- cada una repetiria la lectura
 de las 4 fuentes de S3 sin ganar aislamiento real (un fallo leyendo News no se
 aisla mejor por tener 6 Lambdas leyendolo igual). En vez de eso, aislamiento por
 los ejes que realmente varian:
@@ -605,18 +606,18 @@ los ejes que realmente varian:
    se entera `chunk_comments`. Las dos variantes de News NO son alternativas
    donde se elige una -- ambas corren siempre, en paralelo, cada una produciendo
    su propio conjunto de chunks.
-3. **Paso de merge + 6 Lambdas de embedding, SOLO texto -> vector, store-agnostic**
+3. **Paso de merge + 2 Lambdas de embedding, SOLO texto -> vector, store-agnostic**
    (mismo patron que `merge_batch_payloads` de News) -- detecta cuando las 5
    Lambdas de chunking terminaron, arma 2 corpus completos (`registry + comments
    + digest + news_paragraph` vs. `registry + comments + digest +
-   news_article`), y dispara 3 Lambdas de embedding (`embed_titan`,
-   `embed_cohere`, `embed_voyage`) por cada uno de los 2 corpus -- 6 invocaciones
-   totales. **Deliberadamente NO escriben a ningun vector store directamente** --
-   cada una calcula sus vectores y los persiste a S3
-   (`vectors/<variante>/<modelo>.json`), igual que cualquier otra Lambda de
-   Fase 1 escribe su output a S3 antes que nada mas pase. Cada Lambda de
-   embedding aisla fallos por MODELO -- si Cohere esta caido o Voyage falla por
-   su API key, Titan sigue funcionando sin bloquearse.
+   news_article`), y dispara 2 Lambdas de embedding (`embed_cohere`,
+   `embed_voyage` -- `embed_titan` eliminada 2026-08-21, ver nota mas abajo) por
+   cada uno de los 2 corpus -- 4 invocaciones totales. **Deliberadamente NO
+   escriben a ningun vector store directamente** -- cada una calcula sus
+   vectores y los persiste a S3 (`vectors/<variante>/<modelo>.json`), igual que
+   cualquier otra Lambda de Fase 1 escribe su output a S3 antes que nada mas
+   pase. Cada Lambda de embedding aisla fallos por MODELO -- si Cohere esta
+   caido, Voyage sigue funcionando sin bloquearse (y viceversa).
 4. **Lambdas de escritura a store, separadas y desacopladas del calculo del
    vector -- decision explicita 2026-08-20, ver tech_debt.md.** El paso de
    "guardar el vector en un store" es la unica parte de Fase 2 que NO es
@@ -633,13 +634,20 @@ Consistente con el patron de cadena estricta ya establecido en Fase 1
 (`cycle_started_at` heredado en cada paso) -- aqui el fan-out es simplemente mas
 ancho (5 en paralelo, luego 6), no un mecanismo nuevo.
 
-**Modelo de embeddings, decidido 2026-08-20 (ver tech_debt.md, "Embedding Model
-Choice", para el pricing/disponibilidad verificados via AWS CLI real):** Amazon
-Titan Embeddings v2 como default de produccion (sin friccion, ya autorizado en la
-cuenta, mas barato). Cohere Embed v4 y Voyage AI (`voyage-finance-2`) quedan como
-comparacion A/B en Dia 6, no descartados -- ver tech_debt.md para el razonamiento
-completo, incluyendo la correccion de que excluir Voyage por "romper un patron
-IAM-only" nunca fue una regla real del proyecto.
+**Modelo de embeddings, revisado 2026-08-21 (ver tech_debt.md, "Embedding Model
+Choice", para el pricing/disponibilidad verificados via AWS CLI real):** **Amazon
+Titan Embeddings v2 fue eliminado del proyecto por completo** -- durante el
+bootstrap real de embedding, Titan choco contra un limite duro de cuenta AWS
+(600 requests/min, verificado via `aws service-quotas`) y su API de Bedrock no
+tiene batch real (1 texto = 1 request, sin excepcion), proyectando ~3.5h solo
+para el corpus paragraph-chunked. Ese limite de 600/min es una cuota de cuenta
+permanente, no una casualidad del bootstrap -- seria el cuello de botella de
+CADA ciclo incremental futuro de Fase 2 en produccion, no solo de este one-off.
+Cohere Embed v4 y Voyage AI (`voyage-finance-2`) SI tienen batch real (96 y 128
+textos/request respectivamente) y terminan el mismo corpus en minutos, no horas
+-- **son ahora los 2 modelos de embedding del proyecto**, no una comparacion A/B
+de Dia 6 contra Titan. La comparacion Cohere-vs-Voyage sigue siendo el eje de
+Dia 6 (calidad de retrieval, no velocidad de bootstrap).
 
 **Vector store, decision inicial + secuencia para Dia 6 (2026-08-20, ver
 tech_debt.md, "Vector Store Choice"):** Databricks Vector Search descartado

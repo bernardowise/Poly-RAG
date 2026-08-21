@@ -2336,6 +2336,31 @@ deciding off spec sheets.
 **Revisit when:** Day 6 evaluation work begins and there's a real query interface to A/B Titan
 against Cohere v4.
 
+**Update 2026-08-21 -- Titan v2 DROPPED from the project entirely, not deferred.** During the
+real embedding bootstrap (`scripts/bootstrap_embed_corpus.py --apply`), Titan hit AWS's real
+account quota: "On-demand model inference requests per minute for Amazon Titan Text Embeddings
+V2" = 600 (verified via `aws service-quotas list-service-quotas --service-code bedrock`), and
+Titan's Bedrock API has no batch field at all (`{"inputText": "<one string>"}`, one request per
+text, confirmed via `aws bedrock get-foundation-model` -- inferenceTypesSupported=[ON_DEMAND],
+no BATCH, so async Batch Inference doesn't apply either). At ~120K chunks per corpus variant that
+quota projects to ~3.5 hours just for Titan on the paragraph-chunked variant alone (confirmed
+real via CloudWatch: a sustained ~600 invocations/min, i.e. already saturating the account
+ceiling, not throttling from this script's own concurrency). Cohere v4 (96 texts/call) and Voyage
+(128 texts/call) both have real multi-text batch APIs and finished the same corpus size in
+minutes (Voyage: 38/62 checkpoints, ~76,000 vectors, in under 20 minutes, before Titan was
+dropped). The key realization: this 600/min ceiling is a **permanent account quota**, not a
+one-off bootstrap fluke -- it would be the bottleneck of every future incremental Phase 2 cycle
+in production too, not just this bootstrap. Titan was the cheapest of the three in dollars, but
+"free in dollars" turned out to cost hours of wall-clock time every cycle, which is the resource
+this project actually budgets against day to day (see CLAUDE.md, budget discipline is about
+spending deliberately, not just about dollars). **Decision: Cohere v4 + Voyage
+(voyage-finance-2) are now the 2 embedding models compared, not 3 -- Titan is out of the
+architecture, not paused for Day 6.** architecture_canon.md updated to match. The original
+"Titan default, Cohere/Voyage A/B in Day 6" framing was already superseded earlier the same
+session (2026-08-20/21) when the project moved to all comparison models running from the
+bootstrap itself, not staggered into Day 6 -- this update removes Titan from that already-revised
+3-way comparison, leaving a 2-way one.
+
 ---
 
 ## Voyage AI Free Tier Spend Alert -- Pending, Not Designed (2026-08-20)
@@ -2548,3 +2573,59 @@ not just the 4 affected) after the purge.
 **Revisit if:** a future registry cleanup again purges markets without also checking Comments for
 newly-orphaned references -- this was a one-time catch-up, not a recurring maintenance task with
 its own schedule.
+
+---
+
+## Phase 2 Embedding Bootstrap BLOCKED -- No Model Has Completed a Corpus (2026-08-20/21, OPEN)
+
+**Issue:** step 1 of the Phase 2 bootstrap (chunking) is done and verified in S3 -- 5 source files
+under `chunks/`, refreshed to include the 2026-08-21 00:00 UTC cycle (registry 981, news_paragraph
+120,568, news_article 7,429, comments 681, digest 11). Step 2 (embedding those chunks into vectors)
+is **not done and currently blocked**: after a full session of attempts, `vectors/` holds exactly
+one partial checkpoint (`news_article_variant/cohere/part_00000.json`, 2,000 of 9,102 vectors) and
+zero finalized files. Every candidate model hit a real, verified account-level limit:
+
+| Model | Status | Real blocker (verified, not assumed) |
+|---|---|---|
+| Titan v2 | **dropped from the project** | No batch API at all (`{"inputText": "<one string>"}`); `inferenceTypesSupported=[ON_DEMAND]`, no BATCH, so async Batch Inference doesn't apply either. Account quota 600 req/min (`aws service-quotas`), saturated immediately -- ~3.5h projected for the paragraph corpus, and that ceiling is permanent, so it would bottleneck every future incremental cycle too, not just this bootstrap. |
+| Voyage (`voyage-finance-2`) | corpus completed, then **data lost** | Completed 122,241 vectors in 62 checkpoints in ~30 min with zero throttling -- the only model that actually worked. Its checkpoints were then deleted by mistake (see session_ledger 2026-08-20). Separately: real dashboard reading showed **28,263,931 tokens = 56.5% of the 50M free tier consumed by that single run**, projecting free-tier exhaustion in ~7 cycles (~4 days) at current ingestion rate. |
+| Cohere v4 | **blocked, unresolved** | First `--apply` died at 39s with `ThrottlingException` ("Too many tokens"). Exponential backoff+jitter (`COHERE_MAX_RETRIES=8`) did not help; a fixed-pacing model (`COHERE_PACE_SECONDS=10`, sleep before each request rather than reacting to throttles) did not help either. CloudWatch measured **~15-20 throttles/min sustained against 1-2 successful invocations/min** under both schemes. |
+
+**Leading hypothesis for the Cohere block, NOT yet verified:** a **daily** quota, not the
+per-minute one. `Model invocation max tokens per day for Cohere Embed V4` = **8,100,000 tokens/day**
+(`aws service-quotas`), and `InputTokenCount` on CloudWatch showed **5,261,503 tokens already
+consumed that same UTC day (65%)** before the last attempt. The aggressive throttling may be AWS
+tightening as the account approaches its daily ceiling, which would explain why neither backoff nor
+pacing (both of which only address the 150K tokens/min limit) changed anything. **First thing to
+check next session:** the daily counter resets at 00:00 UTC -- re-run then and watch whether the
+throttle rate collapses. If it does, the fix is scheduling/pacing against the DAILY budget, not the
+per-minute one.
+
+**Real lateral finding, already applied to the script:** running multiple models concurrently inside
+one process made everything worse -- a single module-level `boto3.client("bedrock-runtime")` shared
+across ~44 threads saturates urllib3's default ~10-connection pool, so models queue behind each
+other. Cohere measured ~1.13s/request when run alone in an isolated test vs. ~1.67 invocations/min
+when sharing the process with Titan and Voyage. **Run one model at a time, sequentially** -- this is
+also more consistent with the failure-isolation principle already used across the Phase 1 Lambdas.
+
+**Mitigation already built (keep it):** `scripts/bootstrap_embed_corpus.py` writes a checkpoint to
+`vectors/_checkpoints/<variant>/<model>/part_NNNNN.json` every `CHECKPOINT_SIZE=2000` chunks and
+resumes by skipping parts already present in S3. This was added after two runs died having written
+nothing at all, and it is the only reason the partial Cohere progress survived at all. Do not remove
+it when reworking the embedding path.
+
+**Open decision, not made:** the user raised **Vertex AI (GCP, `text-embedding-004`)** as an
+alternative -- real pricing confirmed at $0.10/M tokens, which works out to ~$3.04 for a one-time
+full-corpus bootstrap but ~$15.88/month in steady-state production, breaking the project's $5/month
+budget (CLAUDE.md). The user also argued persuasively that using GCP here would NOT violate
+CLAUDE.md's "Out of Scope: GCP" rule in spirit: that rule exists to stop the project from retreating
+to a familiar cloud instead of learning AWS, whereas this would be adopting a specific tool *because*
+real AWS limits were discovered by doing the work in AWS. That reframing is accepted as reasonable;
+the cost question is what remains unresolved.
+
+**Also still open (pre-existing, now more urgent):** no spend/usage guardrail exists for any non-AWS
+embedding vendor. See "Voyage AI Free Tier Spend Alert" above -- the same gap applies to whatever
+model is chosen next, and today's session demonstrated concretely how fast a free tier can be
+consumed without one.
+
+**Revisit:** next session, starting with the daily-quota reset check described above.

@@ -38,6 +38,16 @@ Hooks are event-triggered handlers that execute automatically at specific lifecy
 **Purpose:**
 (Add description here)
 
+### PreToolUse: AskUserQuestion
+
+**Event:** `PreToolUse`
+**Trigger:** AskUserQuestion
+**Handler:** Shell command
+**Script:** `/workspaces/Poly-RAG/.claude/hooks/block_ask_user_question.sh`
+
+**Purpose:**
+(Add description here)
+
 ### FileChanged: .claude/claude_docs/memory_mirror/**
 
 **Event:** `FileChanged`

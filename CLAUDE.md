@@ -141,6 +141,19 @@ que bloquea cualquier `Agent()` cuyo campo `description` no empiece exactamente 
 chat -- el hook no valida que la confirmacion realmente ocurrio (igual que el hook de
 Lambdas), pero exige un paso consciente y deliberado en vez de spawnear por inercia.
 
+## Nunca usar AskUserQuestion
+
+**Regla dura, sin excepcion ni escape hatch.** El tool `AskUserQuestion` (preguntas de
+opcion multiple estructuradas) esta deshabilitado por completo -- decision explicita del
+usuario 2026-08-21, tras senalarlo varias veces en sesiones previas. Cuando haga falta una
+decision del usuario, preguntar en texto plano dentro de la respuesta normal, sin el
+formato de opciones.
+
+**Mecanica:** hay un hook (`.claude/hooks/block_ask_user_question.sh`, PreToolUse sobre
+AskUserQuestion) que bloquea cualquier intento de usarlo, siempre -- a diferencia de los
+hooks de Lambda/Agent/archivos nuevos, este NO tiene prefijo de autorizacion que lo
+desbloquee. El bloqueo es incondicional por diseno.
+
 ## Timezone Convention
 
 Two clocks, deliberately. The split exists because the pipeline's day and the user's day
