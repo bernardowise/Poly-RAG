@@ -2414,7 +2414,13 @@ alerts, if they have one) until Day 4 block F implementation actually begins.
 
 ---
 
-## Vector Store Choice (Day 4 block F, not yet decided, 2026-08-20)
+## Vector Store Choice (Day 4 block F, DECIDED 2026-08-21 -- LanceDB, see correction at the end)
+
+> **STATUS 2026-08-21: DECIDED.** LanceDB, chosen on measured storage-growth cost and
+> free-tier ceilings, not on the retrieval-quality reasoning explored below (that
+> comparison -- filter-during vs filter-after search -- is deferred to Day 6, unchanged).
+> The reasoning below remains useful background for the Day 6 comparison; read the
+> correction at the bottom of this entry for why LanceDB won TODAY's decision specifically.
 
 **Issue:** the embedding model is decided (Titan v2 default, Cohere v4 + Voyage as Day 6 A/B),
 chunking is closed for all 4 sources, but nothing has been chosen for WHERE the resulting vectors
@@ -2550,6 +2556,66 @@ shared architecture concept:
 **Revisit when:** Qdrant and LanceDB integrations are actually coded (Day 6 store cloning) --
 confirm Qdrant's collection limits at that point, don't assume the Pinecone namespace pattern
 transfers as-is.
+
+---
+
+### CORRECTION 2026-08-21 -- decided on measured growth cost, not the filtering theory above
+
+The reasoning above (inline-filter-during-search vs post-search filtering) is real and still
+the right axis for a Day 6 retrieval-quality comparison, but it was NOT what decided today's
+choice. The user asked the sharper question directly: "imagina que tan grande sera mi corpus
+en 2-3 meses" -- forcing a real growth projection instead of reasoning from today's ~8K
+vectors.
+
+**Measured, not estimated (2026-08-21):** the `news_article` variant grows at ~700
+articles/cycle x 2 cycles/day (real rate, all 12 cycles). At the real per-record size (20.8 KB
+per vector record including metadata, 6.4 KB per chunk including text -- both measured from
+actual S3 objects, not assumed):
+
+| Horizon | Corpus size (one variant) |
+|---|---|
+| +1 month | 1.40 GB |
+| +3 months | 3.74 GB |
+| +12 months | 14.27 GB |
+
+**Qdrant's free tier (1GB) is exhausted in under 2 months. Pinecone's (2GB) in about 3.** Both
+would force either a paid tier (breaking the $5/month budget) or active pruning within the
+project's stated near-term horizon. LanceDB has no free-tier ceiling to exhaust -- it is not a
+managed service, it is a columnar file format written directly to the S3 bucket the project
+already pays for. Real S3 cost at the same horizon: **$0.09/month at 3 months, $0.33/month at
+12 months.** No new account, no new secret -- confirmed live, `lancedb.connect("s3://...")`
+authenticates via the same AWS credentials already used for S3/DynamoDB/Bedrock.
+
+**A 6-way tournament (article/paragraph x LanceDB/Pinecone/Qdrant) was considered for
+TODAY and explicitly rejected**, after the user asked directly whether skipping it was
+self-sabotage. Resolved: the tournament answers "which store retrieves better," a Day 6
+question that needs a real query interface and eval metrics (still undecided, see "RAG
+Evaluation Metrics Landscape" above) to produce a trustworthy number. Running it today would
+have measured infrastructure with no yardstick. The store axis was already decided by a
+different, harder constraint (will it still be free in 3 months) that doesn't need a
+tournament to answer.
+
+**Packaging risk verified before committing, not assumed:** `pip download lancedb
+--platform manylinux2014_x86_64 --python-version 3.12`, fully unpacked and measured (not just
+downloaded) = **339 MB unzipped**, over Lambda's 250MB zip/Layer limit (pyarrow 136MB +
+lancedb's native binary 132MB + numpy 31MB dominate; no pandas dependency, which helped). This
+rules out a plain zip deploy AND a Lambda Layer (Layers share the same 250MB cap as function
+code) for the Fase 2/3 Lambdas due Monday. **Only a container-image Lambda (10GB limit) works.**
+The user confirmed comfort with container images before this was locked in -- real added setup
+cost for Monday (Dockerfile, ECR repo, build/push step), not a blocker.
+
+**Fase 3 one-off (`scripts/write_to_lancedb.py`) built and verified same day** against the
+Friday `news_article` slice -- table created at `s3://poly-rag-369970405415/lancedb/`, reopened
+from a fresh connection (not memory), vector search and `market_id` metadata filtering both
+confirmed semantically correct on real data. See session_ledger.md 2026-08-21 for the two real
+bugs found while verifying it (`list_tables()` returning a response object rather than a plain
+list, and `merge_insert` correctly rejecting the duplicate-chunk_id case documented in "Duplicate
+Article URLs Within a Single Cycle" below).
+
+**Revisit when:** Day 6 store-cloning work begins -- Qdrant and Pinecone remain the comparison
+targets for retrieval quality (a small corpus sample fits either free tier fine for a
+quality test; the growth-cost argument above only rules them out as the PERMANENT store, not
+as a valid comparison target).
 
 ---
 
@@ -2783,3 +2849,17 @@ was already half-paid-for. Recorded instead of patched under time pressure.
 **Revisit when:** `ingest_news` is next touched, or when Phase 3 store-writing is built
 (whichever comes first) -- the overwrite only becomes real damage at store-write time,
 so Phase 3 is the deadline.
+
+**Update 2026-08-21 (same day, hours later) -- hit for real in Phase 3, and the predicted
+failure mode was WRONG in one detail.** `scripts/write_to_lancedb.py` reached this exact
+case on its first `merge_insert` and did NOT silently overwrite as predicted above --
+LanceDB raised a hard error instead: "Ambiguous merge inserts are prohibited: multiple
+source rows match the same target row." The prediction of silent data loss was right in
+spirit (one market does lose its link either way) but wrong on mechanism -- this specific
+store fails loudly on the ambiguity rather than picking a winner quietly. Worked around
+with an explicit, logged dedup-by-chunk_id step in the write script (keeps the last
+occurrence, reports the count) as a stopgap -- the upstream fix in `ingest_news` above is
+still the real fix and is still not done. Whether Pinecone or Qdrant would also reject the
+ambiguous write outright, or silently overwrite as originally assumed, is unverified and
+worth checking when either is coded in Day 6 -- do not assume LanceDB's fail-loud
+behavior generalizes to the other two stores.
