@@ -31,11 +31,30 @@ WHAT EACH SOURCE PRODUCES (see architecture_canon.md for the full design)
   newly_tracked_markets/resolved_markets/top_volatility/world_snapshot/quotes/
   executive_summary.
 
+CYCLE SLICING (added 2026-08-21)
+--------------------------------
+`--cycles A-B` restricts chunking to an inclusive, 1-indexed range of cycles,
+where cycle 1 is the earliest complete cycle in the bucket. This exists for the
+4-day sliced embedding bootstrap: the full corpus does fit inside one day's
+Bedrock token quota, but the project deliberately drains it in daily slices so
+that each day is independently verifiable and a failure costs one slice, not
+the whole run. Each day re-chunks its own slice immediately before embedding it
+(the corpus keeps growing at 2 cycles/day underneath, so a chunk file written
+yesterday is already stale), and writes to its own labelled file rather than
+overwriting a shared one.
+
+The registry source has no cycle axis -- it is a live DynamoDB scan of current
+market metadata, not a per-cycle S3 payload -- so `--cycles` does not apply to
+it and it always chunks the full current registry.
+
 OUTPUT
 ------
-Writes one JSON file per source to s3://<bucket>/chunks/<source>/bootstrap.json
-(only with --apply). Each file is a flat list of chunk dicts, each carrying at
-minimum `chunk_id` and `text`, plus the metadata documented per-source above.
+Writes one JSON file per source to s3://<bucket>/chunks/<source>/<label>.json
+(only with --apply), where <label> defaults to `bootstrap` for a full run or
+`cycles_<first>-<last>` for a sliced one. Each file is a flat list of chunk
+dicts, each carrying at minimum `chunk_id` and `text`, plus the metadata
+documented per-source above, plus `cycle_number`/`cycle_key` for the three
+cycle-based sources.
 
 SAFETY
 ------
@@ -46,9 +65,10 @@ this directory.
 
 USAGE
 -----
-    python scripts/bootstrap_chunk_corpus.py                # dry run, all sources
-    python scripts/bootstrap_chunk_corpus.py --source news   # dry run, one source
-    python scripts/bootstrap_chunk_corpus.py --apply         # write to S3
+    python scripts/bootstrap_chunk_corpus.py                        # dry run, all sources, all cycles
+    python scripts/bootstrap_chunk_corpus.py --source news           # dry run, one source
+    python scripts/bootstrap_chunk_corpus.py --cycles 1-5            # dry run, cycles 1-5 only
+    python scripts/bootstrap_chunk_corpus.py --cycles 1-5 --apply    # write cycles 1-5 to S3
 """
 
 import argparse
@@ -72,16 +92,54 @@ dynamodb = boto3.resource("dynamodb")
 # S3 / DynamoDB read helpers
 # ---------------------------------------------------------------------------
 
-def list_cycle_keys(prefix):
+def list_cycle_keys(prefix, cycle_range=None):
     """All final cycle payload keys under a prefix, excluding fan-out batch
-    intermediates (same filter as tag_news_temporal_tier.py)."""
+    intermediates (same filter as tag_news_temporal_tier.py).
+
+    `cycle_range` is an inclusive (first, last) pair of 1-indexed cycle
+    NUMBERS, not dates -- cycle 1 is the earliest cycle in the bucket, in
+    chronological order. Added 2026-08-21 for the 4-day sliced bootstrap: each
+    day re-chunks and embeds only its own slice of cycles, so a day's chunk
+    file is a self-contained artifact of exactly what that day embedded.
+
+    Chronological ordering is safe from a plain `sorted()` here because the key
+    layout is zero-padded and fixed-width (`<source>/YYYY-MM-DD/HH.json`), so
+    lexicographic order IS chronological order. Cycle numbers are assigned per
+    prefix, but every prefix has the same 12 cycles by construction (a cycle is
+    only complete when all 4 stages wrote their file -- see
+    runbook_verify_cycle_health.md), so cycle N means the same instant in
+    `news/` as it does in `digest/`.
+    """
     keys = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".json") and "_batch" not in obj["Key"]:
                 keys.append(obj["Key"])
-    return sorted(keys)
+    keys = sorted(keys)
+
+    if cycle_range is None:
+        return keys
+
+    first, last = cycle_range
+    if first < 1:
+        raise ValueError(f"cycle numbers are 1-indexed, got first={first}")
+    selected = keys[first - 1:last]
+    if not selected:
+        raise ValueError(
+            f"{prefix}: no cycles in range {first}-{last} "
+            f"(only {len(keys)} cycles exist)"
+        )
+    if last > len(keys):
+        print(f"  NOTE {prefix}: requested cycles {first}-{last} but only "
+              f"{len(keys)} exist -- processing {first}-{len(keys)}")
+    return selected
+
+
+def cycle_number_map(prefix):
+    """S3 key -> 1-indexed cycle number, for labelling chunks with the cycle
+    they came from. Same ordering guarantee as list_cycle_keys above."""
+    return {key: i for i, key in enumerate(list_cycle_keys(prefix), start=1)}
 
 
 def read_json(key):
@@ -232,21 +290,60 @@ def chunk_news_paragraph(article, article_id):
     return chunks
 
 
+MAX_ARTICLE_CHARS = 32000   # ~8K tokens. Overflow cap for the whole-article
+                             # variant, added 2026-08-21. NOT truncation -- an
+                             # article over this splits into N parts that all
+                             # stay in the corpus and reassemble via article_id
+                             # (same pattern chunk_comments already uses for
+                             # oversized comment groups). Measured against the
+                             # real 12-cycle corpus before choosing the cap:
+                             # median article 3,648 chars, p95 16,284, and only
+                             # 184/8,201 articles (2.24%) exceed 32K -- so the
+                             # "whole article, no split" property of this
+                             # variant still holds for 97.76% of it. The cap
+                             # exists for PACING, not storage: Cohere's real
+                             # binding limit is 300K tokens/min, and a single
+                             # 240,387-char article (~60K tokens, real case in
+                             # cycle 6) inside one batched request blows a
+                             # fifth of a minute's entire budget in one call --
+                             # the actual cause of the sustained throttling
+                             # that blocked the previous bootstrap attempts,
+                             # which no amount of backoff could fix.
+
+
 def chunk_news_article(article, article_id):
     body_text = (article.get("body_text") or "").strip()
     if not body_text:
         return []
     market_id = (article.get("market_ids") or [None])[0]
-    return [{
-        "chunk_id": article_id,
+    base_meta = {
         "article_id": article_id,
         "market_id": market_id,
         "temporal_tier": article.get("temporal_tier"),
         "market_status_at_publish": article.get("market_status_at_publish"),
         "pubDate": article.get("pubDate"),
         "source": article.get("source"),
-        "text": body_text,
-    }]
+    }
+
+    parts = force_split(body_text, MAX_ARTICLE_CHARS)
+    if len(parts) == 1:
+        # Unsplit articles keep a bare article_id as chunk_id -- no "#0" suffix,
+        # so the overwhelming majority of this variant is addressed exactly as
+        # it was before overflow splitting existed.
+        return [{
+            **base_meta,
+            "chunk_id": article_id,
+            "part_index": 0,
+            "part_count": 1,
+            "text": parts[0],
+        }]
+    return [{
+        **base_meta,
+        "chunk_id": f"{article_id}#{idx}",
+        "part_index": idx,
+        "part_count": len(parts),
+        "text": part,
+    } for idx, part in enumerate(parts)]
 
 
 # ---------------------------------------------------------------------------
@@ -421,10 +518,12 @@ def run_registry():
     return chunks
 
 
-def run_news():
-    keys = list_cycle_keys("news/")
+def run_news(cycle_range=None):
+    cycle_of = cycle_number_map("news/")
+    keys = list_cycle_keys("news/", cycle_range)
     paragraph_chunks, article_chunks = [], []
     errors = 0
+    split_articles = 0
     for key in keys:
         try:
             payload = read_json(key)
@@ -432,18 +531,28 @@ def run_news():
             print(f"  {key}: READ ERROR {type(exc).__name__}")
             errors += 1
             continue
+        cycle_meta = {"cycle_number": cycle_of[key], "cycle_key": key}
         for i, article in enumerate(payload.get("articles", [])):
             article_id = article.get("url") or f"{key}#{i}"
-            paragraph_chunks.extend(chunk_news_paragraph(article, article_id))
-            article_chunks.extend(chunk_news_article(article, article_id))
-    print(f"news: {len(keys)} cycle files ({errors} read errors), "
-          f"{len(paragraph_chunks)} paragraph chunks, {len(article_chunks)} article chunks")
+            paragraph_chunks.extend(
+                {**c, **cycle_meta} for c in chunk_news_paragraph(article, article_id)
+            )
+            parts = chunk_news_article(article, article_id)
+            if len(parts) > 1:
+                split_articles += 1
+            article_chunks.extend({**c, **cycle_meta} for c in parts)
+    cycles_seen = sorted({cycle_of[k] for k in keys})
+    print(f"news: {len(keys)} cycle files (cycles {cycles_seen[0]}-{cycles_seen[-1]}), "
+          f"{errors} read errors, {len(paragraph_chunks)} paragraph chunks, "
+          f"{len(article_chunks)} article chunks "
+          f"({split_articles} articles over {MAX_ARTICLE_CHARS:,} chars split into parts)")
     return paragraph_chunks, article_chunks
 
 
-def run_comments():
+def run_comments(cycle_range=None):
     entity_map = get_comment_entity_map(scan_registry())
-    keys = list_cycle_keys("comments/")
+    cycle_of = cycle_number_map("comments/")
+    keys = list_cycle_keys("comments/", cycle_range)
     all_chunks = []
     link_type_counts = Counter()
     unknown_entity_comments = 0
@@ -460,18 +569,30 @@ def run_comments():
             _, entity_key = comment_group_key(c, entity_map)
             if entity_key == "unknown_entity":
                 unknown_entity_comments += 1
+        cycle_number = cycle_of[key]
         cycle_chunks = chunk_comments(comments, entity_map)
         for c in cycle_chunks:
             link_type_counts[c["link_type"]] += 1
+            # chunk_id is entity-scoped ({entity}#{part}), so the SAME entity in
+            # two different cycles would collide on id. Qualify with the cycle
+            # so ids stay globally unique -- this matters now that cycles are
+            # embedded in separate slices on separate days and later merged into
+            # one vector store, where a duplicate id would silently overwrite
+            # an earlier cycle's chunk instead of coexisting with it.
+            c["chunk_id"] = f"{c['chunk_id']}@c{cycle_number}"
+            c["cycle_number"] = cycle_number
+            c["cycle_key"] = key
         all_chunks.extend(cycle_chunks)
-    print(f"comments: {len(keys)} cycle files ({errors} read errors), "
-          f"{len(all_chunks)} chunks -- {dict(link_type_counts)}"
+    cycles_seen = sorted({cycle_of[k] for k in keys})
+    print(f"comments: {len(keys)} cycle files (cycles {cycles_seen[0]}-{cycles_seen[-1]}), "
+          f"{errors} read errors, {len(all_chunks)} chunks -- {dict(link_type_counts)}"
           f"{f', {unknown_entity_comments} comments with no resolvable entity' if unknown_entity_comments else ''}")
     return all_chunks
 
 
-def run_digest():
-    keys = list_cycle_keys("digest/")
+def run_digest(cycle_range=None):
+    cycle_of = cycle_number_map("digest/")
+    keys = list_cycle_keys("digest/", cycle_range)
     chunks = []
     errors = 0
     for key in keys:
@@ -481,8 +602,13 @@ def run_digest():
             print(f"  {key}: READ ERROR {type(exc).__name__}")
             errors += 1
             continue
-        chunks.extend(chunk_digest(payload, key))
-    print(f"digest: {len(keys)} cycle files ({errors} read errors), {len(chunks)} chunks")
+        chunks.extend(
+            {**c, "cycle_number": cycle_of[key], "cycle_key": key}
+            for c in chunk_digest(payload, key)
+        )
+    cycles_seen = sorted({cycle_of[k] for k in keys})
+    print(f"digest: {len(keys)} cycle files (cycles {cycles_seen[0]}-{cycles_seen[-1]}), "
+          f"{errors} read errors, {len(chunks)} chunks")
     return chunks
 
 
@@ -491,15 +617,19 @@ def run_digest():
 # ---------------------------------------------------------------------------
 
 SOURCE_RUNNERS = {
-    "registry": lambda: {"registry": run_registry()},
-    "news": lambda: dict(zip(("news_paragraph", "news_article"), run_news())),
-    "comments": lambda: {"comments": run_comments()},
-    "digest": lambda: {"digest": run_digest()},
+    # registry takes no cycle_range on purpose -- it is a live DynamoDB scan of
+    # current market metadata, not a per-cycle S3 payload, so it has no cycle
+    # axis to slice on. A registry chunk is always "as of now"; see the note
+    # printed in main() when --cycles is used with it.
+    "registry": lambda cr: {"registry": run_registry()},
+    "news": lambda cr: dict(zip(("news_paragraph", "news_article"), run_news(cr))),
+    "comments": lambda cr: {"comments": run_comments(cr)},
+    "digest": lambda cr: {"digest": run_digest(cr)},
 }
 
 
-def write_chunks(source_name, chunks):
-    key = f"{CHUNKS_PREFIX}{source_name}/bootstrap.json"
+def write_chunks(source_name, chunks, label):
+    key = f"{CHUNKS_PREFIX}{source_name}/{label}.json"
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
@@ -507,6 +637,21 @@ def write_chunks(source_name, chunks):
         ContentType="application/json",
     )
     return key
+
+
+def parse_cycles(raw):
+    """'1-5' -> (1, 5); '7' -> (7, 7). 1-indexed and inclusive on both ends."""
+    if raw is None:
+        return None
+    text = raw.strip()
+    if "-" in text:
+        first_s, last_s = text.split("-", 1)
+        first, last = int(first_s), int(last_s)
+    else:
+        first = last = int(text)
+    if first > last:
+        raise ValueError(f"--cycles {raw}: first cycle is after last")
+    return first, last
 
 
 def main():
@@ -521,18 +666,42 @@ def main():
         choices=sorted(SOURCE_RUNNERS.keys()),
         help="only process one source (default: all 4)",
     )
+    parser.add_argument(
+        "--cycles",
+        help="inclusive 1-indexed cycle range to chunk, e.g. '1-5' (default: all "
+             "cycles). Cycle 1 is the earliest complete cycle in the bucket. Does "
+             "not apply to the registry source, which is always a live scan.",
+    )
+    parser.add_argument(
+        "--label",
+        help="output filename stem, written to chunks/<source>/<label>.json "
+             "(default: 'bootstrap', or 'cycles_<first>-<last>' when --cycles is given)",
+    )
     args = parser.parse_args()
+
+    cycle_range = parse_cycles(args.cycles)
+    if args.label:
+        label = args.label
+    elif cycle_range:
+        label = f"cycles_{cycle_range[0]:02d}-{cycle_range[1]:02d}"
+    else:
+        label = "bootstrap"
 
     mode = "APPLY (writing to S3)" if args.apply else "DRY RUN (writing nothing)"
     sources = [args.source] if args.source else list(SOURCE_RUNNERS.keys())
     print(f"=== Bootstrap chunk corpus -- {mode} ===")
     print(f"Sources: {', '.join(sources)}")
+    print(f"Cycles:  {args.cycles if cycle_range else 'ALL'}")
+    print(f"Output:  chunks/<source>/{label}.json")
+    if cycle_range and "registry" in sources:
+        print("NOTE: --cycles does not apply to registry (live DynamoDB scan, "
+              "no cycle axis) -- it will chunk the full current registry.")
     print()
 
     started = time.time()
     all_results = {}
     for source in sources:
-        all_results.update(SOURCE_RUNNERS[source]())
+        all_results.update(SOURCE_RUNNERS[source](cycle_range))
 
     print()
     print("=== Sample chunks (first of each) ===")
@@ -546,14 +715,16 @@ def main():
         print()
         print("=== Writing to S3 ===")
         for name, chunks in all_results.items():
-            key = write_chunks(name, chunks)
+            key = write_chunks(name, chunks, label)
             print(f"  {name}: {len(chunks)} chunks -> s3://{S3_BUCKET}/{key}")
 
     elapsed = time.time() - started
     print()
     print("=== Summary ===")
     for name, chunks in all_results.items():
-        print(f"  {name}: {len(chunks)} chunks")
+        total_chars = sum(len(c.get("text", "")) for c in chunks)
+        print(f"  {name}: {len(chunks)} chunks, {total_chars:,} chars "
+              f"(~{total_chars // 4:,} tokens)")
     print(f"  elapsed: {elapsed:.1f}s")
     if not args.apply:
         print()

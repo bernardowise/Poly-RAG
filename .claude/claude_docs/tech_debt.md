@@ -2361,6 +2361,28 @@ session (2026-08-20/21) when the project moved to all comparison models running 
 bootstrap itself, not staggered into Day 6 -- this update removes Titan from that already-revised
 3-way comparison, leaving a 2-way one.
 
+**Update 2026-08-21 (later the same day) -- Voyage is OUT too; the project is Cohere-only
+for now, and the comparison axis is deliberately suspended, not deleted.** Explicit user
+decision ("Voyage is out of the question") after Voyage's single completed run consumed
+**56.5% of its 50M free tier** in one pass, projecting exhaustion in ~4 days at current
+ingestion rate -- with no spend guardrail built (see "Voyage AI Free Tier Spend Alert"
+above, still open and now moot for Voyage specifically). Combined with Titan already being
+dropped for its 600 req/min ceiling, **Cohere Embed v4 is currently the only embedding
+model in the project.**
+
+This does collapse axis 3 of the Day 6 recruiter-facing comparison to a single value, which
+is a real loss against a documented day-1 requirement -- accepted deliberately and
+provisionally. The user's stated sequencing: get ONE variant (`news_article`) fully
+embedded and queryable end-to-end first, and only then consider reintroducing a second
+model (Titan was named as the more likely candidate to revive than Voyage) and/or the second
+chunking variant (`news_paragraph`). The vectors already produced are unaffected by that
+later choice -- adding a model means embedding the same chunks again into a separate
+namespace, not redoing any prior work.
+
+**Revisit when:** the `news_article` + Cohere path is proven end-to-end through Phase 3
+(vectors queryable in a real store), which is the user's stated precondition for widening
+back to a multi-model comparison.
+
 ---
 
 ## Voyage AI Free Tier Spend Alert -- Pending, Not Designed (2026-08-20)
@@ -2576,7 +2598,14 @@ its own schedule.
 
 ---
 
-## Phase 2 Embedding Bootstrap BLOCKED -- No Model Has Completed a Corpus (2026-08-20/21, OPEN)
+## Phase 2 Embedding Bootstrap BLOCKED -- No Model Has Completed a Corpus (2026-08-20/21, RESOLVED 2026-08-21 -- see correction at the end of this entry)
+
+> **STATUS 2026-08-21: UNBLOCKED. The root cause recorded in this entry was WRONG.**
+> The daily quota blamed below does not exist in this account, and the account was
+> never near its real daily ceiling. The actual cause was unbounded request size
+> against the per-MINUTE token limit. Cohere v4 has since embedded a full slice with
+> zero throttles. The original text is preserved unedited for the record; read the
+> correction at the bottom of this entry before acting on anything above it.
 
 **Issue:** step 1 of the Phase 2 bootstrap (chunking) is done and verified in S3 -- 5 source files
 under `chunks/`, refreshed to include the 2026-08-21 00:00 UTC cycle (registry 981, news_paragraph
@@ -2629,3 +2658,128 @@ model is chosen next, and today's session demonstrated concretely how fast a fre
 consumed without one.
 
 **Revisit:** next session, starting with the daily-quota reset check described above.
+
+---
+
+### CORRECTION 2026-08-21 -- the diagnosis above was wrong, and the bootstrap is unblocked
+
+The daily-quota hypothesis was checked first thing, as the entry above instructed, and it
+**did not survive contact with the real account**:
+
+- **The quota named above does not exist.** `Model invocation max tokens per day for
+  Cohere Embed V4 = 8,100,000` is not in this account's quota list (verified by
+  enumerating every `per day` quota via `aws service-quotas list-service-quotas
+  --service-code bedrock`). The only Cohere Embed V4 daily quota is **`Global
+  cross-region model inference tokens per day` = 16,200,000** -- exactly double the
+  figure that was cited.
+- **Consumption was therefore misread by 2x.** The 5,261,503 tokens measured that day
+  were **37% of the real 16.2M ceiling, not 65%** of an 8.1M one. There was ~10M of
+  daily headroom left at the moment the runs were being throttled to death.
+
+**The real cause: unbounded request size against the per-MINUTE limit.** The binding
+quota is `On-demand model inference tokens per minute for Cohere Embed English` =
+**300,000 TPM (not adjustable)**. The old script batched by COUNT (96 texts/request,
+Cohere's documented max) over a corpus whose article chunks range from ~200 chars to
+240,387 chars -- a ~1,200x spread. A single 96-text request of large articles can carry
+millions of tokens and exhaust a whole minute's budget in one call. This is why neither
+exponential backoff nor `COHERE_PACE_SECONDS=10` ever helped: **both control request
+RATE, and the limit being violated was tokens per minute.** No amount of waiting between
+oversized requests makes an oversized request fit.
+
+**Fixes, in the order they mattered:**
+1. **Token-aware batching** -- fill each request to a token budget
+   (`MAX_TOKENS_PER_REQUEST = 40,000`), never to a text count. Count is now only the
+   secondary cap (Cohere's own 96-text API limit).
+2. **Overflow-split oversized chunks** (`MAX_ARTICLE_CHARS = 32,000` in
+   `bootstrap_chunk_corpus.py`) -- articles over the cap split into linked parts rather
+   than being truncated, so no single chunk can dominate a request. Only 184/8,201
+   articles (2.24%) are affected; the whole-article variant stays whole for 97.76% of
+   the corpus.
+3. **A sliding-window rate governor** that tracks tokens actually sent in the trailing
+   60s and sleeps before breaching the target -- necessary because Bedrock's embed
+   response carries **no `meta.billed_units`** field (verified against a real call), so
+   there is no server-side token count to read back and pacing must be computed locally.
+
+**Empirically-set pacing, measured not guessed:**
+
+| TPM target | Throttles | Effective rate | Result |
+|---|---|---|---|
+| 210,000 (0.70 of limit) | 93 | ~168K/min | usable but wasteful; crashed on an unrelated bug |
+| **150,000 (0.50 of limit)** | **0** | 119K/min | clean |
+
+The reason 0.70 still throttles despite real consumption never exceeding ~215K/min
+against a 300K ceiling: **Bedrock enforces over a window shorter than 60 seconds**, so a
+governor that is correct on a 60-second average can still burst past the real limiter.
+The chars/4 token estimate was independently confirmed accurate (CloudWatch counted
+663,197 real tokens against ~700,000 estimated, ratio 0.95 -- it slightly OVER-counts,
+so it is not the source of the throttles). **Use 0.50 for future slices; do not exceed
+0.70.**
+
+**Two of my own bugs, both found against real data rather than in review:**
+- **A transient Bedrock HTTP 500 killed a run at 52.5%** because retry logic only
+  matched throttling codes. Now retries any 5xx/429, matching on HTTP status as well as
+  error code -- Bedrock returned the literal string `"500"` as the code, with no
+  symbolic name to match on.
+- **Resume-by-position was silently unsafe.** It skipped chunks by index, which only
+  works if batch boundaries are identical between runs -- and they are not, since
+  batching is token-driven and `MAX_TOKENS_PER_REQUEST` changed mid-effort (90K -> 40K),
+  re-cutting every boundary. Rewritten to resume by `chunk_id` identity, which is
+  immune to batch size, chunk order, and part count.
+
+**Checkpointing earned its keep again** -- the 500-crash cost only the un-checkpointed
+tail (~2.27M tokens survived in 3 parts). The instruction above to keep it stands.
+
+**Result:** `news_article` cycles 1-5 fully embedded and verified -- 2,746 vectors, 6
+checkpoint parts, ~4.06M tokens, 0 missing/extra ids, 1536-dim uniform, L2 norms exactly
+1.0000, no zero/NaN/Inf vectors, and a real semantic sanity check (nearest neighbours of
+random chunks are genuinely same-topic). Titan and Voyage remain out of the project for
+the reasons already documented above -- neither was revived to reach this result.
+
+**Superseded by:** the 4-day sliced bootstrap plan (see session_ledger.md 2026-08-21).
+The remaining open question is no longer "can any model embed this corpus" -- it can --
+but the Phase 3 vector store choice, still undecided (see "Vector Store Choice" above).
+
+---
+
+## Duplicate Article URLs Within a Single Cycle (2026-08-21, OPEN, low severity)
+
+**Issue:** two article URLs appear **twice within the same News cycle payload**, each
+tagged with a different `market_id` but carrying byte-identical text:
+
+| URL | Cycle | market_ids | chars |
+|---|---|---|---|
+| `stealthex.io/blog/when-will-bitcoin-recover/` | 3 (`news/2026-08-17/00.json`) | 3257332, 3257338 | 14,319 |
+| `federalnewsnetwork.com/prediction-markets/2026/02/democratic-nominee-odds-after-state-of-the-union/` | 5 (`news/2026-08-18/00.json`) | 559657, 559675 | 8,001 |
+
+This contradicts the invariant stated in architecture_canon.md that News dedupes by exact
+URL via `poly-rag-processed-urls`. The dedup table is not wrong -- it just cannot prevent
+this specific race: `ingest_news` fans out ~20 batches that run **concurrently**, and two
+batches searching two different markets can both fetch the same URL before either one
+writes its dedup marker. The markets in each pair have adjacent ids (3257332/3257338,
+559657/559675), i.e. sibling markets of the same event, which is exactly the case most
+likely to return identical Google News results.
+
+**Why it matters, concretely:** the chunking design uses the article `url` as
+`article_id` and, for the whole-article variant, as `chunk_id` (decided 2026-08-20
+precisely because the URL "ya es unica por diseno"). It is not unique in practice. On
+write to a vector store keyed by id, the second record **silently overwrites** the first,
+and the surviving vector keeps only ONE of the two `market_id`s -- so one market loses
+its link to an article that genuinely belongs to it. Silent, not an error.
+
+**Scale:** 2 of 2,746 chunks in cycles 1-5 (0.07%). Real but not urgent.
+
+**Deliberately NOT fixed 2026-08-21** -- found mid-run while verifying the embedding
+resume logic, and fixing it would have meant re-chunking and re-embedding a slice that
+was already half-paid-for. Recorded instead of patched under time pressure.
+
+**Two candidate fixes, not chosen:**
+1. **Upstream (preferred):** make `ingest_news` collapse same-URL articles within a
+   cycle merge, unioning their `market_ids` into one record -- which is what the schema
+   already supports (`market_ids` is a list) and would make the corpus honest about an
+   article belonging to two markets.
+2. **Downstream (weaker):** qualify `chunk_id` with `market_id` for the article variant,
+   which stops the overwrite but duplicates the vector and re-embeds identical text.
+
+**Revisit when:** `ingest_news` is next touched, or when Phase 3 store-writing is built
+(whichever comes first) -- the overwrite only becomes real damage at store-write time,
+so Phase 3 is the deadline.
