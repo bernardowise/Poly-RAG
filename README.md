@@ -34,6 +34,43 @@ ingest_polymarket --invoke--> ingest_news --invoke--> ingest_comments --invoke--
     filter, registry       market, fan-out              Series, deduped       HTML email, its
     diff, odds+history     batching + parallel          by comment_id)        own Bedrock call)
     for new markets)        merge, deduped by URL)
+                                                                                     |
+                                                                                     v
+                                                                          embed_orchestrator
+                                                                              (Phase 2 entry)
+                                                                                     |
+                          +--------------------+--------------------+--------------------+
+                          v                     v                     v                     v
+                   chunk_registry        chunk_comments          chunk_digest       chunk_news_article
+                  (this cycle's         (entity-grouped         (one narrative      (whole-article,
+                   new markets           comment chunks)         chunk)              overflow split)
+                   only)
+                          |                     |                     |                     |
+                          +--------------------+--------------------+--------------------+
+                                                     | (fan-out, all 4 in PARALLEL)
+                                                     v
+                                              embed_digest
+                                                     | --invoke-->
+                                                     v
+                                             embed_comments
+                                                     | --invoke-->
+                                                     v
+                                             embed_registry
+                                                     | --invoke-->
+                                                     v
+                                          embed_news_article
+                                   (strict SEQUENCE, deliberately not parallel --
+                                    the 4 embed Lambdas share one Cohere TPM ceiling)
+                                                     |
+                                                     v
+                                              digest_metrics
+                                        (Phase 1+2 cost/latency/tokens
+                                         report email, second email)
+                                                     |
+                                                     v
+                                              write_lancedb
+                                    (Phase 3 -- per-cycle merge_insert into
+                                     each source's LanceDB table, terminal)
 ```
 
 Only `ingest_polymarket` has its own EventBridge trigger. Every other stage is
@@ -53,16 +90,27 @@ strict SEQUENCE (`embed_digest` → `embed_comments` → `embed_registry` →
 inference profile. Sequential, not parallel, on purpose: the 4 embed Lambdas
 share one account-wide token-per-minute ceiling, and running them concurrently
 would recreate the exact uncoordinated-competing-invocations bug that already
-caused a real News double-invocation incident. **Phase 3 (write to a vector
-store) is explicitly out of scope for now** — `embed_news_article` is the last
-stage and invokes nothing further. See architecture_canon.md for the full
-per-Lambda design and tech_debt.md for how two real Cohere daily-quota outages
-(on the bare on-demand model id and the `us.` cross-region route) were diagnosed
-and fixed by switching to `global.cohere.embed-v4:0`.
+caused a real News double-invocation incident. See architecture_canon.md for
+the full per-Lambda design and tech_debt.md for how two real Cohere
+daily-quota outages (on the bare on-demand model id and the `us.` cross-region
+route) were diagnosed and fixed by switching to `global.cohere.embed-v4:0`.
+
+**Phase 3 (write to LanceDB) is also built and connected, same day
+(2026-08-22):** `embed_news_article` invokes `digest_metrics` (see below), which
+invokes `write_lancedb`, the true last stage of the whole cycle — it merges
+each source's new rows into its LanceDB table (`registry_cohere`,
+`comments_cohere`, `digest_cohere`, `news_article_cohere`) and invokes nothing
+further. `write_lancedb` is this project's only container-image Lambda
+(LanceDB's real dependency footprint is 339MB unzipped, over Lambda's 250MB
+zip/Layer limit), deployed via its own ECR repo. It deliberately does not
+rebuild the vector index every cycle — only `merge_insert`s new rows — since
+index-rebuild cost scales with the table's total size, not how many rows are
+new; index maintenance is a separate, lower-cadence concern.
 
 Every embedding Lambda writes cost/latency/token rows to
-`poly-rag-embedding-metrics`, and the last stage of the whole cycle
-(`embed_news_article`) sends a **second email**, separate from `send_digest`'s
+`poly-rag-embedding-metrics`. `digest_metrics` (split out of
+`embed_news_article` 2026-08-22, so the Lambda that embeds isn't also the one
+that reports) sends a **second email**, separate from `send_digest`'s
 market-content digest — a plain cost/latency/tokens report covering both Phase 1
 and Phase 2 for that cycle. The two emails land at genuinely different times
 (one at the end of Phase 1, one at the end of Phase 2), which is deliberate: it
@@ -139,7 +187,7 @@ lambdas/
   watchdog_ingest_news/  stuck-cycle detection and retry
   embed_orchestrator/    Phase 2 entry point -- fans out chunking, starts the
                           sequential embedding chain
-  chunk_registry/        this cycle's new markets only (first_seen >
+  chunk_registry/        this cycle's new markets only (first_seen >=
                           cycle_started_at, no lookback window needed)
   chunk_comments/        entity-grouped comment chunks for this cycle
   chunk_digest/          this cycle's digest as one narrative chunk
@@ -148,8 +196,12 @@ lambdas/
   embed_digest/          1st in the sequential embed chain
   embed_comments/        2nd -- invoked by embed_digest
   embed_registry/        3rd -- invoked by embed_comments
-  embed_news_article/    4th and last -- invoked by embed_registry, writes
-                          embedding metrics, sends the cycle metrics report email
+  embed_news_article/    4th -- invoked by embed_registry, writes embedding
+                          metrics, invokes digest_metrics
+  digest_metrics/        Phase 1+2 cost/latency/tokens report email, split out
+                          of embed_news_article 2026-08-22; invokes write_lancedb
+  write_lancedb/         Phase 3, true last stage -- per-cycle merge_insert into
+                          each source's LanceDB table, container-image Lambda
 scripts/                  one-off scripts, run manually, not part of the 12h chain
                            (odds/registry backfills, News temporal/status tagging,
                            corpus chunking + embedding bootstrap — see its README)
