@@ -133,6 +133,9 @@ def lambda_handler(event, context):
             split_count += 1
         chunks.extend(article_chunks)
 
+    for c in chunks:
+        c["_lineage"] = {"written_by": "poly-rag-chunk-news-article", "run_type": "automated_cycle"}
+
     output_key = cycle_key.replace("news/", "chunks/news_article/")
 
     if dry_run:

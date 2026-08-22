@@ -57,13 +57,16 @@ data "aws_iam_policy_document" "embed_lambda_permissions" {
     # profile -- global.cohere.embed-v4:0, chosen 2026-08-22 after two real
     # daily-quota outages on the bare on-demand and us. cross-region routes
     # (see tech_debt.md, "Phase 2 Embedding Bootstrap", second correction).
+    # Region wildcard on the foundation-model resource: the "global." profile
+    # (unlike "us.") can route outside the 3 US regions we originally
+    # enumerated, which caused a real AccessDeniedException on cycle 14
+    # (2026-08-22, embed_digest) when Bedrock resolved it to a region we had
+    # not granted.
     effect  = "Allow"
     actions = ["bedrock:InvokeModel"]
     resources = [
       "arn:aws:bedrock:us-east-1:369970405415:inference-profile/global.cohere.embed-v4:0",
-      "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",
-      "arn:aws:bedrock:us-east-2::foundation-model/cohere.embed-v4:0",
-      "arn:aws:bedrock:us-west-2::foundation-model/cohere.embed-v4:0",
+      "arn:aws:bedrock:*::foundation-model/cohere.embed-v4:0",
     ]
   }
 

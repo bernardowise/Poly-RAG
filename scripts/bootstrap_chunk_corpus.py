@@ -655,6 +655,11 @@ SOURCE_RUNNERS = {
 
 
 def write_chunks(source_name, chunks, label):
+    for c in chunks:
+        c["_lineage"] = {
+            "written_by": "scripts/bootstrap_chunk_corpus.py",
+            "run_type": "manual_backfill",
+        }
     key = f"{CHUNKS_PREFIX}{source_name}/{label}.json"
     s3.put_object(
         Bucket=S3_BUCKET,

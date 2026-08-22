@@ -129,6 +129,7 @@ def lambda_handler(event, context):
         if chunk is None:
             skipped_no_question += 1
             continue
+        chunk["_lineage"] = {"written_by": "poly-rag-chunk-registry", "run_type": "automated_cycle"}
         chunks.append(chunk)
 
     output_key = registry_output_key(cycle_started_at)

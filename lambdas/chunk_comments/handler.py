@@ -144,6 +144,8 @@ def lambda_handler(event, context):
     comments = payload.get("comments", [])
     entity_map = scan_registry_entity_map()
     chunks = chunk_comments(comments, entity_map, cycle_started_at)
+    for c in chunks:
+        c["_lineage"] = {"written_by": "poly-rag-chunk-comments", "run_type": "automated_cycle"}
 
     output_key = cycle_key.replace("comments/", "chunks/comments/")
 

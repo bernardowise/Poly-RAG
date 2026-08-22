@@ -138,6 +138,7 @@ def lambda_handler(event, context):
         raise RuntimeError(f"digest payload not found at s3://{S3_BUCKET}/{cycle_key}")
 
     chunk = chunk_digest(digest_data, cycle_key, cycle_started_at)
+    chunk["_lineage"] = {"written_by": "poly-rag-chunk-digest", "run_type": "automated_cycle"}
 
     output_key = cycle_key.replace("digest/", "chunks/digest/")
     s3.put_object(
