@@ -73,38 +73,12 @@ data "aws_iam_policy_document" "embed_lambda_permissions" {
   statement {
     # Fase 2 cost/latency tracking (2026-08-22, see dynamodb.tf and
     # tech_debt.md, "Day 6" entry) -- the 4 embed Lambdas write one row per
-    # Bedrock request here. Query added for embed_news_article specifically:
-    # as the last stage of the sequential embed chain, it reads back every
-    # row written this cycle (across all 4 sources) to build the Fase 2
-    # metrics report email -- see embed_news_article/handler.py.
-    effect = "Allow"
-    actions = [
-      "dynamodb:PutItem",
-      "dynamodb:Query",
-    ]
-    resources = [
-      aws_dynamodb_table.embedding_metrics.arn,
-      "${aws_dynamodb_table.embedding_metrics.arn}/index/*",
-    ]
-  }
-
-  statement {
-    # Read-only. embed_news_article's report email covers the WHOLE cycle,
-    # not just Fase 2 -- see handler.py -- so it also reads Fase 1's existing
-    # architecture_metrics table (already written by the 4 ingestion
-    # Lambdas). Scan, not Query: that table's rows aren't keyed in a way that
-    # supports a cycle_started_at prefix query (see ingest_lambda_role's
-    # PutItem-only grant on the same table -- Fase 1 never needed to read it
-    # back before now).
+    # Bedrock request here. Write-only: reading these rows back to build the
+    # Fase 2 metrics report email is digest_metrics' job now (split out
+    # 2026-08-22, see its own dedicated role below), not this shared role's.
     effect    = "Allow"
-    actions   = ["dynamodb:Scan"]
-    resources = [aws_dynamodb_table.architecture_metrics.arn]
-  }
-
-  statement {
-    effect    = "Allow"
-    actions   = ["ses:SendEmail", "ses:SendRawEmail"]
-    resources = ["*"]
+    actions   = ["dynamodb:PutItem"]
+    resources = [aws_dynamodb_table.embedding_metrics.arn]
   }
 
   statement {
@@ -113,7 +87,10 @@ data "aws_iam_policy_document" "embed_lambda_permissions" {
     # itself is sequential (embed_digest -> embed_comments -> embed_registry
     # -> embed_news_article), deliberately NOT parallel -- see
     # embed_orchestrator handler.py docstring for why parallel embedding
-    # would recreate the News double-invocation race. Every target is listed
+    # would recreate the News double-invocation race. embed_news_article also
+    # invokes digest_metrics as its last act (split out 2026-08-22, see
+    # digest_metrics/handler.py -- the report email used to be sent inline
+    # here, now it's a separate terminal Lambda). Every target is listed
     # explicitly, none of this role's Lambdas gets "*".
     effect  = "Allow"
     actions = ["lambda:InvokeFunction"]
@@ -126,6 +103,7 @@ data "aws_iam_policy_document" "embed_lambda_permissions" {
       aws_lambda_function.embed_comments.arn,
       aws_lambda_function.embed_registry.arn,
       aws_lambda_function.embed_news_article.arn,
+      aws_lambda_function.digest_metrics.arn,
     ]
   }
 }
@@ -134,4 +112,55 @@ resource "aws_iam_role_policy" "embed_lambda_permissions" {
   name   = "poly-rag-embed-permissions"
   role   = aws_iam_role.embed_lambda_role.id
   policy = data.aws_iam_policy_document.embed_lambda_permissions.json
+}
+
+# digest_metrics execution role -- deliberately separate from
+# embed_lambda_role (2026-08-22), not piled onto the shared Fase 2 role.
+# Its job (read both metrics tables, send one report email) is orthogonal to
+# chunking/embedding, and giving it its own role means its permissions are
+# scoped exactly to what it needs, not inherited leftovers from a role built
+# for a different set of Lambdas.
+resource "aws_iam_role" "digest_metrics_lambda_role" {
+  name               = "poly-rag-digest-metrics-role"
+  description        = "Execution role for poly-rag-digest-metrics (Fase 1+2 cycle report email)"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+}
+
+data "aws_iam_policy_document" "digest_metrics_permissions" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["arn:aws:logs:us-east-1:369970405415:*"]
+  }
+
+  statement {
+    # Read-only, both metrics tables -- Fase 2's own (written by the 4 embed
+    # Lambdas via embed_lambda_role's PutItem-only grant above) and Fase 1's
+    # pre-existing architecture_metrics (written by the 4 ingestion Lambdas,
+    # see ingest_lambda_role). Scan, not Query, on both: neither table's keys
+    # support a cycle_started_at range query (see fetch_embedding_metrics/
+    # fetch_architecture_metrics docstrings in digest_metrics/handler.py).
+    effect = "Allow"
+    actions = ["dynamodb:Scan"]
+    resources = [
+      aws_dynamodb_table.embedding_metrics.arn,
+      aws_dynamodb_table.architecture_metrics.arn,
+    ]
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["ses:SendEmail", "ses:SendRawEmail"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "digest_metrics_permissions" {
+  name   = "poly-rag-digest-metrics-permissions"
+  role   = aws_iam_role.digest_metrics_lambda_role.id
+  policy = data.aws_iam_policy_document.digest_metrics_permissions.json
 }

@@ -378,8 +378,10 @@ resource "aws_lambda_function" "embed_news_article" {
   # bootstrap, see tech_debt.md). Steady-state cycle volume (~700-900
   # articles) is far smaller than that bootstrap, but 900s gives real
   # headroom given Bedrock pacing latency is the dominant cost, not CPU.
-  # Terminal stage -- does NOT invoke anything further (Fase 3 is out of
-  # scope for now, see handler.py docstring).
+  # Invokes digest_metrics as its last act (split out 2026-08-22 -- the
+  # report email used to be sent inline here, see digest_metrics/handler.py
+  # for why that got its own Lambda). Fase 3 (write to LanceDB) is still out
+  # of scope for THIS Lambda's own chaining -- see handler.py docstring.
   timeout     = 900
   memory_size = 256
 
@@ -389,6 +391,34 @@ resource "aws_lambda_function" "embed_news_article" {
   environment {
     variables = {
       S3_BUCKET                  = aws_s3_bucket.poly_rag_data.bucket
+      EMBEDDING_METRICS_TABLE    = aws_dynamodb_table.embedding_metrics.name
+      DIGEST_METRICS_LAMBDA_NAME = aws_lambda_function.digest_metrics.function_name
+    }
+  }
+}
+
+data "archive_file" "digest_metrics" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/digest_metrics/handler.py"
+  output_path = "${path.module}/build/digest_metrics.zip"
+}
+
+resource "aws_lambda_function" "digest_metrics" {
+  function_name = "poly-rag-digest-metrics"
+  role          = aws_iam_role.digest_metrics_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Terminal stage of the whole cycle (Fase 1 + Fase 2) -- split out of
+  # embed_news_article 2026-08-22, see handler.py docstring for why. Just 2
+  # DynamoDB Scans + 1 SES send, no Bedrock call -- short timeout is enough.
+  timeout     = 60
+  memory_size = 128
+
+  filename         = data.archive_file.digest_metrics.output_path
+  source_code_hash = data.archive_file.digest_metrics.output_base64sha256
+
+  environment {
+    variables = {
       EMBEDDING_METRICS_TABLE    = aws_dynamodb_table.embedding_metrics.name
       ARCHITECTURE_METRICS_TABLE = aws_dynamodb_table.architecture_metrics.name
       SES_SENDER                 = "bernardolw@gmail.com"
