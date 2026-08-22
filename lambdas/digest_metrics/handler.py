@@ -32,6 +32,7 @@ Invoked by embed_news_article at the very end of the embedding chain, with
 cycle_started_at. Terminal -- sends no further invocation.
 """
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -41,9 +42,11 @@ EMBEDDING_METRICS_TABLE = os.environ.get("EMBEDDING_METRICS_TABLE", "poly-rag-em
 ARCHITECTURE_METRICS_TABLE = os.environ.get("ARCHITECTURE_METRICS_TABLE", "poly-rag-architecture-metrics")
 SES_SENDER = os.environ.get("SES_SENDER", "bernardolw@gmail.com")
 SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
+WRITE_LANCEDB_LAMBDA_NAME = os.environ.get("WRITE_LANCEDB_LAMBDA_NAME", "poly-rag-write-lancedb")
 
 dynamodb = boto3.resource("dynamodb")
 ses = boto3.client("ses")
+lambda_client = boto3.client("lambda")
 
 
 def fetch_embedding_metrics(cycle_started_at):
@@ -174,9 +177,20 @@ def lambda_handler(event, context):
     fase1_rows = fetch_architecture_metrics(cycle_started_at)
     send_metrics_report(cycle_started_at, fase1_rows, fase2_rows)
 
+    # Terminal stage of the report itself, but not of the cycle -- Fase 3
+    # (write to LanceDB) is chained here (2026-08-22), after the report has
+    # been sent, so a slow/failed Fase 3 write never delays or blocks the
+    # email. See write_lancedb/handler.py for what it does.
+    lambda_client.invoke(
+        FunctionName=WRITE_LANCEDB_LAMBDA_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({"cycle_started_at": cycle_started_at}),
+    )
+
     return {
         "cycle_started_at": cycle_started_at,
         "fase1_rows": len(fase1_rows),
         "fase2_rows": len(fase2_rows),
         "metrics_report_sent": True,
+        "write_lancedb_invoked": WRITE_LANCEDB_LAMBDA_NAME,
     }

@@ -157,6 +157,15 @@ data "aws_iam_policy_document" "digest_metrics_permissions" {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
     resources = ["*"]
   }
+
+  statement {
+    # digest_metrics invokes write_lancedb as the true last step of the
+    # cycle, after the report email is sent (2026-08-22, see
+    # write_lancedb/handler.py).
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.write_lancedb.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "digest_metrics_permissions" {

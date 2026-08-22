@@ -423,8 +423,29 @@ resource "aws_lambda_function" "digest_metrics" {
       ARCHITECTURE_METRICS_TABLE = aws_dynamodb_table.architecture_metrics.name
       SES_SENDER                 = "bernardolw@gmail.com"
       SES_RECIPIENT              = "bernardolw@gmail.com"
+      WRITE_LANCEDB_LAMBDA_NAME  = aws_lambda_function.write_lancedb.function_name
     }
   }
+}
+
+# Fase 3 -- the only container-image Lambda in this project (2026-08-22).
+# LanceDB's real dependency footprint is 339MB unzipped, over the 250MB
+# zip/Layer limit every other Lambda here uses (see write_lancedb/handler.py
+# and tech_debt.md "Vector Store Choice"). image_uri is NOT built from an
+# archive_file -- the image must already exist in ECR before this resource
+# can be created (see lambdas/write_lancedb/Dockerfile, pushed manually via
+# docker/aws ecr, not by terraform itself).
+resource "aws_lambda_function" "write_lancedb" {
+  function_name = "poly-rag-write-lancedb"
+  role          = aws_iam_role.write_lancedb_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.write_lancedb.repository_url}:latest"
+  # Terminal stage of the whole cycle -- invokes nothing further. Per-cycle
+  # write is 4 sources x a few hundred rows each (~1-2s per source measured
+  # 2026-08-22 against the real corpus) -- generous headroom, not a tight
+  # budget.
+  timeout     = 120
+  memory_size = 512
 }
 
 data "archive_file" "embed_orchestrator" {
