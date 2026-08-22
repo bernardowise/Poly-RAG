@@ -107,7 +107,7 @@ def list_cycle_keys(prefix, cycle_range=None):
     lexicographic order IS chronological order. Cycle numbers are assigned per
     prefix, but every prefix has the same 12 cycles by construction (a cycle is
     only complete when all 4 stages wrote their file -- see
-    runbook_verify_cycle_health.md), so cycle N means the same instant in
+    runbook_verify_phase1_health.md), so cycle N means the same instant in
     `news/` as it does in `digest/`.
     """
     keys = []

@@ -1639,7 +1639,7 @@ live.** Two things happened, in order:
    deploy the same day, and nobody had come back for it. Measured precisely: the 2026-08-19T00
    and T12 cycles had **1,798 articles with neither field** (0/922, 0/876), growing by roughly
    900/cycle. The user asked directly whether this would have been caught by
-   `runbook_verify_cycle_health.md` -- it would NOT have: that runbook's own Paso 5 explicitly
+   `runbook_verify_phase1_health.md` -- it would NOT have: that runbook's own Paso 5 explicitly
    said "skip this check until the tagging is connected," so a runbook run against either
    gapped cycle would have reported 4/4 green with a grey note, not a failure. Corrected the
    runbook the same day (see its own changelog) to assert on missing fields instead of skipping.
@@ -1665,7 +1665,7 @@ zip from `Code.Location` and diffed `handler.py` against the repo -- byte-identi
 invoked to confirm; the next automatic cycle is the first real test.
 
 **Revisit if:** the next automatic cycle's `news/*.json` doesn't carry both fields on 100% of
-its articles (per the corrected `runbook_verify_cycle_health.md`, Paso 5 -- that would now be a
+its articles (per the corrected `runbook_verify_phase1_health.md`, Paso 5 -- that would now be a
 real regression, not a known gap).
 
 ---
