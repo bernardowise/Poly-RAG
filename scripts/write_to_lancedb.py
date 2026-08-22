@@ -154,6 +154,25 @@ def main():
     print(f"vectors read  : {len(vectors):,}  (all checkpoint parts currently in S3 for this variant/model)")
 
     rows, missing = join_text(vectors, chunks)
+    # _lineage (added 2026-08-22 to chunk_* Lambda output for provenance
+    # tracing, see tech_debt.md) rides along into the vector checkpoint
+    # record via embed_*'s `{k: v for k, v in chunk.items() if k != "text"}`,
+    # but older slices written before that fix don't have it. Similarly, the
+    # older one-off bootstrap script tagged chunks with cycle_key/cycle_number,
+    # while the newer per-cycle Lambdas use cycle_started_at instead (comments
+    # specifically -- verified 2026-08-22: bootstrap and cycle 14 chunk records
+    # otherwise match). LanceDB's merge_insert tolerates a batch with FEWER
+    # fields than the table's existing schema (padded with null) but hard-fails
+    # on a batch with a field the schema doesn't already have -- so any of
+    # these cycle-bookkeeping fields can break a later write depending on
+    # which slice created the table first. None of the 4 are part of the
+    # documented retrieval filter set (market_id/temporal_tier/
+    # market_status_at_publish/link_type/comment_entity_id, see
+    # architecture_canon.md), so drop all of them uniformly rather than
+    # patch per-source schema drift as it's discovered.
+    for r in rows:
+        for stale_field in ("_lineage", "cycle_key", "cycle_number", "cycle_started_at"):
+            r.pop(stale_field, None)
     dupes = len(vectors) - len(rows) - len(missing)
     print(f"joined rows   : {len(rows):,}")
     if dupes > 0:
@@ -213,7 +232,7 @@ def main():
 
     if after >= MIN_ROWS_FOR_INDEX:
         print(f"  building vector index ({after:,} >= {MIN_ROWS_FOR_INDEX:,} row threshold)...")
-        tbl.create_index(metric="cosine")
+        tbl.create_index(vector_column_name="embedding", metric="cosine")
     else:
         print(f"  skipping vector index ({after:,} < {MIN_ROWS_FOR_INDEX:,}) -- "
               f"brute-force search is exact and fast at this size")
