@@ -3004,3 +3004,59 @@ interval. No action taken per explicit user request.
 **Revisit if:** a future cycle's Phase 2 healthcheck (once `runbook_verify_
 phase2_health.md` gets its own first real run) finds either bug's symptom again --
 would indicate a regression, not a known gap.
+
+---
+
+## Phase 3 (write_to_lancedb.py) Closed for All 4 Sources, Full 14-Cycle Corpus (2026-08-22)
+
+**Context:** same day as the two Phase 2 bugs above, `write_to_lancedb.py` was run for
+the first time against the real full corpus, not just the Friday 5-cycle news_article
+slice it had been verified against before. Scope was all 4 embedded sources (registry,
+comments, digest, news_article), each in 2 slices (the multi-cycle bootstrap/
+cycles_01-13 file, then cycle 14's own per-cycle file) -- 8 dry runs, all clean, then 8
+real writes.
+
+**Three real bugs found and fixed in the script itself, none in production Lambdas:**
+
+1. `tbl.create_index(metric="cosine")` used LanceDB's default
+   `vector_column_name="vector"`, but this project's column is `embedding` --
+   every index build failed with `Schema Error: Field path 'vector' not found`
+   right after a successful data write (data was never lost, only the index step
+   failed). Fixed with `vector_column_name="embedding"` explicit.
+2. `_lineage` (added earlier the same day to `chunk_*` Lambda output, see the entry
+   above) rides into the vector checkpoint record via `embed_*`'s
+   `{k: v for k, v in chunk.items() if k != "text"}`, so any chunk written after
+   that fix carries it into the vector too. Writing cycle 14's registry vectors
+   into a table first created from the pre-fix bootstrap slice (no `_lineage`
+   column) failed: `ValueError: Field '_lineage' not found in target schema`.
+3. Same failure mode, different field: the older `bootstrap_chunk_corpus.py`
+   tagged comment chunks with `cycle_key`/`cycle_number`, while the newer
+   `chunk_comments` Lambda uses `cycle_started_at` instead. Writing cycle 14's
+   comments into the bootstrap-created `comments_cohere` table failed:
+   `ValueError: Field 'cycle_started_at' not found in target schema`.
+
+**Root cause, all three:** LanceDB's `merge_insert` tolerates a batch with FEWER
+fields than the table's existing schema (missing fields get padded null), but
+hard-fails on a batch introducing a field the schema doesn't already have. Since the
+table's schema is locked in by whichever slice created it first, and this project's
+chunk format evolved mid-corpus (bootstrap script vs. the newer per-cycle Lambdas),
+any newer slice written after an older one risks introducing a field the older
+slice never had.
+
+**Fix:** drop `_lineage`, `cycle_key`, `cycle_number`, and `cycle_started_at` from
+every row before writing, uniformly, regardless of which are actually present.
+None of the four are part of the documented retrieval filter set (`market_id`/
+`temporal_tier`/`market_status_at_publish`/`link_type`/`comment_entity_id`, see
+architecture_canon.md), so dropping them costs nothing at query time and closes
+this whole class of schema drift instead of patching it field-by-field as new
+mismatches surface.
+
+**Result, verified via `count_rows()` on each table after writing:** `registry_cohere`
+1,115 rows, `comments_cohere` 786, `digest_cohere` 14, `news_article_cohere` 9,832 --
+11,747 vectors total, all 4 embedded sources, all 14 cycles. Phase 3 is now closed for
+all 4 sources (previously only `news_article`'s Friday 5-cycle slice, 2,744 rows, had
+ever been written).
+
+**Revisit if:** a future chunk format change (a 5th field renamed or added) breaks a
+merge again -- the fix above is a fixed exclusion list, not a general schema
+reconciliation, so it will need extending by hand each time the chunk schema drifts.

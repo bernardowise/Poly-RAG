@@ -202,9 +202,22 @@ bootstrap (1,090 registry + 749 comments + 13 digest + 9,235 news_article
 chunks, 11,087 vectors) plus cycle 14's own automatic-cycle vectors (25
 registry + 37 comments + 1 digest + 603 news_article, 666 vectors, verified
 zero gaps against their source chunk files). `news_paragraph` is deliberately
-not built yet (see Pending below). Nothing is written to a vector store yet —
-Phase 3 is explicitly out of scope for now; vectors are durable in S3 under
-`vectors/_checkpoints/<source>/cohere/`.
+not built yet (see Pending below).
+
+**Phase 3 (write to LanceDB) closed for all 4 embedded sources, same day
+(2026-08-22):** `scripts/write_to_lancedb.py`, previously verified only against
+a 5-cycle news_article slice, was run against the full 14-cycle corpus for all
+4 sources — `registry_cohere` 1,115 rows, `comments_cohere` 786,
+`digest_cohere` 14, `news_article_cohere` 9,832 rows (11,747 vectors total),
+all in S3 under `lancedb/`. Fixed three real schema-drift bugs in the script
+along the way (wrong vector column name for index creation, and two cases of
+LanceDB rejecting a later write that introduced a field — `_lineage`,
+`cycle_started_at` — the first-created table's schema didn't have; see
+tech_debt.md for the full diagnosis). `news_paragraph` still has no chunks to
+write. Phase 3 as an automatic Lambda (container image, LanceDB's real
+dependency footprint is 339MB unzipped, over Lambda's 250MB zip/Layer limit)
+is still not built — this was a one-off write, not a connection to the
+automatic cycle.
 
 ## Pending / TODO
 
@@ -239,14 +252,16 @@ Phase 3 is explicitly out of scope for now; vectors are durable in S3 under
     unblocking correlation against older news. A real orphan-data finding (305
     articles referencing purged markets) was left untouched by choice, to be
     handled at query time.
-  - **Vector store: decided (LanceDB), not yet connected to the automatic
-    cycle.** Chosen 2026-08-22 on measured 3-12 month storage growth against
-    real free-tier ceilings (Qdrant/Pinecone would be exhausted in 2-4 months at
-    current growth; LanceDB's real cost at 12 months is ~$0.33/month in S3
-    storage, no managed-service tier to outgrow). A one-off write script
-    (`scripts/write_to_lancedb.py`) is built and verified against the corpus;
-    Phase 3 as a Lambda needs a container image (LanceDB's real dependency
-    footprint measured at 339MB unzipped, over Lambda's 250MB zip/Layer limit) —
+  - **Vector store: decided (LanceDB), written for all 4 sources, not yet
+    connected to the automatic cycle.** Chosen 2026-08-22 on measured 3-12
+    month storage growth against real free-tier ceilings (Qdrant/Pinecone would
+    be exhausted in 2-4 months at current growth; LanceDB's real cost at 12
+    months is ~$0.33/month in S3 storage, no managed-service tier to outgrow).
+    The one-off write script (`scripts/write_to_lancedb.py`) was run the same
+    day against the full 14-cycle corpus for registry/comments/digest/
+    news_article (11,747 vectors total, see Status above) — Phase 3 as a
+    Lambda still needs a container image (LanceDB's real dependency footprint
+    measured at 339MB unzipped, over Lambda's 250MB zip/Layer limit) and is
     deliberately deferred, not yet built.
   - **`news_paragraph` deliberately paused**, not abandoned — explicit user
     decision to prove one chunking variant end-to-end (chunk → embed → store →
