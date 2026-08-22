@@ -66,7 +66,7 @@ s3 = boto3.client("s3")
 
 
 def scan_new_registry_items(cycle_started_at):
-    """Full registry scan, filtered client-side by first_seen > cycle_started_at.
+    """Full registry scan, filtered client-side by first_seen >= cycle_started_at.
 
     Corrected 2026-08-22, same session: the first version computed a fixed
     12h lookback window (cycle_started_at minus CYCLE_INTERVAL_HOURS) to
@@ -77,21 +77,28 @@ def scan_new_registry_items(cycle_started_at):
     first_seen already answers directly: cycle_started_at is captured once
     at the START of the whole Fase 1 chain (in ingest_polymarket), BEFORE any
     market from this cycle gets written -- so any item with
-    first_seen > cycle_started_at is, by construction, one that entered
+    first_seen >= cycle_started_at is, by construction, one that entered
     during this exact cycle, with no assumption about cadence, no lookback
-    math, and no dependency on when the prior cycle happened to run."""
+    math, and no dependency on when the prior cycle happened to run.
+
+    Second correction, also 2026-08-22 (found verifying cycle 14's real
+    output was 0 despite 25 markets actually entering): ingest_polymarket
+    captures a single now_iso and reuses it for BOTH first_seen (of every
+    market upserted that cycle) AND cycle_started_at threaded through the
+    whole chain -- so first_seen is never strictly greater than
+    cycle_started_at, it is exactly equal. The filter must be >=, not >."""
     table = dynamodb.Table(REGISTRY_TABLE)
     new_items = []
     response = table.scan()
     for item in response["Items"]:
         first_seen = item.get("first_seen")
-        if first_seen and first_seen > cycle_started_at:
+        if first_seen and first_seen >= cycle_started_at:
             new_items.append(item)
     while "LastEvaluatedKey" in response:
         response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
         for item in response["Items"]:
             first_seen = item.get("first_seen")
-            if first_seen and first_seen > cycle_started_at:
+            if first_seen and first_seen >= cycle_started_at:
                 new_items.append(item)
     return new_items
 
