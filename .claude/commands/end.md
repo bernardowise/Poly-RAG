@@ -46,3 +46,9 @@ reemplazada, un debt resuelto, un mitigation ya aplicado, un riesgo que ya no ap
 Si encuentras una inconsistencia, corrigela directamente en tech_debt.md como parte de
 este mismo /end -- no esperes a que el usuario lo pida. Si no hay nada que actualizar,
 no toques el archivo.
+
+**Tambien revisa `README.md`** (raiz del repo) por la misma logica: si el bloque de
+trabajo cambio arquitectura, estado del pipeline, cifras del corpus, o el mapa de
+Pending/TODO, actualiza el README en el mismo paso -- no esperes a que el usuario lo
+pida por separado. Si nada de lo que se hizo este bloque afecta lo que el README
+describe, no lo toques.

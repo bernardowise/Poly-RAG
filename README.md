@@ -170,26 +170,41 @@ snapshot of everything above — this README is a summary of it, not a replaceme
 
 Verified in production: the full Phase 1 chain (4 Lambdas) runs unattended on the
 00:00/12:00 UTC schedule with no manual intervention, cost/latency/tokens logged
-per invocation to `poly-rag-architecture-metrics`. As of 2026-08-22, the full
-Phase 2 chain (9 Lambdas — chunking + embedding) is deployed and connected to
-fire automatically at the end of every Phase 1 cycle; the next automatic
-EventBridge cycle is its first real production test (no Lambda has been manually
-invoked to test it, per this project's hard rule against manual invocation of
-production Lambdas — see CLAUDE.md).
+per invocation to `poly-rag-architecture-metrics`. The full Phase 2 chain (9
+Lambdas — chunking + embedding) is deployed and connected to fire automatically
+at the end of every Phase 1 cycle. Its first real production test (cycle 14,
+2026-08-22 12:00 UTC) surfaced two real bugs, both diagnosed and fixed the same
+day without any manual Lambda invocation: an IAM policy scoped to only 3 AWS
+regions, insufficient for where the `global.` cross-region Bedrock profile
+actually routes (`AccessDeniedException` in `embed_digest`, broke the chain
+before it reached the other 3 embed Lambdas); and `chunk_registry` comparing
+`first_seen > cycle_started_at` when `ingest_polymarket` sets both fields to the
+exact same timestamp, so the comparison must be `>=` — this one silently
+returned 0 new markets every cycle since the Lambda was written, not just on
+cycle 14. Both fixed and deployed, cycle 14's registry gap closed via a local
+one-off (chunk_registry + embed_registry re-run against real chunk data, no
+Lambda invoked). A dedicated Phase 2 healthcheck runbook
+(`.claude/claude_docs/runbook_verify_phase2_health.md`) was written the same
+day, encoding checks that would have caught both bugs — cross-checking
+`chunk_registry`'s output against `send_digest`'s already-verified
+`newly_tracked_markets` count, and a CloudWatch error sweep across all 8 Phase 2
+Lambdas.
 
-**Corpus, as of 2026-08-22 (13 complete cycles, registry growing every cycle):**
-1,090 registry markets, 8,980 news articles, 12,108 comments, and 102,997+ odds
-snapshots (a growing mix of `cycle` and `clob_backfill` provenance — most markets
-now carry history back to their real creation date, not just since we started
-tracking them).
+**Corpus, as of 2026-08-22 (14 complete cycles, registry growing every cycle):**
+1,090+ registry markets, 8,980+ news articles, 12,108+ comments, and 102,997+
+odds snapshots (a growing mix of `cycle` and `clob_backfill` provenance — most
+markets now carry history back to their real creation date, not just since we
+started tracking them).
 
 **Embedded and verified in a real vector space** (Cohere Embed v4, via the
-`global.cohere.embed-v4:0` cross-region inference profile): 1,090 registry + 749
-comments + 13 digest + 9,235 news_article chunks — 11,087 vectors total, 1536-dim,
-L2-normalized, zero gaps against their source chunk files. `news_paragraph` is
-deliberately not built yet (see Pending below). Nothing is written to a vector
-store yet — Phase 3 is explicitly out of scope for now; vectors are durable in S3
-under `vectors/_checkpoints/<source>/cohere/`.
+`global.cohere.embed-v4:0` cross-region inference profile): the Friday/Saturday
+bootstrap (1,090 registry + 749 comments + 13 digest + 9,235 news_article
+chunks, 11,087 vectors) plus cycle 14's own automatic-cycle vectors (25
+registry + 37 comments + 1 digest + 603 news_article, 666 vectors, verified
+zero gaps against their source chunk files). `news_paragraph` is deliberately
+not built yet (see Pending below). Nothing is written to a vector store yet —
+Phase 3 is explicitly out of scope for now; vectors are durable in S3 under
+`vectors/_checkpoints/<source>/cohere/`.
 
 ## Pending / TODO
 

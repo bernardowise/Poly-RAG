@@ -2934,3 +2934,73 @@ still the real fix and is still not done. Whether Pinecone or Qdrant would also 
 ambiguous write outright, or silently overwrite as originally assumed, is unverified and
 worth checking when either is coded in Day 6 -- do not assume LanceDB's fail-loud
 behavior generalizes to the other two stores.
+
+---
+
+## Phase 2's First Real Production Cycle Surfaced Two Real Bugs (2026-08-22, both CLOSED same day)
+
+**Context:** cycle 14 (2026-08-22 12:00 UTC) was the first time the full Phase 2 chain
+(`embed_orchestrator` -> 4 chunking Lambdas in parallel -> 4 embedding Lambdas in
+sequence) ran automatically in production, with no manual invocation. It failed in two
+independent, silent ways, verified entirely via CloudWatch Logs / S3 / DynamoDB reads --
+no Lambda was manually invoked to diagnose or fix either one.
+
+**Bug 1 -- IAM region scope too narrow for the `global.` cross-region profile.**
+`embed_digest` threw `AccessDeniedException` on its first real `bedrock:InvokeModel`
+call. The policy (`terraform/iam_embed_lambda.tf`) granted the `foundation-model/
+cohere.embed-v4:0` resource ARN in exactly 3 US regions (us-east-1/2, us-west-2) --
+enough for the `us.` cross-region profile, but the `global.` profile (chosen precisely
+because it survived two earlier daily-quota outages, see "Phase 2 Embedding Bootstrap"
+above) can route outside those 3 regions. Since `embed_digest` is the first Lambda in
+the strict sequential chain, its failure meant `embed_comments`/`embed_registry`/
+`embed_news_article` never ran at all -- confirmed via `aws logs describe-log-groups`
+showing zero log streams ever for those three. **Fix:** region-wildcarded the
+`foundation-model` resource ARN (`arn:aws:bedrock:*::foundation-model/
+cohere.embed-v4:0` -- safe because these ARNs never carry an account id). Verified
+live by importing `embed_digest/handler.py` and calling Bedrock directly against a real
+cycle 14 chunk, no Lambda invoked.
+
+**Bug 2 -- `chunk_registry`'s comparison used `>` when the data model guarantees
+equality, not strict inequality.** The user asked directly why `chunk_registry`
+reported 0 new markets for cycle 14 when `send_digest`'s own digest already reported
+`newly_tracked_markets: 25` for the same cycle -- a real cross-check against a
+number Phase 1 had already computed independently, not a guess. Root cause:
+`ingest_polymarket` computes a single `now_iso` once at the top of its handler and
+reuses that exact same value both as `first_seen` on every market it upserts that
+cycle AND as `cycle_started_at` threaded through the entire chain (`invoke_next_stage
+(now_iso)`). So `first_seen` is never strictly greater than `cycle_started_at` for a
+market that entered this cycle -- it is exactly equal. `chunk_registry`'s filter
+(`first_seen > cycle_started_at`) silently returned 0 markets **every cycle since the
+Lambda was written**, not just on cycle 14 -- this was not a cycle-14-specific
+regression, it was latent from the design correction earlier the same day (see
+"registry sin eje de ciclo real" in architecture_canon.md). **Fix:** `>=` instead of
+`>` in `scan_new_registry_items` (`lambdas/chunk_registry/handler.py`), both
+occurrences. Verified with a dry run against the real cycle 14 `cycle_started_at`
+(25 markets found, matching `send_digest`'s count exactly), then re-run for real
+(`chunk_registry` + `embed_registry`, `skip_chain: true`, no Lambda invoked) to close
+cycle 14's registry gap -- 25 chunks, 25 vectors, verified zero duplicates in S3.
+
+**Mitigation, both bugs:** fixed same day, deployed via `terraform apply` (user-run,
+per the auto-mode classifier blocking `terraform apply` from this environment). A new
+runbook, `.claude/claude_docs/runbook_verify_phase2_health.md`, was written the same
+day specifically encoding checks that would have caught both bugs without depending on
+"did the report email arrive" -- Paso 1 cross-checks `chunk_registry` output against
+`send_digest`'s `newly_tracked_markets` (bug 2), Paso 3 sweeps CloudWatch for errors
+across all 8 Phase 2 Lambdas (bug 1).
+
+**Also found, not fixed by choice (user declined the anotation, recorded here only
+because it is a distinct, real finding, not swept under the registry fix above):** the
+first attempt at the cycle 14 one-off was interrupted by a tool permission prompt
+after it had already done real embedding work against Bedrock (roughly 313 of
+news_article's 603 chunks) but before it reached its first checkpoint (every 500
+chunks). That work was never persisted, so the final successful run re-embedded those
+same chunks from scratch -- confirmed via duplicate `chunk_count` sequences in
+`poly-rag-embedding-metrics` (the exact same batch-size sequence appearing twice back
+to back). Final data is correct (603 unique vectors, zero duplicates in the S3
+checkpoint), but real Bedrock cost was paid twice for that slice. Not a code bug --
+an interaction between interrupted-tool-call handling and the 500-chunk checkpoint
+interval. No action taken per explicit user request.
+
+**Revisit if:** a future cycle's Phase 2 healthcheck (once `runbook_verify_
+phase2_health.md` gets its own first real run) finds either bug's symptom again --
+would indicate a regression, not a known gap.
