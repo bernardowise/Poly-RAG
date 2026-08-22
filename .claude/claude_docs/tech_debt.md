@@ -3060,3 +3060,38 @@ ever been written).
 **Revisit if:** a future chunk format change (a 5th field renamed or added) breaks a
 merge again -- the fix above is a fixed exclusion list, not a general schema
 reconciliation, so it will need extending by hand each time the chunk schema drifts.
+
+---
+
+## Second LLM Pass ("Query the Cycle") Is the Day 5 Synthesis Agent, Not a New Idea (raised 2026-08-22)
+
+**Context:** right after closing Fase 3 (write_lancedb), the user proposed a Lambda at
+the very end of the automatic pipeline (after write_lancedb) that would be "the second
+LLM pass" -- the first being the verifiability classifier at ingestion
+(`ingest_polymarket`) -- this time letting the LLM answer questions about the just-
+ingested cycle, similar to how retrieval will eventually work. The user was explicit
+that the idea wasn't fully formed yet and asked directly whether RAG (Bloque G /
+Day 4 retrieval) needs to exist first.
+
+**Answer, and why it matters:** the scope of the question determines the dependency.
+- **Cycle-scoped questions** ("what moved most this cycle") need nothing new --
+  `send_digest`'s `executive_summary` already does this today, one LLM call over that
+  cycle's own structured digest JSON, no retrieval involved.
+- **Cross-cycle/cross-source questions** ("how has this market moved since it entered",
+  "what did coverage say about X over the last 3 cycles") are exactly this project's
+  real differentiator (the self-built historical time-series, see README "Why this
+  exists") and genuinely require retrieval -- there is no way to assemble that context
+  without a metadata+semantic index over the accumulated corpus.
+
+**Conclusion:** this is not a new Lambda to design -- it is the Day 5 synthesis agent,
+already tracked (see "Guardrails Against Unbounded Structured Queries", "RAG Evaluation
+Metrics Landscape", and the LLM-as-internet-search-substitute entries above, all under
+Day 5). Its dependency on Day 4 (RAG retrieval, Bloque G) was already the documented
+order in README's Pending/TODO before this conversation -- this entry just records that
+the user independently arrived at the same conclusion from a different angle (proposing
+the feature, not reading the roadmap), which is a useful confirmation that the
+sequencing is right, not a new decision.
+
+**Revisit when:** Bloque G (retrieval) is built and Day 5 synthesis agent design
+actually starts -- fold this framing (cycle-scoped vs. cross-cycle questions) into
+that design instead of treating it as a separate feature.

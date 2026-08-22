@@ -204,26 +204,37 @@ registry + 37 comments + 1 digest + 603 news_article, 666 vectors, verified
 zero gaps against their source chunk files). `news_paragraph` is deliberately
 not built yet (see Pending below).
 
-**Phase 3 (write to LanceDB) closed for all 4 embedded sources, same day
-(2026-08-22):** `scripts/write_to_lancedb.py`, previously verified only against
-a 5-cycle news_article slice, was run against the full 14-cycle corpus for all
-4 sources — `registry_cohere` 1,115 rows, `comments_cohere` 786,
-`digest_cohere` 14, `news_article_cohere` 9,832 rows (11,747 vectors total),
-all in S3 under `lancedb/`. Fixed three real schema-drift bugs in the script
-along the way (wrong vector column name for index creation, and two cases of
-LanceDB rejecting a later write that introduced a field — `_lineage`,
+**Phase 3 (write to LanceDB) closed for all 4 embedded sources AND connected to
+the automatic cycle, same day (2026-08-22):** `scripts/write_to_lancedb.py`
+was first run manually against the full 14-cycle corpus for all 4 sources —
+`registry_cohere` 1,115 rows, `comments_cohere` 786, `digest_cohere` 14,
+`news_article_cohere` 9,832 rows (11,747 vectors total), all in S3 under
+`lancedb/`. Fixed three real schema-drift bugs in the script along the way
+(wrong vector column name for index creation, and two cases of LanceDB
+rejecting a later write that introduced a field — `_lineage`,
 `cycle_started_at` — the first-created table's schema didn't have; see
-tech_debt.md for the full diagnosis). `news_paragraph` still has no chunks to
-write. Phase 3 as an automatic Lambda (container image, LanceDB's real
-dependency footprint is 339MB unzipped, over Lambda's 250MB zip/Layer limit)
-is still not built — this was a one-off write, not a connection to the
-automatic cycle.
+tech_debt.md). That logic was then ported into a new Lambda,
+`poly-rag-write-lancedb` — this project's only container-image Lambda
+(LanceDB's real dependency footprint is 339MB unzipped, over the 250MB
+zip/Layer limit), deployed via a new ECR repo. Chained after a new
+`poly-rag-digest-metrics` Lambda, split out of `embed_news_article` the same
+day (the cycle cost/latency/tokens report email was living in a Lambda named
+for embedding, not reporting — see tech_debt.md). Full chain as of today:
+`embed_digest → embed_comments → embed_registry → embed_news_article →
+digest_metrics → write_lancedb`. Deliberately does not rebuild the vector
+index every cycle (only `merge_insert`s new rows) — index rebuild cost scales
+with table size, not new-row count, so it's a separate lower-cadence concern.
+IAM verified against the real deployed roles via `iam simulate-principal-policy`
+before declaring this done; no automatic cycle has fired the full new chain
+end-to-end yet as of this writing, so treat it as verified-but-unproven until
+one does.
 
 ## Pending / TODO
 
-- **RAG retrieval (Day 4)** — chunking and embedding for 4 of 5 sources **done,
-  connected to the automatic cycle, and verified**; vector store and retrieval
-  not started.
+- **RAG retrieval (Day 4)** — chunking, embedding, and vector store write for 4
+  of 5 sources **done, connected to the automatic cycle** (verification of the
+  full new chain still pending its first real automatic cycle, see Status);
+  retrieval itself (the actual query layer) not started.
   - **Chunking + embedding (steps 1-2, done for registry/comments/digest/
     news_article).** Strategy closed for all sources; `news_paragraph` was
     deliberately paused (see below) so the whole pipeline could be proven
@@ -252,17 +263,17 @@ automatic cycle.
     unblocking correlation against older news. A real orphan-data finding (305
     articles referencing purged markets) was left untouched by choice, to be
     handled at query time.
-  - **Vector store: decided (LanceDB), written for all 4 sources, not yet
-    connected to the automatic cycle.** Chosen 2026-08-22 on measured 3-12
-    month storage growth against real free-tier ceilings (Qdrant/Pinecone would
-    be exhausted in 2-4 months at current growth; LanceDB's real cost at 12
-    months is ~$0.33/month in S3 storage, no managed-service tier to outgrow).
-    The one-off write script (`scripts/write_to_lancedb.py`) was run the same
-    day against the full 14-cycle corpus for registry/comments/digest/
-    news_article (11,747 vectors total, see Status above) — Phase 3 as a
-    Lambda still needs a container image (LanceDB's real dependency footprint
-    measured at 339MB unzipped, over Lambda's 250MB zip/Layer limit) and is
-    deliberately deferred, not yet built.
+  - **Vector store: decided (LanceDB), written for all 4 sources, connected to
+    the automatic cycle.** Chosen 2026-08-22 on measured 3-12 month storage
+    growth against real free-tier ceilings (Qdrant/Pinecone would be exhausted
+    in 2-4 months at current growth; LanceDB's real cost at 12 months is
+    ~$0.33/month in S3 storage, no managed-service tier to outgrow). The
+    one-off write script (`scripts/write_to_lancedb.py`) proved the design
+    against the full 14-cycle corpus (11,747 vectors total, see Status above),
+    then its logic was ported into `poly-rag-write-lancedb`, a container-image
+    Lambda (LanceDB's real dependency footprint measured at 339MB unzipped,
+    over Lambda's 250MB zip/Layer limit) chained after the new
+    `poly-rag-digest-metrics` Lambda — see Status above for the full chain.
   - **`news_paragraph` deliberately paused**, not abandoned — explicit user
     decision to prove one chunking variant end-to-end (chunk → embed → store →
     query) before doubling the corpus with a second one. Revisit once retrieval
