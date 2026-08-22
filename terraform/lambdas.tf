@@ -160,3 +160,269 @@ resource "aws_lambda_function" "send_digest" {
     }
   }
 }
+
+# ---------------------------------------------------------------------------
+# Fase 2 (embedding) -- added 2026-08-22. 9 Lambdas: embed_orchestrator (fans
+# out chunking, kicks off the sequential embed chain), 4 chunking Lambdas
+# (parallel, no shared resource risk), 4 embedding Lambdas (sequential --
+# see embed_orchestrator/handler.py docstring for why parallel embedding was
+# rejected: all 4 draw against the same Cohere TPM ceiling). All share
+# embed_lambda_role (see iam_embed_lambda.tf) -- registry read-only, no
+# Fase 1 dedup/lock table access, Bedrock scoped to Cohere Embed v4 only.
+# ---------------------------------------------------------------------------
+
+data "archive_file" "chunk_registry" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/chunk_registry/handler.py"
+  output_path = "${path.module}/build/chunk_registry.zip"
+}
+
+resource "aws_lambda_function" "chunk_registry" {
+  function_name = "poly-rag-chunk-registry"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Full registry scan (~1,090 items today, boto3 only) filtered client-side
+  # by first_seen -- fast, no external HTTP, no Bedrock call in this Lambda.
+  timeout     = 60
+  memory_size = 128
+
+  filename         = data.archive_file.chunk_registry.output_path
+  source_code_hash = data.archive_file.chunk_registry.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET      = aws_s3_bucket.poly_rag_data.bucket
+      REGISTRY_TABLE = aws_dynamodb_table.market_registry.name
+    }
+  }
+}
+
+data "archive_file" "chunk_comments" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/chunk_comments/handler.py"
+  output_path = "${path.module}/build/chunk_comments.zip"
+}
+
+resource "aws_lambda_function" "chunk_comments" {
+  function_name = "poly-rag-chunk-comments"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # One cycle's comments payload (low hundreds of comments in steady state)
+  # plus one registry scan for the entity map -- no external HTTP.
+  timeout     = 60
+  memory_size = 128
+
+  filename         = data.archive_file.chunk_comments.output_path
+  source_code_hash = data.archive_file.chunk_comments.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET      = aws_s3_bucket.poly_rag_data.bucket
+      REGISTRY_TABLE = aws_dynamodb_table.market_registry.name
+    }
+  }
+}
+
+data "archive_file" "chunk_digest" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/chunk_digest/handler.py"
+  output_path = "${path.module}/build/chunk_digest.zip"
+}
+
+resource "aws_lambda_function" "chunk_digest" {
+  function_name = "poly-rag-chunk-digest"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Exactly 1 chunk (the cycle's own digest) -- trivial, no Bedrock call
+  # (deterministic template, see handler.py digest_to_text).
+  timeout     = 30
+  memory_size = 128
+
+  filename         = data.archive_file.chunk_digest.output_path
+  source_code_hash = data.archive_file.chunk_digest.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET = aws_s3_bucket.poly_rag_data.bucket
+    }
+  }
+}
+
+data "archive_file" "chunk_news_article" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/chunk_news_article/handler.py"
+  output_path = "${path.module}/build/chunk_news_article.zip"
+}
+
+resource "aws_lambda_function" "chunk_news_article" {
+  function_name = "poly-rag-chunk-news-article"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # One cycle's news payload (~700-900 articles in steady state), whole-
+  # article chunking with overflow splitting -- pure CPU/string work, no
+  # external HTTP, no Bedrock call in this Lambda (that's embed_news_article).
+  timeout     = 60
+  memory_size = 256
+
+  filename         = data.archive_file.chunk_news_article.output_path
+  source_code_hash = data.archive_file.chunk_news_article.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET = aws_s3_bucket.poly_rag_data.bucket
+    }
+  }
+}
+
+data "archive_file" "embed_digest" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/embed_digest/handler.py"
+  output_path = "${path.module}/build/embed_digest.zip"
+}
+
+resource "aws_lambda_function" "embed_digest" {
+  function_name = "poly-rag-embed-digest"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # 1 chunk, 1 Bedrock call -- trivial in steady state.
+  timeout     = 60
+  memory_size = 128
+
+  filename         = data.archive_file.embed_digest.output_path
+  source_code_hash = data.archive_file.embed_digest.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET               = aws_s3_bucket.poly_rag_data.bucket
+      NEXT_LAMBDA_NAME        = aws_lambda_function.embed_comments.function_name
+      EMBEDDING_METRICS_TABLE = aws_dynamodb_table.embedding_metrics.name
+    }
+  }
+}
+
+data "archive_file" "embed_comments" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/embed_comments/handler.py"
+  output_path = "${path.module}/build/embed_comments.zip"
+}
+
+resource "aws_lambda_function" "embed_comments" {
+  function_name = "poly-rag-embed-comments"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Steady-state comments volume (~50-100/cycle) embeds in well under a
+  # minute at the measured ~120K tok/min effective rate -- see
+  # tech_debt.md for the real numbers from the 2026-08-21/22 bootstrap.
+  timeout     = 120
+  memory_size = 128
+
+  filename         = data.archive_file.embed_comments.output_path
+  source_code_hash = data.archive_file.embed_comments.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET               = aws_s3_bucket.poly_rag_data.bucket
+      NEXT_LAMBDA_NAME        = aws_lambda_function.embed_registry.function_name
+      EMBEDDING_METRICS_TABLE = aws_dynamodb_table.embedding_metrics.name
+    }
+  }
+}
+
+data "archive_file" "embed_registry" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/embed_registry/handler.py"
+  output_path = "${path.module}/build/embed_registry.zip"
+}
+
+resource "aws_lambda_function" "embed_registry" {
+  function_name = "poly-rag-embed-registry"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Steady-state new-market volume (~50-90/cycle, see chunk_registry) embeds
+  # in well under a minute.
+  timeout     = 120
+  memory_size = 128
+
+  filename         = data.archive_file.embed_registry.output_path
+  source_code_hash = data.archive_file.embed_registry.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET               = aws_s3_bucket.poly_rag_data.bucket
+      NEXT_LAMBDA_NAME        = aws_lambda_function.embed_news_article.function_name
+      EMBEDDING_METRICS_TABLE = aws_dynamodb_table.embedding_metrics.name
+    }
+  }
+}
+
+data "archive_file" "embed_news_article" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/embed_news_article/handler.py"
+  output_path = "${path.module}/build/embed_news_article.zip"
+}
+
+resource "aws_lambda_function" "embed_news_article" {
+  function_name = "poly-rag-embed-news-article"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Last and heaviest stage in the embed chain -- news_article dominates
+  # token volume (~96% of the 4-source total measured during the 13-cycle
+  # bootstrap, see tech_debt.md). Steady-state cycle volume (~700-900
+  # articles) is far smaller than that bootstrap, but 900s gives real
+  # headroom given Bedrock pacing latency is the dominant cost, not CPU.
+  # Terminal stage -- does NOT invoke anything further (Fase 3 is out of
+  # scope for now, see handler.py docstring).
+  timeout     = 900
+  memory_size = 256
+
+  filename         = data.archive_file.embed_news_article.output_path
+  source_code_hash = data.archive_file.embed_news_article.output_base64sha256
+
+  environment {
+    variables = {
+      S3_BUCKET                  = aws_s3_bucket.poly_rag_data.bucket
+      EMBEDDING_METRICS_TABLE    = aws_dynamodb_table.embedding_metrics.name
+      ARCHITECTURE_METRICS_TABLE = aws_dynamodb_table.architecture_metrics.name
+      SES_SENDER                 = "bernardolw@gmail.com"
+      SES_RECIPIENT              = "bernardolw@gmail.com"
+    }
+  }
+}
+
+data "archive_file" "embed_orchestrator" {
+  type        = "zip"
+  source_file = "${path.module}/../lambdas/embed_orchestrator/handler.py"
+  output_path = "${path.module}/build/embed_orchestrator.zip"
+}
+
+resource "aws_lambda_function" "embed_orchestrator" {
+  function_name = "poly-rag-embed-orchestrator"
+  role          = aws_iam_role.embed_lambda_role.arn
+  handler       = "handler.lambda_handler"
+  runtime       = "python3.12"
+  # Pure fan-out/dispatch -- 5 async lambda:InvokeFunction calls, no S3/
+  # DynamoDB/Bedrock work of its own. Returns almost immediately.
+  timeout     = 30
+  memory_size = 128
+
+  filename         = data.archive_file.embed_orchestrator.output_path
+  source_code_hash = data.archive_file.embed_orchestrator.output_base64sha256
+
+  environment {
+    variables = {
+      CHUNK_REGISTRY_NAME      = aws_lambda_function.chunk_registry.function_name
+      CHUNK_COMMENTS_NAME      = aws_lambda_function.chunk_comments.function_name
+      CHUNK_DIGEST_NAME        = aws_lambda_function.chunk_digest.function_name
+      CHUNK_NEWS_ARTICLE_NAME  = aws_lambda_function.chunk_news_article.function_name
+      FIRST_EMBED_LAMBDA_NAME  = aws_lambda_function.embed_digest.function_name
+    }
+  }
+}

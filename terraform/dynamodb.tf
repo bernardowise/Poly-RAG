@@ -123,3 +123,33 @@ resource "aws_dynamodb_table" "domain_failures" {
     enabled = true
   }
 }
+
+resource "aws_dynamodb_table" "embedding_metrics" {
+  # Fase 2 cost/latency tracking -- decided 2026-08-20 (see tech_debt.md,
+  # "Day 6: A/B Tests as a Live, User-Facing Feature"), built 2026-08-22 once
+  # the 8 Fase 2 Lambdas that need it actually existed. Deliberately a
+  # SEPARATE table from architecture_metrics: Fase 1 writes one row per
+  # Lambda invocation, but Fase 2 embedding writes N rows per invocation (one
+  # per Bedrock request within a batch run), each carrying its own
+  # source/embedding_model/tokens_in -- forcing that into architecture_metrics'
+  # one-row-per-invocation shape would make both tables harder to query
+  # cleanly. Same infra pattern as every other project table: pay-per-request,
+  # PITR enabled.
+  #
+  # hash_key is a composite string (cycle_started_at#source#request_index),
+  # not a generated UUID -- makes "all rows for this cycle" and "all rows for
+  # this cycle+source" both directly queryable by key prefix without a GSI,
+  # and keeps rows naturally ordered by insertion within a source.
+  name         = "poly-rag-embedding-metrics"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}

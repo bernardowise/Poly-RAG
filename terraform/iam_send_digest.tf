@@ -68,6 +68,16 @@ data "aws_iam_policy_document" "send_digest_permissions" {
     actions   = ["dynamodb:PutItem"]
     resources = [aws_dynamodb_table.architecture_metrics.arn]
   }
+
+  statement {
+    # Fase 2 entry point (2026-08-22, see architecture_canon.md, "Fase de
+    # embedding, desacoplada de la cadena de ingesta") -- send_digest is the
+    # last stage of Fase 1's strict chain and the trigger for Fase 2. Scoped
+    # to exactly this one target, same pattern as every other chain link.
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.embed_orchestrator.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "send_digest_permissions" {
