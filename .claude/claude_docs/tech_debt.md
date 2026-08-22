@@ -2664,14 +2664,17 @@ its own schedule.
 
 ---
 
-## Phase 2 Embedding Bootstrap BLOCKED -- No Model Has Completed a Corpus (2026-08-20/21, RESOLVED 2026-08-21 -- see correction at the end of this entry)
+## Phase 2 Embedding Bootstrap BLOCKED -- No Model Has Completed a Corpus (2026-08-20/21, RESOLVED 2026-08-22 -- TWO unrelated root causes, see both corrections at the end)
 
-> **STATUS 2026-08-21: UNBLOCKED. The root cause recorded in this entry was WRONG.**
-> The daily quota blamed below does not exist in this account, and the account was
-> never near its real daily ceiling. The actual cause was unbounded request size
-> against the per-MINUTE token limit. Cohere v4 has since embedded a full slice with
-> zero throttles. The original text is preserved unedited for the record; read the
-> correction at the bottom of this entry before acting on anything above it.
+> **STATUS 2026-08-22: FULLY UNBLOCKED, after TWO separate root causes on two different days.**
+> (1) The daily quota blamed below does not exist in this account -- the account was never near
+> its real daily ceiling; the actual cause was unbounded request size against the per-MINUTE
+> limit. (2) A second, genuinely different daily-quota block hit the next session: the bare
+> on-demand model id draws against its own separate undocumented daily ceiling, distinct from the
+> "Global cross-region" quota this project had been checking. All 13 cycles of `news_article` are
+> now fully embedded and verified (9,229/9,229 chunk_ids, 0 missing). The original text is
+> preserved unedited for the record; read BOTH corrections at the bottom of this entry before
+> acting on anything above it.
 
 **Issue:** step 1 of the Phase 2 bootstrap (chunking) is done and verified in S3 -- 5 source files
 under `chunks/`, refreshed to include the 2026-08-21 00:00 UTC cycle (registry 981, news_paragraph
@@ -2724,6 +2727,63 @@ model is chosen next, and today's session demonstrated concretely how fast a fre
 consumed without one.
 
 **Revisit:** next session, starting with the daily-quota reset check described above.
+
+---
+
+### SECOND CORRECTION 2026-08-22 -- a genuinely different daily-quota block hit hours later
+
+The "UNBLOCKED" banner at the top of this entry was accurate for its own root cause (unbounded
+request size against the 300K TPM per-minute limit) but was written before a SECOND, unrelated
+daily-quota block appeared during an aggressive same-day bootstrap of the full 13-cycle corpus
+(registry + comments + digest + news_article, see session_ledger.md 2026-08-22 UTC / 2026-08-21
+local). Named separately here because the mechanism is genuinely different, not a recurrence of
+the first bug:
+
+**What happened:** `news_article` embedding died again at 60.2% (6,000+ of 9,235 chunks) with
+`ThrottlingException: Too many tokens per day, please wait before trying again` -- exhausting all
+6 retries. CloudWatch showed only 38% of the documented 16.2M daily quota consumed, not remotely
+close to a ceiling. A minimal 4-token test call against the bare model id confirmed the block was
+TOTAL and unconditional (not a batch-size issue): even the smallest possible request failed with
+the identical message.
+
+**Root cause: the 16.2M quota this project has been checking is titled "Global CROSS-REGION model
+inference tokens per day for Cohere Embed V4" -- it never applied to the bare on-demand model id
+(`cohere.embed-v4:0`, no inference-profile prefix) that `embed_corpus_slice.py` had been using all
+along.** On-demand calls apparently draw against a separate, lower, UNDOCUMENTED daily ceiling that
+`aws service-quotas list-service-quotas` does not surface under any name matching "Cohere" or
+"Embed". This is the same class of mistake as the first block in this entry (trusting a quota name
+without confirming it actually governs the calls being made), but a different specific quota.
+
+**Fix, found by testing rather than guessing:** switched `MODEL_ID` to the cross-region inference
+profile `us.cohere.embed-v4:0` -- worked immediately on a live test call. Verified byte-identical
+embeddings against the bare model id first (cosine similarity 1.0, max absolute difference 0.0
+across all 1536 dimensions on the same input text) before trusting the switch -- same underlying
+model, different routing path only, safe to mix vectors already written under one model id with new
+ones under another.
+
+**Second surprise: `us.cohere.embed-v4:0` ALSO hit the identical error minutes later.** At the exact
+moment it failed, `global.cohere.embed-v4:0` was tested and succeeded. This proves the three routing
+paths -- bare on-demand, `us.` cross-region, `global.` cross-region -- draw against INDEPENDENT
+daily counters, not one shared account-level Cohere Embed V4 limit as first assumed after the
+`us.` fix appeared to work. Switched to `global.cohere.embed-v4:0`, which completed the remaining
+2,989 chunks cleanly: 0 throttles, 35.2 minutes, 115K tokens/min effective rate.
+
+**Practical guidance left in `embed_corpus_slice.py` itself** (not just here): if this recurs, the
+other two model ids are the fallback, in whichever order still has headroom -- check with a single
+4-token test call before relaunching the real batch rather than assuming which route is free. No
+`Retry-After` header is ever returned by any of the three, so there is no way to know a ceiling has
+lifted except by testing.
+
+**Not investigated:** what the actual on-demand/per-route daily ceiling number is, whether it
+resets on the same 00:00 UTC boundary as the documented 16.2M cross-region quota, or whether AWS
+Support has an official name for it. `list-service-quotas` does not expose it under any queried
+term. Worth asking AWS Support directly if this blocks a future bootstrap again, rather than
+re-diagnosing empirically each time.
+
+**Revisit if:** a future embedding run hits an unexplained daily-quota-style throttle again --
+check whether all three Cohere Embed v4 routing paths (bare, `us.`, `global.`) are exhausted before
+assuming the whole model is blocked, and budget time for empirical testing since no quota name or
+Retry-After header will confirm it directly.
 
 ---
 

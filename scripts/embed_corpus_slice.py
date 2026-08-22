@@ -79,7 +79,23 @@ from botocore.exceptions import ClientError
 S3_BUCKET = "poly-rag-369970405415"
 REGION = "us-east-1"
 
-MODEL_ID = "cohere.embed-v4:0"
+MODEL_ID = "global.cohere.embed-v4:0"
+# Changed 2026-08-22, TWICE in the same outage. First changed from the bare
+# on-demand model id "cohere.embed-v4:0" to "us.cohere.embed-v4:0" after a
+# hard, total block: even a 4-token test request returned "ThrottlingException:
+# Too many tokens per day" with zero Retry-After. That fix worked for exactly
+# one successful test call, then "us.cohere.embed-v4:0" ALSO started returning
+# the identical error minutes later. Confirmed live: at the moment
+# "us.cohere.embed-v4:0" failed, "global.cohere.embed-v4:0" still succeeded --
+# proof the three routing paths (bare on-demand, us. cross-region,
+# global. cross-region) have INDEPENDENT daily counters, not one shared
+# account-level limit as first assumed. Verified byte-identical embeddings vs
+# the other two model ids before switching (cosine 1.0, max abs diff 0.0 across
+# all 1536 dims) -- same underlying model, safe to mix vectors already written
+# under either prior model id with new ones under this one. If this one also
+# gets blocked, the other two are the fallback to try, in whichever order still
+# has headroom -- check with a single 4-token test call before relaunching the
+# real batch, exactly as done here, rather than assuming which one is free.
 MODEL_LABEL = "cohere"
 EMBED_DIM = 1536
 
