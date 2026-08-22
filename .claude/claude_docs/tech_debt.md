@@ -2194,6 +2194,17 @@ This is a Block F requirement regardless of whether the project ends up shipping
 in production -- the per-source breakdown is what makes the Day 6 comparison legible, not an
 optional nice-to-have metric.
 
+**BUILT 2026-08-22.** Table created via Terraform (dynamodb.tf), populated by all 4 embed
+Lambdas (embed_digest/embed_comments/embed_registry/embed_news_article) -- one row per Bedrock
+request, carrying `source`, `embedding_model`, `tokens_in`, `latency_ms`, `estimated_cost_usd`
+(real confirmed Cohere v4 pricing, $0.12/M input tokens). Went further than originally scoped
+here: `embed_news_article`, as the true last stage of the full cycle (Fase 1 + Fase 2), also
+reads back `poly-rag-architecture-metrics` (Fase 1's existing table) and sends a second cycle
+report email via SES -- separate from send_digest's market-content email, sent at the END of
+Fase 2 rather than Fase 1, deliberately so the two emails' timestamps let the user measure
+Fase 2's real wall-clock duration per cycle just by diffing when each arrives. See
+session_ledger.md 2026-08-21 (local date) for the mock reviewed before deploying.
+
 **Experimental design note, resolved:** considered vary-one-axis-at-a-time (4 runs against a
 baseline) as cheaper and sufficient absent suspected interaction between axes -- user does not
 suspect real interaction, but wants the full cube anyway because the demonstration value (a

@@ -142,6 +142,26 @@ def cycle_number_map(prefix):
     return {key: i for i, key in enumerate(list_cycle_keys(prefix), start=1)}
 
 
+def cycle_started_at_from_key(key):
+    """S3 key (e.g. 'comments/2026-08-16/01.json') -> the canon
+    cycle_started_at ISO string ('2026-08-16T01:00:00+00:00').
+
+    Added 2026-08-22 to unify chunk_id qualifiers between this one-off script
+    and the per-cycle chunk_comments Lambda, which was found using a
+    DIFFERENT qualifier (the real cycle_started_at threaded through Fase 1)
+    while this script used a locally-numbered @c<N> -- same intent (keep
+    entity-scoped comment chunk_ids globally unique across cycles), two
+    incompatible formats, real tech debt caught before it accumulated. The
+    payload's own ingested_at field was considered and rejected: it's the
+    Lambda's completion timestamp (with variable run duration and
+    microseconds baked in), not the canon cycle identity -- the S3 key itself
+    (date/hour) IS the canon, same value chunk_registry/chunk_comments derive
+    cycle_started_at from in the other direction."""
+    parts = key.split("/")  # ['comments', 'YYYY-MM-DD', 'HH.json']
+    date_part, hour_part = parts[1], parts[2].replace(".json", "")
+    return f"{date_part}T{hour_part}:00:00+00:00"
+
+
 def read_json(key):
     return json.loads(s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read())
 
@@ -570,16 +590,22 @@ def run_comments(cycle_range=None):
             if entity_key == "unknown_entity":
                 unknown_entity_comments += 1
         cycle_number = cycle_of[key]
+        cycle_started_at = cycle_started_at_from_key(key)
         cycle_chunks = chunk_comments(comments, entity_map)
         for c in cycle_chunks:
             link_type_counts[c["link_type"]] += 1
             # chunk_id is entity-scoped ({entity}#{part}), so the SAME entity in
-            # two different cycles would collide on id. Qualify with the cycle
-            # so ids stay globally unique -- this matters now that cycles are
-            # embedded in separate slices on separate days and later merged into
-            # one vector store, where a duplicate id would silently overwrite
-            # an earlier cycle's chunk instead of coexisting with it.
-            c["chunk_id"] = f"{c['chunk_id']}@c{cycle_number}"
+            # two different cycles would collide on id. Qualify with
+            # cycle_started_at (not a locally-numbered @c<N> -- see
+            # cycle_started_at_from_key docstring, 2026-08-22, for why that was
+            # corrected: it must match the qualifier chunk_comments Lambda uses,
+            # so ids stay comparable and globally unique across BOTH the one-off
+            # bootstrap and the per-cycle Lambda path) so ids stay globally
+            # unique -- this matters now that cycles are embedded in separate
+            # slices on separate days and later merged into one vector store,
+            # where a duplicate id would silently overwrite an earlier cycle's
+            # chunk instead of coexisting with it.
+            c["chunk_id"] = f"{c['chunk_id']}@{cycle_started_at}"
             c["cycle_number"] = cycle_number
             c["cycle_key"] = key
         all_chunks.extend(cycle_chunks)

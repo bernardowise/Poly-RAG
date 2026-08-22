@@ -47,6 +47,10 @@ SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
 REGISTRY_TABLE = os.environ.get("REGISTRY_TABLE", "poly-rag-market-registry")
 METRICS_TABLE = os.environ.get("METRICS_TABLE", "poly-rag-architecture-metrics")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+# Fase 2 (embedding) entry point -- see architecture_canon.md, "Fase de
+# embedding, desacoplada de la cadena de ingesta" (2026-08-20 design,
+# connected 2026-08-22).
+EMBED_ORCHESTRATOR_NAME = os.environ.get("EMBED_ORCHESTRATOR_NAME", "poly-rag-embed-orchestrator")
 
 # Sources with a per-cycle S3 payload (source -> list field whose length is
 # shown as "item count" for that source's cycle). Polymarket's own payload
@@ -71,6 +75,15 @@ NEW_MARKETS_SHOWN = 10
 s3 = boto3.client("s3")
 ses = boto3.client("ses")
 dynamodb = boto3.resource("dynamodb")
+lambda_client = boto3.client("lambda")
+
+
+def invoke_embed_orchestrator(cycle_started_at):
+    lambda_client.invoke(
+        FunctionName=EMBED_ORCHESTRATOR_NAME,
+        InvocationType="Event",
+        Payload=json.dumps({"cycle_started_at": cycle_started_at}),
+    )
 bedrock = boto3.client("bedrock-runtime")
 
 
@@ -637,6 +650,16 @@ def lambda_handler(event, context):
             "Body": {"Html": {"Data": html_body}},
         },
     )
+
+    # Fase 2 (embedding) trigger -- added 2026-08-22, same chaining pattern
+    # every prior stage uses (invoke_next_stage in ingest_comments, etc.).
+    # This was the last unconnected link in the design documented in
+    # architecture_canon.md since 2026-08-20 ("Fase de embedding, desacoplada
+    # de la cadena de ingesta... send_digest invoca Fase 2 al terminar").
+    # Invoked AFTER the digest S3 write above and the email send, so a
+    # failure here never blocks or is blocked by either -- same
+    # fail-independently principle as the rest of Fase 1.
+    invoke_embed_orchestrator(cycle_started_at)
 
     return {
         "statusCode": 200,

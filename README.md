@@ -43,15 +43,31 @@ same cycle's date/hour partition, regardless of how long an earlier stage took. 
 separate watchdog Lambda (`poly-rag-watchdog-ingest-news`, 10-min cron) detects a
 stuck News cycle and retries only the missing batches.
 
-Everything above is **Phase 1 (ingestion)**. **Phase 2 (embedding)** is designed
-but not built: a separate set of Lambdas that reads what Phase 1 already wrote to
-S3 and never modifies it — an orchestrator invoked by `send_digest` as one more
-link in the same chain, fanning out to per-source chunking Lambdas, then to
-embedding Lambdas that only turn text into vectors and persist them to S3, and
-finally to store-write Lambdas kept deliberately separate so adding a new vector
-store touches none of the already-proven embedding code. Only the one-off
-bootstrap scripts exist so far; none of these Lambdas are written yet. See
-architecture_canon.md.
+Everything above is **Phase 1 (ingestion)**. **Phase 2 (chunking + embedding)** is
+built and connected as of 2026-08-22: `send_digest` invokes `embed_orchestrator`,
+which fans out in parallel to 4 chunking Lambdas (`chunk_registry`,
+`chunk_comments`, `chunk_digest`, `chunk_news_article` — the `news_paragraph`
+variant is deliberately not built yet) and then runs 4 embedding Lambdas in
+strict SEQUENCE (`embed_digest` → `embed_comments` → `embed_registry` →
+`embed_news_article`), all calling Cohere Embed v4 via its cross-region
+inference profile. Sequential, not parallel, on purpose: the 4 embed Lambdas
+share one account-wide token-per-minute ceiling, and running them concurrently
+would recreate the exact uncoordinated-competing-invocations bug that already
+caused a real News double-invocation incident. **Phase 3 (write to a vector
+store) is explicitly out of scope for now** — `embed_news_article` is the last
+stage and invokes nothing further. See architecture_canon.md for the full
+per-Lambda design and tech_debt.md for how two real Cohere daily-quota outages
+(on the bare on-demand model id and the `us.` cross-region route) were diagnosed
+and fixed by switching to `global.cohere.embed-v4:0`.
+
+Every embedding Lambda writes cost/latency/token rows to
+`poly-rag-embedding-metrics`, and the last stage of the whole cycle
+(`embed_news_article`) sends a **second email**, separate from `send_digest`'s
+market-content digest — a plain cost/latency/tokens report covering both Phase 1
+and Phase 2 for that cycle. The two emails land at genuinely different times
+(one at the end of Phase 1, one at the end of Phase 2), which is deliberate: it
+lets Phase 2's real wall-clock duration be measured directly from the gap
+between their timestamps, cycle over cycle.
 
 **Data flow, per cycle:**
 1. **Registry** (DynamoDB, `poly-rag-market-registry`) — one item per market, updated
@@ -118,8 +134,22 @@ lambdas/
   ingest_news/           Google News RSS (open + post-resolution markets),
                           fan-out batching, article extraction
   ingest_comments/       Polymarket comments, entity grouping, comment_id dedup
-  send_digest/           cross-source synthesis, JSON artifact + email
+  send_digest/           cross-source synthesis, JSON artifact + email, invokes
+                          embed_orchestrator at the end (Phase 2 entry point)
   watchdog_ingest_news/  stuck-cycle detection and retry
+  embed_orchestrator/    Phase 2 entry point -- fans out chunking, starts the
+                          sequential embedding chain
+  chunk_registry/        this cycle's new markets only (first_seen >
+                          cycle_started_at, no lookback window needed)
+  chunk_comments/        entity-grouped comment chunks for this cycle
+  chunk_digest/          this cycle's digest as one narrative chunk
+  chunk_news_article/    this cycle's articles, whole-article chunking with
+                          overflow split for oversized articles
+  embed_digest/          1st in the sequential embed chain
+  embed_comments/        2nd -- invoked by embed_digest
+  embed_registry/        3rd -- invoked by embed_comments
+  embed_news_article/    4th and last -- invoked by embed_registry, writes
+                          embedding metrics, sends the cycle metrics report email
 scripts/                  one-off scripts, run manually, not part of the 12h chain
                            (odds/registry backfills, News temporal/status tagging,
                            corpus chunking + embedding bootstrap — see its README)
@@ -138,72 +168,75 @@ snapshot of everything above — this README is a summary of it, not a replaceme
 
 ## Status
 
-Verified in production: the full 4-Lambda chain runs unattended on the 00:00/12:00
-UTC schedule with no manual intervention, cost/latency/tokens logged per invocation
-to `poly-rag-architecture-metrics` for all 4 Lambdas. Registry currently tracks
-markets under the current (post-2026-08-16) design only — an early-pipeline cleanup
-removed all registry/odds data tied to the deprecated Bluesky + keyword-matching
-design.
+Verified in production: the full Phase 1 chain (4 Lambdas) runs unattended on the
+00:00/12:00 UTC schedule with no manual intervention, cost/latency/tokens logged
+per invocation to `poly-rag-architecture-metrics`. As of 2026-08-22, the full
+Phase 2 chain (9 Lambdas — chunking + embedding) is deployed and connected to
+fire automatically at the end of every Phase 1 cycle; the next automatic
+EventBridge cycle is its first real production test (no Lambda has been manually
+invoked to test it, per this project's hard rule against manual invocation of
+production Lambdas — see CLAUDE.md).
 
-**Corpus, as of 2026-08-21 (11 complete cycles, registry growing every cycle):**
-981 registry markets, 7,429 news articles (100% linked to exactly one market_id,
-all classified by temporal tier and market status at publish time), 8,858
-comments (News keeps growing steadily per cycle, Comments flattened to
-steady-state volume once its dedup table caught up — 3,080 orphaned comments
-referencing markets purged in an earlier registry cleanup were removed on
-2026-08-20 by `scripts/purge_orphan_comments.py`), and 63,641+ odds snapshots (a
-growing mix of `cycle` and `clob_backfill` provenance — most markets now carry
-history back to their real creation date, not just since we started tracking
-them).
+**Corpus, as of 2026-08-22 (13 complete cycles, registry growing every cycle):**
+1,090 registry markets, 8,980 news articles, 12,108 comments, and 102,997+ odds
+snapshots (a growing mix of `cycle` and `clob_backfill` provenance — most markets
+now carry history back to their real creation date, not just since we started
+tracking them).
 
-Chunked and ready for embedding in `chunks/`: 981 registry + 120,568
-news_paragraph + 7,429 news_article + 681 comments + 11 digest. Nothing is
-embedded yet — see Day 4 below.
+**Embedded and verified in a real vector space** (Cohere Embed v4, via the
+`global.cohere.embed-v4:0` cross-region inference profile): 1,090 registry + 749
+comments + 13 digest + 9,235 news_article chunks — 11,087 vectors total, 1536-dim,
+L2-normalized, zero gaps against their source chunk files. `news_paragraph` is
+deliberately not built yet (see Pending below). Nothing is written to a vector
+store yet — Phase 3 is explicitly out of scope for now; vectors are durable in S3
+under `vectors/_checkpoints/<source>/cohere/`.
 
 ## Pending / TODO
 
-- **RAG retrieval (Day 4)** — chunking **done and written to S3**; embedding
-  **blocked**; retrieval not started.
-  - **Chunking (step 1, complete):** strategy closed for all sources and executed
-    by `scripts/bootstrap_chunk_corpus.py` over the full existing corpus. News
-    splits by paragraph (with a whole-article variant kept as a comparison axis),
-    Comments group by `link_type` (`direct` → `market_id`, shared → the
-    `comment_entity_id` from the registry, so one stream is never re-embedded per
-    market), the registry's `question`+`description` become one vector per market
-    (the semantic half of the Polymarket source, next to odds as the structured
-    half), and each digest becomes one chunk via a deterministic text template —
-    no new LLM call. Live counts in `chunks/`: 981 registry, 120,568
-    news_paragraph, 7,429 news_article, 681 comments, 11 digest.
-  - **Embedding (step 2, blocked — no model has completed a corpus).** Every
-    candidate hit a real, verified account limit. Titan v2 was **dropped from the
-    project**: its Bedrock API has no batch field at all and the account cap is
-    600 req/min, which would bottleneck every future incremental cycle, not just
-    the bootstrap. Voyage (`voyage-finance-2`) was the one model that actually
-    worked (122K vectors in ~30 min, no throttling) but a single run consumed
-    56.5% of its 50M free tier, projecting exhaustion in ~4 days at current
-    ingestion rate. Cohere v4 is throttled at ~15-20 rejections/min against 1-2
-    successful calls/min, and neither exponential backoff nor fixed pacing moved
-    it. Leading unverified hypothesis: the **daily** 8.1M-token cap (already 65%
-    consumed that day), not the per-minute one. Full detail, including the real
-    CLI/CloudWatch evidence for each limit, in tech_debt.md, "Phase 2 Embedding
-    Bootstrap BLOCKED".
+- **RAG retrieval (Day 4)** — chunking and embedding for 4 of 5 sources **done,
+  connected to the automatic cycle, and verified**; vector store and retrieval
+  not started.
+  - **Chunking + embedding (steps 1-2, done for registry/comments/digest/
+    news_article).** Strategy closed for all sources; `news_paragraph` was
+    deliberately paused (see below) so the whole pipeline could be proven
+    end-to-end on one variant first. Comments group by `link_type` (`direct` →
+    `market_id`, shared → the `comment_entity_id` from the registry, so one
+    stream is never re-embedded per market), the registry's
+    `question`+`description` become one vector per market (the semantic half of
+    the Polymarket source, next to odds as the structured half), digest becomes
+    one chunk via a deterministic text template, and news_article chunks whole
+    articles with overflow splitting for anything over ~32K chars — no new LLM
+    call anywhere in this path.
+  - **Embedding model: Cohere Embed v4 only, for now.** Titan v2 was dropped
+    outright (no batch API, 600 req/min account ceiling). Voyage was ruled out
+    after a single run consumed 56.5% of its free tier with no spend guardrail
+    in place. Two real Cohere daily-quota outages were hit and fixed during the
+    2026-08-21/22 bootstrap — see tech_debt.md, "Phase 2 Embedding Bootstrap",
+    for the full diagnosis (the quota actually blocking calls was never the one
+    being monitored) and why `global.cohere.embed-v4:0` is the model id now used
+    everywhere in Phase 2.
   - **Design context that still holds:** retrieval is a single path — metadata
     filter (`market_id`, time, source) plus semantic ranking. The earlier
     two-layer model (explicit linkage + ambient time-window) is deprecated and
     its implementation deleted: the per-market News redesign left 100% of
     articles linked to exactly one market, so the ambient pool it read from was
     empty. Odds history reaches back to each market's creation (CLOB backfill),
-    unblocking correlation against older news; News carries `temporal_tier` and
-    `market_status_at_publish`; post-resolution News capture (4 cycles / 48h) is
-    live. A real orphan-data finding (305 articles referencing purged markets)
-    was left untouched by choice, to be handled at query time.
-  - **Vector store: still undecided, and the constraint changed.** Databricks
-    Vector Search had been ruled out for allowing only 1 active endpoint per
-    account — a blocker only under the earlier plan of many parallel indices, and
-    one that no longer applies now that the design has collapsed toward a single
-    model. Pinecone and Qdrant accounts exist (keys in `.secrets`, gitignored);
-    LanceDB-in-S3 remains a candidate. OpenSearch Serverless stays out on cost
-    (~$700/month).
+    unblocking correlation against older news. A real orphan-data finding (305
+    articles referencing purged markets) was left untouched by choice, to be
+    handled at query time.
+  - **Vector store: decided (LanceDB), not yet connected to the automatic
+    cycle.** Chosen 2026-08-22 on measured 3-12 month storage growth against
+    real free-tier ceilings (Qdrant/Pinecone would be exhausted in 2-4 months at
+    current growth; LanceDB's real cost at 12 months is ~$0.33/month in S3
+    storage, no managed-service tier to outgrow). A one-off write script
+    (`scripts/write_to_lancedb.py`) is built and verified against the corpus;
+    Phase 3 as a Lambda needs a container image (LanceDB's real dependency
+    footprint measured at 339MB unzipped, over Lambda's 250MB zip/Layer limit) —
+    deliberately deferred, not yet built.
+  - **`news_paragraph` deliberately paused**, not abandoned — explicit user
+    decision to prove one chunking variant end-to-end (chunk → embed → store →
+    query) before doubling the corpus with a second one. Revisit once retrieval
+    against `news_article` is working.
 - **Synthesis agent (Day 5)** — not started. `send_digest`'s executive-summary call
   is the closest existing precedent (multi-source context → Bedrock → synthesis) but
   there's no user-facing query interface yet. Includes an open, explicitly deferred

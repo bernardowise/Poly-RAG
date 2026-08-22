@@ -573,15 +573,46 @@ comments -> digest, sin cambios en su logica de negocio), Fase 2 = embedding
 (proceso independiente que lee lo que Fase 1 ya escribio en S3, nunca modifica
 Fase 1).
 
-**Trigger de Fase 2, decidido 2026-08-20: encadenado, ultimo eslabon de la cadena
-existente.** `send_digest` invoca Fase 2 al terminar, mismo mecanismo
-(`lambda.invoke()`, `cycle_started_at` heredado) que ya usa cada eslabon de la
-cadena hoy (polymarket -> news -> comments -> digest) -- la cadena simplemente
-crece un eslabon mas (digest -> embedding), no un mecanismo nuevo. "Desacoplado"
-aqui es logico (Fase 2 no comparte codigo/responsabilidad con Fase 1, se puede
-tocar sin riesgo de romper la cadena de ingesta), no temporal -- no hay delay
-agendado ni cron aparte. Fase 2 corre despues del envio del correo (ultimo paso,
-no bloquea nada previo), pero en la misma corrida de la cadena.
+**Trigger de Fase 2, decidido 2026-08-20, CONECTADO Y DESPLEGADO 2026-08-22.**
+`send_digest` invoca Fase 2 al terminar, mismo mecanismo (`lambda.invoke()`,
+`cycle_started_at` heredado) que ya usa cada eslabon de la cadena hoy (polymarket
+-> news -> comments -> digest) -- la cadena simplemente crece un eslabon mas
+(digest -> embedding), no un mecanismo nuevo. "Desacoplado" aqui es logico (Fase 2
+no comparte codigo/responsabilidad con Fase 1, se puede tocar sin riesgo de romper
+la cadena de ingesta), no temporal -- no hay delay agendado ni cron aparte. Fase 2
+corre despues del envio del correo (ultimo paso, no bloquea nada previo), pero en
+la misma corrida de la cadena.
+
+**Arquitectura real desplegada (2026-08-22, revisada del diseño original de 4
+niveles -- ver seccion completa mas abajo para el detalle Lambda por Lambda):**
+`embed_orchestrator` -> fan-out PARALELO a 4 Lambdas de chunking
+(`chunk_registry`/`chunk_comments`/`chunk_digest`/`chunk_news_article`, sin
+`news_paragraph` -- fuera de alcance por decision explicita, ver mas abajo) ->
+cadena SECUENCIAL de 4 Lambdas de embedding (`embed_digest` -> `embed_comments`
+-> `embed_registry` -> `embed_news_article`). El embedding es secuencial, no
+paralelo como el chunking, porque las 4 comparten el mismo techo de TPM de
+Cohere -- correrlas en paralelo recrearia la condicion de carrera del incidente
+de doble-disparo de News. `MODEL_ID = global.cohere.embed-v4:0` (la ruta de
+inference profile cross-region que sobrevivio dos outages reales de cuota
+diaria en on-demand y `us.` cross-region, ver tech_debt.md). Fase 3 (write a
+vector store) sigue explicitamente fuera de alcance -- estas 9 Lambdas terminan
+en `embed_news_article`, que no invoca nada mas.
+
+**Registry sin eje de ciclo real (decidido y corregido dos veces en vivo,
+2026-08-22):** a diferencia de News/Comments/Digest (que ya tienen un payload
+por ciclo en S3), `chunk_registry` filtra el scan por `first_seen >
+cycle_started_at` -- sin ventana de tiempo, sin tabla de tracking nueva, sin
+campo nuevo escrito al registry. Un primer intento con ventana de -12h (para
+inferir "el ciclo anterior") fue corregido: la cadena de Fase 1 es estricta, si
+un ciclo corrio es porque el anterior corrio, no hace falta calcularlo.
+
+**Metricas de Fase 2 (`poly-rag-embedding-metrics`) y correo de reporte de ciclo
+completo, construidos 2026-08-22** -- ver tech_debt.md, "Day 6: A/B Tests..."
+entry, seccion "BUILT 2026-08-22" para el diseño completo. `embed_news_article`
+manda un segundo correo (separado del digest de mercado de `send_digest`) con
+costo/latencia/tokens de TODO el ciclo (Fase 1 + Fase 2), al terminar Fase 2 --
+los dos correos llegan en momentos distintos por diseño, para medir el tiempo
+real de Fase 2 por la diferencia entre ambos timestamps.
 
 **Arquitectura de Lambdas de Fase 2, decidida 2026-08-20, revisada el mismo dia a
 4 niveles -- aislamiento por fuente, por modelo, Y por store, no una Lambda por
