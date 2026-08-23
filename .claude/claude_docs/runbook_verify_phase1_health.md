@@ -110,15 +110,26 @@ print('  todos con created_at:', all('created_at' in i for i in nuevos))
 
 resueltos = [i for i in items if (i.get('resolution_date') or '').startswith(f'{DAY}T{HH}')]
 print('markets resueltos este ciclo:', len(resueltos))
-print('  todos con post_resolution_cycles_remaining == 4:',
-      all(int(i.get('post_resolution_cycles_remaining', 0)) == 4 for i in resueltos))
+counts = Counter(int(i.get('post_resolution_cycles_remaining', 0)) for i in resueltos)
+print('  distribucion de post_resolution_cycles_remaining:', dict(counts))
 ```
 
 - Todo market nuevo debe tener `created_at` (nativo desde F-lambdas, sin backfill
   manual).
-- Todo market recien resuelto debe arrancar su contador en **4**, no menos -- si
-  aparece en 3 o menos, el decrement corrio antes de que el arranque se confirmara
-  (orden de escritura sospechoso, investigar).
+- **Corregido 2026-08-23, tras un falso positivo real en el primer ciclo automatico
+  que uso este chequeo:** el contador NO se ve en 4 al revisarlo despues del ciclo,
+  aunque el arranque haya sido correcto -- `ingest_news` corre DENTRO de la misma
+  cadena, inmediatamente despues de que `ingest_polymarket` arma el contador en 4,
+  y si el market recien resuelto entra a la busqueda de ese mismo ciclo (contador
+  `4 > 0`), lo decrementa a 3 ahi mismo, antes de que la cadena termine. Verificado
+  con datos reales: 17 markets resueltos en el mismo ciclo, los 17 uniformemente en
+  3 (no una mezcla, lo cual habria sugerido una condicion de carrera real) -- prueba
+  de que es determinístico, no un bug. **El chequeo correcto es que la distribucion
+  sea uniforme y coherente con `4` o `3`** (3 es el valor normal post-cadena si el
+  market entro a la busqueda de News el mismo ciclo que resolvio), no que sea
+  exactamente 4. Un valor distinto de {3, 4}, o una distribucion NO uniforme entre
+  los recien resueltos de un mismo ciclo, sigue siendo la senal real de un problema
+  de orden de escritura -- investigar en ese caso.
 
 ---
 

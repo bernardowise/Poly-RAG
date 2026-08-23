@@ -51,6 +51,15 @@ data "aws_iam_policy_document" "write_lancedb_permissions" {
     actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
     resources = ["${aws_s3_bucket.poly_rag_data.arn}/lancedb/*"]
   }
+
+  statement {
+    # Third checkpoint email of the cycle (2026-08-22) -- write_lancedb's own
+    # per-source write report, separate from send_digest's market digest and
+    # digest_metrics' cost report.
+    effect    = "Allow"
+    actions   = ["ses:SendEmail", "ses:SendRawEmail"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "write_lancedb_permissions" {

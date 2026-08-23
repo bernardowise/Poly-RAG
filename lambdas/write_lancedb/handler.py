@@ -1,7 +1,11 @@
 """
 Poly-RAG write_lancedb Lambda: Fase 3, per-cycle write of the 4 embedded
 sources (registry, comments, digest, news_article) into their LanceDB
-tables. Terminal stage of the whole cycle -- invokes nothing further.
+tables. Terminal stage of the whole cycle -- invokes nothing further, but
+sends the cycle's THIRD checkpoint email (2026-08-22, see send_report below)
+after send_digest's market-content digest (Fase 1) and digest_metrics' cost
+report (Fase 1+2) -- one email per phase, so a human can tell which phase
+succeeded/failed from the inbox alone without opening CloudWatch.
 
 WHY THIS EXISTS (2026-08-22)
 -----------------------------
@@ -54,14 +58,19 @@ same as the one-off script.
 
 import json
 import os
+import time
 
 import boto3
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "poly-rag-369970405415")
 LANCEDB_URI = f"s3://{S3_BUCKET}/lancedb/"
 MODEL_LABEL = "cohere"
+SES_SENDER = os.environ.get("SES_SENDER", "bernardolw@gmail.com")
+SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
 
 SOURCES = ["registry", "comments", "digest", "news_article"]
+
+ses = boto3.client("ses")
 
 STALE_FIELDS = ("_lineage", "cycle_key", "cycle_number", "cycle_started_at")
 
@@ -86,17 +95,32 @@ def load_chunks(source, cycle_started_at):
         return None
 
 
-def load_vectors(source, model_label=MODEL_LABEL):
-    """All checkpoint parts for a source/model currently in S3 -- the join
-    below (keyed by chunk_id, scoped to this cycle's chunk file) naturally
-    picks out only this cycle's new rows, same mechanism already verified
-    working in the one-off script."""
+def load_vectors(source, cycle_started_at, model_label=MODEL_LABEL):
+    """Checkpoint parts written SINCE this cycle started -- not the whole
+    history. Fixed 2026-08-23 after a real timeout: the original version read
+    every checkpoint part ever written for a source (mirroring the one-off
+    script, which is fine for a single manual run but not for something that
+    runs every 12h forever) -- news_article alone was already ~20 checkpoint
+    files/~9,800 records on this Lambda's first real automatic cycle, and the
+    read+join+merge_insert cost of the WHOLE history blew through the 120s
+    timeout on write_lancedb's very first production run (registry/comments/
+    digest, all much smaller, wrote fine in the same invocation before it hit
+    the wall on news_article). This filters by S3 LastModified >=
+    cycle_started_at instead -- checkpoints are always written by an embed_*
+    Lambda that runs strictly after cycle_started_at (see the whole chain's
+    threading), so this can never miss a checkpoint that belongs to the
+    current cycle, and the read cost stays flat (bounded by one cycle's worth
+    of new chunks, ~1-2 checkpoint files at CHECKPOINT_SIZE=500) instead of
+    growing without bound as the corpus grows."""
+    from datetime import datetime
+    cutoff = datetime.fromisoformat(cycle_started_at)
+
     prefix = f"vectors/_checkpoints/{source}/{model_label}/"
     records = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".json"):
+            if obj["Key"].endswith(".json") and obj["LastModified"] >= cutoff:
                 records.extend(read_json(obj["Key"]))
     return records
 
@@ -124,7 +148,7 @@ def write_source(db, source, cycle_started_at):
     if not chunks:
         return {"source": source, "status": "empty_chunk_file"}
 
-    vectors = load_vectors(source)
+    vectors = load_vectors(source, cycle_started_at)
     rows, missing = join_text(vectors, chunks)
     for r in rows:
         for stale_field in STALE_FIELDS:
@@ -157,6 +181,38 @@ def write_source(db, source, cycle_started_at):
                 "written": len(rows), "missing": len(missing)}
 
 
+def build_report_html(cycle_started_at, results, elapsed_s):
+    rows_html = "".join(
+        f"<tr><td>{r['source']}</td><td>{r['status']}</td>"
+        f"<td>{r.get('before', '-')}</td><td>{r.get('after', '-')}</td>"
+        f"<td>{r.get('written', 0):,}</td><td>{r.get('missing', 0):,}</td></tr>"
+        for r in results
+    )
+    return f"""
+    <html><body style="font-family: monospace; font-size: 13px;">
+    <h2>Poly-RAG Fase 3 (write_lancedb) -- {cycle_started_at}</h2>
+    <table border="1" cellpadding="4" cellspacing="0">
+      <tr><th>source</th><th>status</th><th>rows before</th><th>rows after</th>
+          <th>written</th><th>missing</th></tr>
+      {rows_html}
+    </table>
+    <h3>Total time: {elapsed_s:.1f}s</h3>
+    </body></html>
+    """
+
+
+def send_report(cycle_started_at, results, elapsed_s):
+    html_body = build_report_html(cycle_started_at, results, elapsed_s)
+    ses.send_email(
+        Source=SES_SENDER,
+        Destination={"ToAddresses": [SES_RECIPIENT]},
+        Message={
+            "Subject": {"Data": f"Poly-RAG Fase 3 (LanceDB) -- {cycle_started_at}"},
+            "Body": {"Html": {"Data": html_body}},
+        },
+    )
+
+
 def lambda_handler(event, context):
     import lancedb  # imported inside the handler: only needed once invoked,
     # keeps cold-start import time honest about what this Lambda actually
@@ -166,10 +222,20 @@ def lambda_handler(event, context):
     # only makes sense chained from Fase 2, never invoked standalone without
     # a specific cycle to write.
 
+    started = time.time()
     db = lancedb.connect(LANCEDB_URI)
     results = [write_source(db, source, cycle_started_at) for source in SOURCES]
+    elapsed_s = time.time() - started
+
+    # Third checkpoint email of the cycle (2026-08-22), separate from
+    # send_digest's market-content digest and digest_metrics' Fase 1+2 cost
+    # report -- lands genuinely after both, so Fase 3's own wall-clock
+    # duration is measurable from the gap between all three timestamps, same
+    # reasoning as the Fase 1/Fase 2 split.
+    send_report(cycle_started_at, results, elapsed_s)
 
     return {
         "cycle_started_at": cycle_started_at,
         "results": results,
+        "report_sent": True,
     }

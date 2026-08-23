@@ -440,12 +440,22 @@ resource "aws_lambda_function" "write_lancedb" {
   role          = aws_iam_role.write_lancedb_role.arn
   package_type  = "Image"
   image_uri     = "${aws_ecr_repository.write_lancedb.repository_url}:latest"
-  # Terminal stage of the whole cycle -- invokes nothing further. Per-cycle
-  # write is 4 sources x a few hundred rows each (~1-2s per source measured
-  # 2026-08-22 against the real corpus) -- generous headroom, not a tight
-  # budget.
+  # Terminal stage of the whole cycle -- invokes nothing further, but sends
+  # the cycle's third checkpoint email (see handler.py). Per-cycle write is 4
+  # sources x a few hundred rows each -- 35s measured 2026-08-23 against the
+  # real corpus after fixing load_vectors to scope by cycle instead of
+  # reading the whole checkpoint history (see tech_debt.md) -- generous
+  # headroom under the 120s timeout, not a tight budget.
   timeout     = 120
   memory_size = 512
+
+  environment {
+    variables = {
+      S3_BUCKET     = aws_s3_bucket.poly_rag_data.bucket
+      SES_SENDER    = "bernardolw@gmail.com"
+      SES_RECIPIENT = "bernardolw@gmail.com"
+    }
+  }
 }
 
 data "archive_file" "embed_orchestrator" {

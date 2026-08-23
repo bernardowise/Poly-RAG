@@ -108,14 +108,16 @@ index-rebuild cost scales with the table's total size, not how many rows are
 new; index maintenance is a separate, lower-cadence concern.
 
 Every embedding Lambda writes cost/latency/token rows to
-`poly-rag-embedding-metrics`. `digest_metrics` (split out of
-`embed_news_article` 2026-08-22, so the Lambda that embeds isn't also the one
-that reports) sends a **second email**, separate from `send_digest`'s
-market-content digest — a plain cost/latency/tokens report covering both Phase 1
-and Phase 2 for that cycle. The two emails land at genuinely different times
-(one at the end of Phase 1, one at the end of Phase 2), which is deliberate: it
-lets Phase 2's real wall-clock duration be measured directly from the gap
-between their timestamps, cycle over cycle.
+`poly-rag-embedding-metrics`. Each phase sends its own checkpoint email, three
+total, landing at genuinely different times so each phase's real wall-clock
+duration is measurable from the gaps between their timestamps: `send_digest`
+(Phase 1's market-content digest), `digest_metrics` (split out of
+`embed_news_article` 2026-08-22 so the Lambda that embeds isn't also the one
+that reports — a plain cost/latency/tokens report covering both Phase 1 and
+Phase 2), and `write_lancedb` (added 2026-08-23, a per-source
+status/before/after/written/missing table for Phase 3). The three-email
+pattern means a human can tell which phase succeeded or failed straight from
+the inbox, no CloudWatch needed for the common case.
 
 **Data flow, per cycle:**
 1. **Registry** (DynamoDB, `poly-rag-market-registry`) — one item per market, updated
@@ -271,15 +273,30 @@ tech_debt.md). That logic was then ported into a new Lambda,
 zip/Layer limit), deployed via a new ECR repo. Chained after a new
 `poly-rag-digest-metrics` Lambda, split out of `embed_news_article` the same
 day (the cycle cost/latency/tokens report email was living in a Lambda named
-for embedding, not reporting — see tech_debt.md). Full chain as of today:
-`embed_digest → embed_comments → embed_registry → embed_news_article →
-digest_metrics → write_lancedb`. Deliberately does not rebuild the vector
-index every cycle (only `merge_insert`s new rows) — index rebuild cost scales
-with table size, not new-row count, so it's a separate lower-cadence concern.
-IAM verified against the real deployed roles via `iam simulate-principal-policy`
-before declaring this done; no automatic cycle has fired the full new chain
-end-to-end yet as of this writing, so treat it as verified-but-unproven until
-one does.
+for embedding, not reporting — see tech_debt.md). Full chain: `embed_digest → embed_comments → embed_registry →
+embed_news_article → digest_metrics → write_lancedb`. Deliberately does not
+rebuild the vector index every cycle (only `merge_insert`s new rows) — index
+rebuild cost scales with table size, not new-row count, so it's a separate
+lower-cadence concern.
+
+**Verified in production the very next cycle (2026-08-23 00:00 UTC), which
+surfaced and closed one more real bug the same day:** `write_lancedb` timed
+out at its 120s limit on all 3 attempts (the original invocation plus
+Lambda's 2 automatic async retries) — `registry`/`comments`/`digest` wrote
+fine, but `news_article` (the largest source) never completed. Root cause:
+`load_vectors` was reading every checkpoint ever written for a source, not
+just the current cycle's — harmless for a one-off run, but unbounded cost on
+a Lambda that runs every 12h forever as the corpus grows. Fixed to filter by
+S3 `LastModified >= cycle_started_at` instead, verified locally (35s, well
+under the timeout) before redeploying via `aws lambda update-function-code`
+(Terraform's `image_uri` is a `:latest` tag and doesn't diff on a new
+digest, so this deploy step is manual, not `terraform apply`), and used to
+close that cycle's real data gap in the same run (`news_article_cohere`
+9,832 → 10,580 rows, exactly the missing 748). See tech_debt.md for the full
+incident writeup. Both Phase 1 and Phase 2 healthcheck runbooks passed clean
+on this same cycle — the Phase 1 runbook's own post-resolution-counter check
+turned out to have a false positive (fixed in the runbook itself, see its own
+changelog), not a pipeline bug.
 
 ## Pending / TODO
 

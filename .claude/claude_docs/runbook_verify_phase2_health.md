@@ -131,33 +131,62 @@ pasaria un chequeo de solo-conteo sin ser detectado.
 
 ---
 
-## Paso 3 -- CloudWatch: cero errores reales en los 8 Lambdas de Fase 2
+## Paso 3 -- CloudWatch: cero errores Y cero timeouts en los 10 Lambdas de Fase 2+3
+
+**Corregido 2026-08-23, tras un incidente real que este paso NO atrapaba:**
+`write_lancedb` truena por `Status: timeout` (un evento de plataforma, no una
+excepcion de aplicacion) en su primer ciclo automatico real -- el patron original de
+este paso (`?ERROR ?Exception ?Traceback`) reporto **0 errores** para `write_lancedb`
+mientras las 3 invocaciones (la original + 2 reintentos automaticos de Lambda para
+invocaciones async) tronaban por timeout, una detras de otra. El barrido de errores
+por si solo no es suficiente -- hay que cruzar tambien el conteo de invocaciones
+(mas de 1 en un Lambda que deberia correr exactamente una vez es la senal real, sin
+importar si el patron de error coincide o no) y el `Status` de cada REPORT.
 
 ```bash
 CYCLE_EPOCH_MS=$(python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('$CYCLE_STARTED_AT').timestamp()*1000))")
 
-for fn in chunk-digest chunk-comments chunk-registry chunk-news-article \
-          embed-digest embed-comments embed-registry embed-news-article; do
-  n=$(aws logs filter-log-events --log-group-name /aws/lambda/poly-rag-$fn \
-      --start-time "$CYCLE_EPOCH_MS" \
-      --filter-pattern "?ERROR ?Exception ?Traceback" \
-      --query 'length(events)' --output text 2>/dev/null || echo "SIN LOG GROUP")
-  echo "poly-rag-$fn: $n eventos de error (debe ser 0)"
-done
+python3 -c "
+import boto3
+logs = boto3.client('logs')
+epoch_ms = $CYCLE_EPOCH_MS
+fns = ['chunk-digest','chunk-comments','chunk-registry','chunk-news-article',
+       'embed-digest','embed-comments','embed-registry','embed-news-article',
+       'digest-metrics','write-lancedb']
+for fn in fns:
+    try:
+        errors, starts, reports = [], [], []
+        paginator = logs.get_paginator('filter_log_events')
+        for page in paginator.paginate(logGroupName=f'/aws/lambda/poly-rag-{fn}',
+                                        startTime=epoch_ms,
+                                        filterPattern='?ERROR ?Exception ?Traceback'):
+            errors.extend(page['events'])
+        for page in paginator.paginate(logGroupName=f'/aws/lambda/poly-rag-{fn}',
+                                        startTime=epoch_ms, filterPattern='START RequestId'):
+            starts.extend(page['events'])
+        for page in paginator.paginate(logGroupName=f'/aws/lambda/poly-rag-{fn}',
+                                        startTime=epoch_ms, filterPattern='REPORT RequestId'):
+            reports.extend(page['events'])
+        timeouts = sum(1 for r in reports if 'Status: timeout' in r['message'])
+        print(f'{fn}: {len(starts)} invocaciones (debe ser 1), '
+              f'{len(errors)} errores, {timeouts} timeouts')
+    except Exception as e:
+        print(f'{fn}: SIN LOG GROUP -- {e}')
+"
 ```
 
 Un Lambda que nunca aparece en `aws logs describe-log-groups` (sin log group) es en
 si mismo una senal -- significa que nunca fue invocado en absoluto, lo cual para
-`embed_comments`/`embed_registry`/`embed_news_article` es tan grave como un error
-real si la cadena deberia haber llegado hasta ahi. Verificar con:
+`embed_comments`/`embed_registry`/`embed_news_article`/`digest_metrics`/
+`write_lancedb` es tan grave como un error real si la cadena deberia haber llegado
+hasta ahi. Verificar con:
 
 ```bash
 aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/poly-rag-embed" \
   --query 'logGroups[].logGroupName' --output text
 ```
 
-Las 4 deben existir con al menos 1 log stream cuyo `lastEventTimestamp` caiga dentro
-de la ventana de este ciclo.
+Las 10 Lambdas deben mostrar exactamente 1 invocacion, 0 errores, y 0 timeouts.
 
 ---
 
@@ -217,11 +246,13 @@ las esta disparando en paralelo en vez de en secuencia.
 
 4 archivos de chunks presentes, conteo de `registry` cruzado y coherente contra
 `newly_tracked_markets` de Fase 1, 4 archivos de vectores presentes sin gaps de
-`chunk_id`, cero eventos de error en los 8 log groups (los 8 deben existir), fila de
-`news_article` presente en `poly-rag-embedding-metrics` para este ciclo, y las 4
-invocaciones de embedding en orden estrictamente secuencial sin solape.
+`chunk_id`, cero errores Y cero timeouts en los 10 log groups (los 10 deben existir,
+1 invocacion exacta cada uno), fila de `news_article` presente en
+`poly-rag-embedding-metrics` para este ciclo, y las 4 invocaciones de embedding en
+orden estrictamente secuencial sin solape.
 
 Cualquier desviacion no es necesariamente un incidente de invocacion manual (ver
 `runbook_manual_invocation_cleanup.md` para eso) -- puede ser un bug nuevo del ciclo
-automatico, como los dos que motivaron este runbook. Documentar en tech_debt.md,
-igual que se hizo con ambos bugs del 2026-08-22, no descartar como ruido.
+automatico, como los tres que motivaron este runbook hasta ahora (el de IAM, el de
+`chunk_registry`, y el timeout de `write_lancedb`). Documentar en tech_debt.md, no
+descartar como ruido.

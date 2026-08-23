@@ -3095,3 +3095,63 @@ sequencing is right, not a new decision.
 **Revisit when:** Bloque G (retrieval) is built and Day 5 synthesis agent design
 actually starts -- fold this framing (cycle-scoped vs. cross-cycle questions) into
 that design instead of treating it as a separate feature.
+
+---
+
+## write_lancedb Timeout on Its First Real Automatic Cycle, Fixed Same Day (2026-08-23)
+
+**Context:** cycle `2026-08-23T00:00 UTC` was the first automatic EventBridge cycle to
+run the complete new chain (embed_digest -> ... -> embed_news_article ->
+digest_metrics -> write_lancedb) end to end, after all of 2026-08-22's fixes were
+deployed. Phase 1 and Phase 2 both ran clean (verified via both healthcheck runbooks,
+0 errors across 8 Phase 2 log groups, chunk_registry's 66 new markets cross-checked
+exact against send_digest's `newly_tracked_markets`). Phase 3 (`write_lancedb`) is
+where a real, previously-undetected bug surfaced.
+
+**Bug:** `write_lancedb` timed out at its 120s limit on all 3 attempts (the original
+invocation plus Lambda's automatic 2 retries for async/Event invocations, all sharing
+the same `RequestId` in CloudWatch -- confirmed via `REPORT ... Status: timeout` in
+each attempt's log line). This produced a real, silent-looking failure: the healthcheck's
+CloudWatch error sweep (`?ERROR ?Exception ?Traceback`) reported 0 errors for
+`write_lancedb`, because a platform-level timeout doesn't match any of those patterns --
+a real gap in `runbook_verify_phase2_health.md`'s Paso 3 pattern, found by separately
+checking invocation counts (3, not the expected 1) rather than trusting "0 errors" alone.
+
+**Root cause:** `load_vectors(source)` read every checkpoint part ever written for a
+source (paginating the whole `vectors/_checkpoints/<source>/cohere/` prefix), not just
+this cycle's -- fine for a manual one-off run once, but this Lambda runs every 12h
+forever, and by this first real cycle `news_article` already had ~20 checkpoint files
+and ~9,800 records. The read + join + `merge_insert` cost of the WHOLE history blew
+through the timeout specifically on `news_article` (the largest and last source in the
+loop) -- `registry`/`comments`/`digest` (much smaller) wrote successfully in the same
+invocation before it hit the wall.
+
+**Fix:** `load_vectors` now filters checkpoint files by S3 `LastModified >=
+cycle_started_at` instead of reading everything. Safe by construction: checkpoints are
+always written by an embed Lambda that runs strictly after `cycle_started_at` (same
+threading as the rest of the chain), so this can never miss a checkpoint that belongs
+to the current cycle. Read cost is now bounded by one cycle's worth of new chunks
+(~1-2 checkpoint files at `CHECKPOINT_SIZE=500`), not by total corpus size -- stays
+flat as the corpus grows, instead of degrading further every cycle.
+
+**Verified before redeploying:** ran the fixed image locally via the Lambda RIE against
+the real stuck cycle -- completed in 35s (vs. the 120s limit), and closed the day's
+actual data gap in the same run (`news_article_cohere` 9,832 -> 10,580 rows, the exact
+748 that never landed; `registry`/`comments`/`digest` re-merged idempotently, `before ==
+after` confirming no duplication). Deployed via `docker buildx build --provenance=false
+--sbom=false` (same manifest-format fix as the original build) + `aws lambda
+update-function-code` -- not `terraform apply`, since the Lambda's `image_uri` is a
+`:latest` tag in Terraform state and doesn't diff when the tag's underlying digest
+changes; Terraform stays unaware of image content changes by design here.
+
+**Also built the same day, prompted by this incident:** a third checkpoint email,
+sent by `write_lancedb` itself (per-source status/before/after/written/missing table),
+completing the "one email per phase" pattern (`send_digest` for Phase 1,
+`digest_metrics` for Phase 1+2 cost, `write_lancedb` for Phase 3) -- lets a human tell
+which phase succeeded or failed from the inbox alone, which is precisely what would
+have made this specific incident visible without needing CloudWatch at all.
+
+**Revisit if:** `runbook_verify_phase2_health.md` Paso 3 gets extended to catch
+`Status: timeout` explicitly (it currently only catches `ERROR`/`Exception`/`Traceback`
+patterns, which is what let this incident slip past a "0 errors" reading) -- not yet
+done, tracked here.
