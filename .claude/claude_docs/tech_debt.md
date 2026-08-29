@@ -1608,6 +1608,16 @@ precedent (which deleted debug-run data from a design that no longer exists) -- 
 legitimately-ingested articles under the CURRENT pipeline design, just pointing at a market
 id retired for an unrelated reason.
 
+**CLOSED 2026-08-29 -- decision reversed, cleaned up across all 4 layers.** Rediscovered
+independently while building Bloque G retrieval (a fresh `eda_mio_4` Databricks notebook,
+not a re-read of this entry) as 47 orphaned `market_id`s (143 articles -- a different count
+from the 305 above because this pass counted distinct affected articles across `news/`,
+not the `temporal_tier=unknown_market` classification tag, a different measurement of the
+same underlying phenomenon). This time the user chose to clean it up rather than defer
+again, once retrieval work made the cost concrete (LanceDB search could surface content
+for a `market_id` that no longer resolves to anything). See "Orphan News Data Cleanup"
+entry below for the full 4-layer removal and verification.
+
 **On the 5% 3.3 figure -- validated reasoning, corrected on one point (user + assistant
 discussion, 2026-08-18):** the low 3.3 share is expected and is NOT primarily a function of
 how many markets existed before cycle 1 (most did). It is a function of CORPUS AGE -- News has
@@ -3362,3 +3372,67 @@ one was.
 invocations too (would rule out the cold-start correlation entirely and point
 elsewhere), or if a future occurrence doesn't self-heal within Lambda's 2 automatic
 retries (would actually break a cycle's chain, unlike both observed instances).
+
+---
+
+## Orphan News Data Cleanup (2026-08-29)
+
+**Context:** while exploring corpus coverage in the new `eda_mio_4` Databricks notebook
+(Bloque G-adjacent), found 48 `market_id`s (later 47, see below) referenced by News
+articles in S3 but absent from the current registry -- see the "News Temporal Tiers"
+entry above, "unknown_market" section, for the earlier 2026-08-18 discovery of the same
+underlying phenomenon (registry cleanup on 2026-08-17 purged legacy markets but never
+touched `news/`), which was deliberately left unfixed at the time. This time the user
+chose to actually clean it up, once building retrieval made the cost concrete.
+
+**A live race surfaced mid-investigation, handled correctly rather than blindly trusted:**
+between mapping the full blast radius (48 orphans, 145 affected articles across 4 raw
+cycle files) and actually executing the cleanup, a real automatic cycle fired
+(2026-08-29T12:00 UTC, confirmed via a 28th `news/` cycle file appearing and the registry
+growing from 1,838 to 1,863 markets). Re-running the scan from scratch (not trusting the
+stale count) found 47 orphans / 143 articles -- one previously-orphaned `market_id` had
+apparently re-entered the registry's live count in between. Proceeded on the freshly
+recomputed numbers, not the stale ones, with a hard assertion in the cleanup script that
+would have aborted on any further mismatch.
+
+**Four layers cleaned, in order, each verified against the previous step's output before
+proceeding to the next -- 143 records removed at every layer, consistently:**
+1. **Raw `news/*.json`** (4 files: `2026-08-16/01`, `2026-08-16/12`, `2026-08-17/00`,
+   `2026-08-17/12`) -- removed the 143 affected article objects from each cycle's
+   `articles` array, left `markets_queried`/`markets_processed`/`metadata` untouched
+   (those describe what happened during that historical run, not the current state of
+   the array). S3 versioning is enabled on the bucket, giving a real rollback path if
+   this needed reverting -- factored into the decision to proceed rather than leaving it
+   deferred again.
+2. **`chunks/news_article/{bootstrap,cycles_01-05,cycles_01-13}.json`** -- three
+   OVERLAPPING one-off bootstrap-era snapshot files (predating the automated per-cycle
+   Phase 2 pipeline, 2026-08-22) still contained the same 143 chunk records each (429
+   total removed, 143 unique `chunk_id`s) -- confirmed these are not on the live read
+   path (automated `chunk_news_article` writes `chunks/news_article/<date>/<hour>.json`,
+   a disjoint naming scheme, 16 files covering 2026-08-22 onward only), so this step is
+   audit-trail consistency, not a live-correctness fix.
+3. **`vectors/_checkpoints/news_article/cohere/part_0000{0-3}.json`** -- 143/143 expected
+   chunk_ids found and removed across 4 checkpoint files.
+4. **`news_article_cohere` (LanceDB)** -- `tbl.delete("market_id IN (...)")`, 19,944 ->
+   19,801 rows (143 removed). A plain delete, not a re-embed or reindex -- confirms the
+   earlier framing given to the user before executing: cleanup is surgical, bounded by
+   the 47 orphaned IDs, not a corpus-wide operation.
+
+**Verified clean after all 4 layers:** re-ran the same orphan-detection query against
+both `news/` (raw) and `news_article_cohere` (LanceDB) post-cleanup -- 0 orphans in
+either, confirmed independently rather than assumed from the removal counts alone.
+
+**Explicitly out of scope, raised by the user during this same investigation but deferred
+to its own future decision (not part of this cleanup):** many News articles plausibly
+relate to MULTIPLE simultaneous markets (e.g. several concurrent Bitcoin price-threshold
+markets), but `ingest_news`'s global URL dedup (`poly-rag-processed-urls`, no TTL) gives
+an article to whichever market's search finds it FIRST, permanently -- confirmed directly
+in the code (`process_market_news`, `lambda_handler.py:392-402`): `market_ids` is always
+a single-element list at creation, and a later market's search hitting an
+already-processed URL just `continue`s past it, never appending itself to the existing
+article's linkage. This is a distinct problem from the orphan cleanup above (orphans are
+about DELETED markets; this is about UNDER-linking to markets that still exist) -- three
+candidate fixes discussed (leave as documented limitation; live relink via a new
+`url -> [market_ids]` DynamoDB table without re-extracting content; a one-off semantic
+backfill scoped to a specific topic like Bitcoin) but none decided yet. Revisit as its
+own item, not folded into this one.

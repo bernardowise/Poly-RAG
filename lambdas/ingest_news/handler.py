@@ -618,11 +618,25 @@ def lambda_handler(event, context):
     # registry itself, or it's back to the same bug the fix exists for.
     # Only the dispatch invocation (mode is None) scans fresh, since it's
     # the one establishing this cycle's frozen snapshot in the first place.
+    #
+    # REGRESSION fixed same day (2026-08-29, caught on the very first
+    # automatic cycle after deploy, see tech_debt.md "ingest_news Batch
+    # Re-Scan Race Condition Fix -- Regression"): event["markets"] already
+    # IS this batch's exact slice (sliced once by the dispatcher using the
+    # GLOBAL offset) -- it must be used AS the batch directly. The original
+    # fix still re-sliced it with `open_markets[offset:offset+BATCH_SIZE]`
+    # below using that same global offset, which is only ever valid against
+    # the FULL open_markets list. Applied to an already-35-item slice, every
+    # offset other than 0 sliced out of bounds and silently returned an
+    # empty list -- 32 of 33 batches processed 0 markets on the first
+    # affected cycle (1,133 queried, only 35 processed).
     event_markets = event.get("markets")
     if event_markets is not None:
-        open_markets = event_markets
+        open_markets = None  # unused in this branch -- batch is set directly below
+        batch = event_markets
     else:
         open_markets = get_open_markets(registry_table)
+        batch = None  # computed below once total_markets/all_offsets are known
 
     # total_markets is fixed ONCE by the dispatcher and threaded through
     # every fanned-out batch's payload (see dispatch_remaining_batches for
@@ -633,7 +647,8 @@ def lambda_handler(event, context):
     if total_markets is None:
         total_markets = len(open_markets)
     all_offsets = list(range(0, total_markets, BATCH_SIZE))
-    batch = open_markets[offset:offset + BATCH_SIZE]
+    if batch is None:
+        batch = open_markets[offset:offset + BATCH_SIZE]
 
     # Dispatch step: only the very first invocation of a cycle (offset=0,
     # no mode set) fans out the REMAINING batches before doing its own work.
