@@ -487,7 +487,7 @@ DISPATCH_STAGGER_SECONDS = 3  # small gap between fanned-out invokes -- avoids
 # a request-concurrency concern, not an IP-identity one).
 
 
-def dispatch_remaining_batches(context, offsets, cycle_started_at, total_markets):
+def dispatch_remaining_batches(context, offsets, cycle_started_at, total_markets, open_markets):
     """Fires every remaining batch as an independent async invocation
     (fan-out), instead of chaining one invoke per batch. Each batch writes
     to its own S3 key, so there's no shared-state race between them.
@@ -508,7 +508,24 @@ def dispatch_remaining_batches(context, offsets, cycle_started_at, total_markets
     dispatched, and the merge (and the invoke of the next chain stage)
     silently never happened. Fixed by computing this ONCE in the
     dispatcher and passing it through every downstream invocation instead
-    of re-deriving it."""
+    of re-deriving it.
+
+    Each batch's own MARKET SLICE also travels through the payload now
+    (fixed 2026-08-29, found via a consolidated healthcheck across 12
+    pending cycles -- see tech_debt.md, "ingest_news Batch Re-Scan Race
+    Condition"). Before this fix, only total_markets/all_offsets were
+    frozen at dispatch time -- each batch still independently re-scanned
+    open_markets and sliced its own offset out of ITS OWN scan. Since this
+    same Lambda decrements post_resolution_cycles_remaining for resolved
+    markets it processes, a market crossing 1 -> 0 mid-cycle (decremented
+    by an earlier-finishing batch) would silently disappear from a later
+    batch's independent scan -- even though the dispatcher's original
+    total_markets count still included it and some offset was assigned to
+    cover it. That market's News search for the cycle never ran, with no
+    error anywhere (markets_processed just came out a few short of
+    markets_queried). Passing each batch's exact market slice here instead
+    means every batch works off the SAME frozen snapshot taken once at
+    dispatch time, regardless of what any other concurrent batch does."""
     for i, offset in enumerate(offsets):
         if i > 0:
             time.sleep(DISPATCH_STAGGER_SECONDS)
@@ -520,6 +537,7 @@ def dispatch_remaining_batches(context, offsets, cycle_started_at, total_markets
                 "cycle_started_at": cycle_started_at,
                 "mode": "batch",
                 "total_markets": total_markets,
+                "markets": open_markets[offset:offset + BATCH_SIZE],
             }),
         )
 
@@ -589,11 +607,22 @@ def lambda_handler(event, context):
     registry_table = dynamodb.Table(REGISTRY_TABLE)
     processed_urls_table = dynamodb.Table(PROCESSED_URLS_TABLE)
     domain_failures_table = dynamodb.Table(DOMAIN_FAILURES_TABLE)
-    open_markets = get_open_markets(registry_table)
 
     offset = event.get("offset", 0)
     cycle_started_at = event.get("cycle_started_at") or datetime.now(timezone.utc).isoformat()
     mode = event.get("mode")  # None on the dispatch/first invocation, "batch" on fanned-out workers
+
+    # A fanned-out batch worker gets its own exact market slice in the
+    # payload (fixed 2026-08-29, see dispatch_remaining_batches's docstring
+    # for the race condition this closes) -- it must NOT re-scan the
+    # registry itself, or it's back to the same bug the fix exists for.
+    # Only the dispatch invocation (mode is None) scans fresh, since it's
+    # the one establishing this cycle's frozen snapshot in the first place.
+    event_markets = event.get("markets")
+    if event_markets is not None:
+        open_markets = event_markets
+    else:
+        open_markets = get_open_markets(registry_table)
 
     # total_markets is fixed ONCE by the dispatcher and threaded through
     # every fanned-out batch's payload (see dispatch_remaining_batches for
@@ -612,7 +641,7 @@ def lambda_handler(event, context):
     if mode is None and offset == 0:
         remaining_offsets = [o for o in all_offsets if o != 0]
         if remaining_offsets:
-            dispatch_remaining_batches(context, remaining_offsets, cycle_started_at, total_markets)
+            dispatch_remaining_batches(context, remaining_offsets, cycle_started_at, total_markets, open_markets)
 
     fetch_start = time.time()
     batch_articles = []
