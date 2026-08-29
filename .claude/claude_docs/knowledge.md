@@ -225,6 +225,54 @@ investigar por que `news_article_cohere` devolvia distancias en una escala disti
 al resto de las tablas -- llevo a explicar que es IVF-PQ, que hace, y que en este
 proyecto es un default aceptado, no una eleccion medida contra alternativas.
 
+## 2026-08-29 — Retrieval puro: donde termina, y los levers reales para optimizarlo (top-k, reranking, hybrid search)
+
+**Hasta donde llega el retrieval sin ningun LLM generativo:** el paso final de
+retrieval (`search()` en `retrieval/query.py`) usa exactamente UN modelo neuronal --
+Cohere Embed v4, para convertir la pregunta en texto libre en un vector de 1536
+dimensiones -- pero ese modelo NO genera texto, solo produce un vector. No es un LLM
+conversacional, es un modelo de embedding. Todo lo que pasa despues es matematica
+pura: similitud coseno entre ese vector y cada vector guardado en LanceDB, top-k por
+distancia mas chica. Ningun LLM "razona" sobre la pregunta en este punto -- eso
+recien empezaria en la fase de sintesis (Dia 5, ver `send_digest`'s
+`synthesize_executive_summary` como el precedente ya construido de ese patron:
+darle a un LLM generativo los chunks recuperados + la pregunta, pedirle una
+respuesta en lenguaje natural).
+
+**Tres levers reales para mejorar la calidad del retrieval, en orden de costo/beneficio:**
+
+1. **Top-k** -- el mas barato de ajustar. Cuantos resultados se traen por busqueda
+   (y, si hay varias fuentes/tablas, si `k` deberia ser uniforme o variar por fuente
+   segun su volumen/densidad real).
+2. **Reranking** -- un SEGUNDO modelo (tipicamente cross-encoder, ve la pregunta y
+   el documento JUNTOS en vez de comparar vectores precomputados por separado) que
+   re-ordena el top-k inicial para mejorar precision. Mas caro que ajustar `k`, el
+   beneficio marginal depende del tamano del corpus -- con pocos miles de filas el
+   beneficio es incierto; se vuelve mas valioso cuando el corpus crece.
+3. **Hybrid search** -- combinar busqueda vectorial (semantica) con busqueda de
+   texto/keyword (ej. BM25 o full-text search nativo, que LanceDB si soporta).
+   Util especificamente cuando dos documentos son casi identicos semanticamente
+   pero difieren en un hecho concreto que el embedding no distingue bien -- ej.
+   "Will Bitcoin dip to $58,000" vs "$62,000" vs "$57,500" son preguntas
+   semanticamente casi identicas pero factualmente muy distintas; una busqueda
+   puramente semantica puede no priorizar bien el numero exacto.
+
+**Dos levers adicionales, especificos de este proyecto:** un filtro explicito de
+fecha/rango temporal (hoy solo existe filtro por `market_id`, asi que preguntas tipo
+"que paso esta semana" dependen 100% de que el embedding "entienda" temporalidad, en
+vez de un filtro confiable sobre `pubDate`/`cycle_started_at`); y la fusion
+cross-source (hoy deliberadamente top-k POR FUENTE, no un ranking unico entre las 4
+tablas -- ver la entrada de IVF-PQ arriba para el bug de metrica mixta que motivo esa
+decision).
+
+**Contexto:** el usuario probo `retrieval/query.py` end-to-end desde una libreta de
+Databricks (confirmando que Databricks si puede llamar Bedrock + LanceDB sobre S3) y
+pregunto en que punto se "finetunea" el modelo para que la respuesta sea
+conversacional -- la respuesta llevo a aclarar que no hay fine-tuning en el diseno en
+absoluto (eso no es como funciona RAG), y de ahi a mapear los levers reales de
+optimizacion del retrieval antes de llegar a la fase de sintesis (Dia 5, aun no
+construida).
+
 ---
 
 # Polymarket -- conceptos de dominio

@@ -34,17 +34,29 @@ from cycle_started_at) for all 4 sources in one invocation -- no slice
 argument, no manual scope decision. A source with zero new chunks this cycle
 (e.g. registry on a cycle with no new markets) is skipped, not an error.
 
-INDEX REBUILD -- DELIBERATELY NOT DONE HERE (decided 2026-08-22)
----------------------------------------------------------------------
-Every cycle only merge_inserts the new rows -- it never calls
-tbl.create_index(). Rebuilding IVF-PQ scales with the TABLE's total size, not
-with how many rows are new, so rebuilding every 12h would mean re-indexing
-the whole table (already ~10K rows for news_article and growing ~700/cycle)
-to add a few hundred rows each time -- cost that grows without bound while
-providing zero benefit under LanceDB's real behavior at this scale
-(brute-force search is already exact and fast below ~5,000 rows, see
-MIN_ROWS_FOR_INDEX in the one-off script). Index maintenance is a separate,
-lower-cadence concern (manual or a periodic job), not this Lambda's job.
+INDEX MAINTENANCE -- optimize() every cycle, NEVER create_index() (revised 2026-08-29)
+---------------------------------------------------------------------------------------
+Every cycle still never calls tbl.create_index() -- rebuilding IVF-PQ from
+scratch scales with the TABLE's total size, not how many rows are new, so
+doing that every 12h would mean re-indexing the whole table (already ~20K
+rows for news_article) to add a few hundred rows each time -- cost that
+grows without bound.
+
+But every cycle DOES now call tbl.optimize() (see run_optimize) after each
+source's write -- this is NOT the same operation. optimize() folds newly
+merge_inserted rows into the EXISTING index incrementally (LanceDB's own
+words: "adding new data to existing indices"), plus compacts small files
+and prunes old versions -- it does not rebuild anything from scratch.
+Originally left out of this Lambda (2026-08-22) on the assumption that any
+index maintenance would carry the same table-size-scaling cost as
+create_index() -- that assumption was never verified and turned out wrong.
+Measured directly 2026-08-29 (one-off run, see tech_debt.md): 2.4-13.3s
+across all 4 tables, including news_article with a 7-day backlog of ~10,700
+unindexed rows -- trivial next to this Lambda's 120s timeout. Wrapped in
+try/except (see run_optimize): a maintenance failure should never block the
+data write that already succeeded above it. Tables still under
+MIN_ROWS_FOR_INDEX (no index built yet, see the one-off script) simply get
+the compaction/pruning part of optimize() -- harmless, not skipped.
 
 SCHEMA DRIFT -- SAME FIX AS THE ONE-OFF SCRIPT
 ---------------------------------------------------
@@ -141,6 +153,27 @@ def join_text(vector_records, chunks):
     return list(rows_by_id.values()), missing
 
 
+def run_optimize(tbl):
+    """Folds any unindexed rows into the table's existing vector index
+    (or no-ops if the table has no index yet, still under
+    MIN_ROWS_FOR_INDEX -- see scripts/write_to_lancedb.py) plus compacts
+    small files and prunes old versions. Measured 2026-08-29 (one-off,
+    all 4 tables): 2.4-13.3s even against a table with a 7-day backlog of
+    ~10,700 unindexed rows -- well under this Lambda's 120s timeout, so
+    called every cycle rather than on some N-cycle cadence (see
+    tech_debt.md, "Vector Search Metric Mismatch..." entry for the full
+    reasoning and the LanceDB guidance this measurement revises).
+    Wrapped in try/except: optimize() is maintenance, not correctness --
+    a failure here should never block the actual data write that already
+    succeeded above it."""
+    started = time.time()
+    try:
+        tbl.optimize()
+    except Exception:
+        return None
+    return int((time.time() - started) * 1000)
+
+
 def write_source(db, source, cycle_started_at):
     chunks = load_chunks(source, cycle_started_at)
     if chunks is None:
@@ -172,20 +205,29 @@ def write_source(db, source, cycle_started_at):
             .when_not_matched_insert_all()
             .execute(rows))
         after = tbl.count_rows()
+        optimize_ms = run_optimize(tbl)
         return {"source": source, "status": "merged", "before": before, "after": after,
-                "written": len(rows), "missing": len(missing)}
+                "written": len(rows), "missing": len(missing), "optimize_ms": optimize_ms}
     else:
         tbl = db.create_table(table_name, data=rows)
         after = tbl.count_rows()
+        optimize_ms = run_optimize(tbl)
         return {"source": source, "status": "created", "after": after,
-                "written": len(rows), "missing": len(missing)}
+                "written": len(rows), "missing": len(missing), "optimize_ms": optimize_ms}
 
 
 def build_report_html(cycle_started_at, results, elapsed_s):
+    def optimize_cell(r):
+        ms = r.get("optimize_ms")
+        if ms is None:
+            return "-" if "optimize_ms" not in r else "failed"
+        return f"{ms:,}ms"
+
     rows_html = "".join(
         f"<tr><td>{r['source']}</td><td>{r['status']}</td>"
         f"<td>{r.get('before', '-')}</td><td>{r.get('after', '-')}</td>"
-        f"<td>{r.get('written', 0):,}</td><td>{r.get('missing', 0):,}</td></tr>"
+        f"<td>{r.get('written', 0):,}</td><td>{r.get('missing', 0):,}</td>"
+        f"<td>{optimize_cell(r)}</td></tr>"
         for r in results
     )
     return f"""
@@ -193,7 +235,7 @@ def build_report_html(cycle_started_at, results, elapsed_s):
     <h2>Poly-RAG Fase 3 (write_lancedb) -- {cycle_started_at}</h2>
     <table border="1" cellpadding="4" cellspacing="0">
       <tr><th>source</th><th>status</th><th>rows before</th><th>rows after</th>
-          <th>written</th><th>missing</th></tr>
+          <th>written</th><th>missing</th><th>optimize()</th></tr>
       {rows_html}
     </table>
     <h3>Total time: {elapsed_s:.1f}s</h3>

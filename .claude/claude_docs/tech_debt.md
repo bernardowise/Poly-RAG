@@ -3252,8 +3252,45 @@ avoiding.
 
 **Revisit when:** any new Fase 4/Bloque G/Dia 5 code searches these tables --
 confirm it also forces `.metric("cosine")` and respects the per-source
-`market_id` schema differences documented above. Also revisit to actually
-implement the `optimize()` cadence above -- currently just diagnosed, not fixed.
+`market_id` schema differences documented above.
+
+**One-off `optimize()` run, 2026-08-29 -- cost measured, not guessed, and it
+changes the cadence recommendation above.** Ran `tbl.optimize()` manually against
+all 4 LanceDB tables as a one-off (Bloque G orden del dia, punto 3). Real timings:
+`news_article_cohere` (the one with the gap) 13.3s to fold all 10,715 unindexed
+rows into the index (9,086 -> 19,801 indexed, 0 unindexed after); the other 3
+tables (no index built yet, still under `MIN_ROWS_FOR_INDEX`) 2.4-4.2s each,
+mostly file compaction/version pruning since there's no index to update. All well
+under `write_lancedb`'s 120s timeout, even for the table that had accumulated a
+7-day backlog of unindexed rows. Retrieval sanity-checked post-optimize via
+`retrieval/query.py` -- same coherent cosine-scale distances as before, nothing
+broke.
+
+**Revises the "every N cycles" caution above:** LanceDB's own guidance (100K+
+records or 20+ modification ops between calls) was written assuming `optimize()`
+is expensive enough to warrant batching -- measured here, it is NOT expensive at
+this project's actual scale. Given the real numbers, calling it EVERY cycle
+inside `write_lancedb` is safe, not just "every N cycles as a compromise".
+
+**CLOSED 2026-08-29 -- wired into write_lancedb itself, same day as the
+measurement (punto 4 of the same orden del dia).** Added `run_optimize(tbl)` to
+`lambdas/write_lancedb/handler.py`, called after every `merge_insert`/
+`create_table` in `write_source`, for all 4 sources, every cycle -- wrapped in
+try/except so a maintenance failure never blocks the data write that already
+succeeded above it. Reports `optimize_ms` per source in the Fase 3 checkpoint
+email's table (new column) for ongoing visibility, no CloudWatch digging needed
+to see it working. Verified locally first (`run_optimize()` imported and run
+directly against the real `news_article_cohere` table, 2.2s on a now-current
+table with nothing left to fold in, matching the one-off's expectation that
+cost tracks backlog size, not a fixed cost). Deployed via the container-image
+path (`docker buildx build --provenance=false --sbom=false --push` + `aws lambda
+update-function-code`, not `terraform apply` -- same reasoning as every other
+`write_lancedb` deploy, its `image_uri` is a `:latest` tag Terraform doesn't
+diff on). Confirmed live by pulling the actually-deployed image and grepping its
+`handler.py` for `run_optimize` -- not just trusting `LastModified`, same
+discipline as the `ingest_news` regression fix's verification earlier this
+session. Will self-verify further at the next automatic cycle (00:00 UTC) via
+the report email's new `optimize()` column.
 
 ---
 
@@ -3436,3 +3473,319 @@ candidate fixes discussed (leave as documented limitation; live relink via a new
 `url -> [market_ids]` DynamoDB table without re-extracting content; a one-off semantic
 backfill scoped to a specific topic like Bitcoin) but none decided yet. Revisit as its
 own item, not folded into this one.
+
+---
+
+## ingest_news Batch Re-Scan Race Condition Fix -- Regression, Not Backfilled (2026-08-29)
+
+**Context:** the same-day fix for "ingest_news Batch Re-Scan Race Condition" (see entry
+above) deployed at 2026-08-29T02:12:52 UTC. The next automatic cycle to run with it
+(2026-08-29T12:00 UTC) was caught broken by the user running the newly-built
+`healthcheck_ultimo_ciclo` Databricks notebook -- this is exactly the failure mode that
+notebook was built to catch, and it worked the very first time it was used for real.
+
+**The regression, root cause:** the original fix passed each fanned-out batch's exact
+market slice in the invoke payload (`event["markets"]`, already sliced by the dispatcher
+using the global offset) so batches wouldn't need to re-scan the registry. The handler
+correctly used `event["markets"]` instead of re-scanning -- but then still re-sliced that
+already-small list with the GLOBAL offset (`open_markets[offset:offset+BATCH_SIZE]`,
+`handler.py:636` at the time). For offset 0 this coincidentally still worked (`[0:35]` on
+a 35-item list returns the whole list). For every other offset (35, 70, 105, ...), slicing
+a list that only has ~35 items starting at index 35+ returns an EMPTY list every time --
+deterministic, not intermittent. Verified directly: `news/2026-08-29/12_batch35.json`
+through `_batch1085.json` (32 of 33 batch files) all show `markets_processed: 0,
+articles: []`; only `batch0` processed real markets (35). Cycle totals:
+`markets_queried=1133, markets_processed=35` -- 1,098 markets never searched.
+
+**Fixed same day, verified locally (real registry data, no Lambda invoked) before
+redeploy:** batch workers now use `event["markets"]` directly as the batch, skipping the
+re-slice entirely; only the dispatch invocation (which has the FULL list) still slices by
+offset. Deployed via `terraform apply`, protects the next automatic cycle
+(2026-08-30T00:00 UTC) onward.
+
+**Honest accounting of the mistake, not glossed over:** the "verified locally" check
+done for the ORIGINAL fix only confirmed the INPUT was correct (`event["markets"]`
+correctly present, handler would use it "sin re-escanear") -- it never actually ran the
+full downstream logic through the re-slice line, so it missed the bug entirely. As
+deployed, this regression was objectively MORE severe than the race condition it was
+fixing (~97% of markets affected on the one cycle that hit it, deterministically every
+cycle going forward, vs. the original's ~0.5%/cycle, non-deterministic, silent-but-bounded
+impact) -- see the conversation this session for the direct "tu fix solo empeoro las
+cosas" exchange. The underlying design (freeze the market list once at dispatch time) was
+still correct; the bug was purely in the re-slice implementation.
+
+**The 2026-08-29T12:00 UTC cycle itself was NOT backfilled -- explicit user decision,
+left broken as-is.** Of the 1,120 markets missing News coverage that cycle (recomputed
+fresh at investigation time, registry having grown from 1,133 to more since): 995 are
+open markets that self-heal via the next normal automatic cycle (no permanent loss), 125
+were resolved markets inside their post-resolution capture window (real, permanent loss
+of one cycle's capture for those 125 specifically -- their `post_resolution_cycles_remaining`
+counter still ticks down/expires on schedule regardless of whether this cycle's search
+actually ran for them). `send_digest` for this cycle also ran on the incomplete News
+payload (`news`-derived quotes and `linked_news` in the email/JSON undercount real
+coverage) -- the digest email already sent and was NOT resent, and `digest/2026-08-29/
+12.json` was NOT regenerated.
+
+**A targeted backfill was started, then explicitly interrupted by the user mid-run --
+left in a known, bounded, partially-messy state, documented here instead of finished:**
+
+- Approach: a local one-off (import `process_market_news` from the real handler, run
+  concurrently via `ThreadPoolExecutor`, no Lambda invoked) targeting just the missing
+  markets, meant to merge results into the existing `news/2026-08-29/12.json`, then
+  re-chunk/re-embed `news_article` for this cycle, regenerate `digest/2026-08-29/12.json`
+  (via `send_digest`'s `build_digest_data` with `get_latest_object_key` monkey-patched to
+  target this exact cycle instead of "now", explicitly WITHOUT calling `ses.send_email`),
+  and re-chunk/re-embed/merge `digest` too.
+- Ran much slower than estimated (~200/1,120 markets in ~10.7 minutes, not the projected
+  ~5-8 minutes for 50 concurrent workers) -- likely real network/extraction latency
+  higher than the ~21s/market baseline measured back on 2026-08-16, not a script bug.
+  User killed it before completion rather than wait longer or reconfigure concurrency.
+- **Real leftover side effects from the killed attempt, confirmed via DynamoDB, not
+  guessed:** the script's own S3 merge only happens after ALL futures complete, so
+  `news/2026-08-29/12.json` itself was NEVER touched -- still exactly as broken as
+  before, no corruption risk there. But `process_market_news` calls
+  `mark_url_processed`/`decrement_post_resolution_counter` as a SIDE EFFECT of running,
+  independent of whether the caller later saves the result -- confirmed 104 URLs marked
+  `processed_at` between `2026-08-29T17:15:22` and `17:18:47` UTC (the killed run's exact
+  window) in `poly-rag-processed-urls`, whose article content was extracted but never
+  written anywhere (held only in the killed process's memory) -- these URLs will be
+  silently skipped (not re-fetched) by ANY future attempt for whichever markets they
+  belonged to. Separately, the run's own progress log showed at least 200 (up to ~249)
+  markets fully processed before the kill (`ThreadPoolExecutor` + `as_completed`, so exact
+  count/identity of which specific markets is NOT recoverable after the fact) -- any of
+  those that were resolved-in-window markets already had `post_resolution_cycles_remaining`
+  decremented once for this catch-up pass. **A careless retry that decrements again for
+  the same resolved markets would double-decrement an unknown subset of them, unfairly
+  shrinking their capture window by 2 cycles instead of 1** -- this was flagged before the
+  user decided to abandon the backfill rather than resolve it.
+
+**Explicit decision: abandon this backfill, do not retry now -- pick up fresh in a
+future session ("continuar con otro agente").** Whoever picks this up needs to design
+around the risk above (safest option discussed but not implemented: skip re-decrementing
+`post_resolution_cycles_remaining` entirely on any retry, accepting that some resolved
+markets may end up with a slightly-too-long window rather than risk shrinking it unfairly
+-- under-decrementing is the safer failure direction). The 104 already-marked URLs are a
+small, permanent, low-severity loss (their markets will still get SOME coverage from
+other search results, per `RESULTS_TARGET_PER_MARKET=5` out of `RSS_FETCH_COUNT=15`
+over-fetched candidates).
+
+**Explicitly rejected alternative, and why:** deleting all trace of the 2026-08-29T12:00
+cycle and re-running it end to end for real was raised and rejected -- it would require
+invoking `poly-rag-ingest-polymarket` (hard-blocked without live authorization, and the
+exact instinct that caused the 2026-08-18 x12.5 email-amplification incident), manually
+clearing `poly-rag-cycle-chain-locks` (the table exists specifically to prevent re-running
+the same cycle), re-paying real LLM/embedding cost across all 4 sources instead of just
+the one actually broken, and reverting an already-appended odds snapshot from every
+affected market's `odds/<market_id>.json` -- a cleanup at least as delicate as the orphan
+data cleanup done earlier this same session, not a simplification.
+
+**Revisit when:** picking this back up -- re-verify the 995/125 open/resolved split is
+still accurate (registry keeps growing), decide the safe retry design for the
+post-resolution counter (see above), and decide whether the 104 lost URLs are worth
+tracing to their specific markets or accepted as noise.
+
+**CLOSED (2026-08-29), explicit user decision: accept the gap, do not retry.** Before
+closing, re-verified the 995/125 split fresh (several hours later, same day, no real
+automatic cycle had run in between -- next one was still ~6.5h out): 995 open markets
+unchanged (self-heal for free at the next cycle, zero real loss). The 125 resolved-in-window
+figure had already drifted to 119 resolved-in-window markets registry-wide (116 of them
+still missing this cycle's coverage) -- a real, observed side effect of the killed backfill
+attempt: it evidently reached and decremented some of the original 125 before being killed,
+since no other process could have moved that counter in the intervening hours. A precise
+recovery of exactly which ~9 markets those were (to include them in a final targeted retry
+with zero decrement risk) was attempted and abandoned as unreliable: filtering "resolved
+recently + counter now 0 + missing this cycle's coverage" returned 91 candidates, not 9 --
+almost all false positives, markets that resolved around 2026-08-27 and legitimately
+exhausted their real 4-cycle window (4 genuine automatic cycles: 08-27 00:00/12:00, 08-28
+00:00/12:00) before the broken 08-29T12:00 cycle even started. There is no reliable way to
+separate "decremented by the killed backfill" from "legitimately expired on schedule"
+without the exact original DynamoDB scan order, which is not reproducible after the fact.
+
+**Final accounting of what's permanently accepted, all bounded and small:** (1) 104 URLs
+marked processed with no content saved (already-quantified from the original interruption);
+(2) an unknown subset of resolved markets whose post-resolution window is 1 cycle shorter
+than it should be, due to the killed backfill's decrements before it was stopped (same
+unrecoverable-identity problem as above -- cannot even enumerate this subset, only bound it
+by "at most ~200-249, the killed run's own processed count before the kill"); (3) 116
+resolved-in-window markets (as of this closure) missing exactly one of up to 4 post-resolution
+News snapshots -- they are NOT orphaned, they remain eligible for every subsequent real cycle
+while their counter stays > 0, this is a single missing data point inside an otherwise intact
+capture window; (4) `digest/2026-08-29/12.json` (and its embedded `digest_cohere` vector for
+this cycle) stays under-representing News coverage (13/141 markets with real `linked_news`,
+`executive_summary` written from that incomplete picture) -- one cycle out of 14+, not
+corrected.
+
+**Why accepted instead of run:** a redesigned, scoped-down retry (116 targeted markets
+instead of the original 1,120, skip re-decrementing entirely, ~10-12 min estimated instead of
+>1h) was fully designed and verified feasible before this decision -- see the conversation
+this session for the complete plan (merge_insert chunk_id mechanics for both `news_article_cohere`
+and `digest_cohere` confirmed safe for a targeted correction). Explicit user call: after
+already spending 2+ hours the same day fixing the underlying regression, the remaining gap is
+small, bounded, non-corrupting, and does not block the automatic pipeline -- not worth the
+additional engineering time and Bedrock/embedding cost right now. No corruption, no cascading
+failure; the next real automatic cycle (2026-08-30T00:00 UTC) proceeds normally regardless.
+
+**Revisit if:** never planned as a scheduled revisit -- this is accepted permanently, not
+deferred. Only reopen if a future need specifically requires complete post-resolution News
+coverage for this exact cycle (unlikely given the small scope), in which case the redesigned
+116-market plan above is ready to execute as-is.
+
+---
+
+## Retrieval Date Filter: Pre-filter vs Post-filter Bug (found 2026-08-29, CLOSED 2026-08-29)
+
+**Context:** building query rewriting (LLM as structured filter extractor -- search_text,
+market_id, date_from/date_to, sources -- see `rag_query_exploracion` Databricks notebook,
+Bloque G item 5) surfaced a real, reproducible bug the first time date filtering was
+actually exercised end to end.
+
+**Bug:** `filter_news_article_by_date`/`filter_digest_by_date` apply the date range filter
+AFTER `search_source` has already truncated results to the top-k by pure semantic
+similarity, with zero awareness of the date constraint at search time. If none of the k
+semantically-closest chunks happen to fall inside the requested date range, the result is
+0 -- even if a real, relevant match exists further down the true ranked list (rank k+1,
+k+2, ...) that never got a chance to be considered, since it was never fetched in the
+first place. This is the classic pre-filter vs. post-filter problem in vector search:
+post-filtering can only narrow what's already in the top-k, it can never reach past it.
+
+**Reproduced live:** query "what happened with Bitcoin markets this week" -> query
+rewriting correctly computed `date_from=2026-08-23, date_to=2026-08-29` (today's real
+date correctly injected into the LLM's system prompt) -- but `news_article` returned 0
+results despite real Bitcoin coverage existing in that window (confirmed present in the
+corpus separately). `digest` returned 1 result only by chance (its k=5 pool happened to
+include one chunk inside the range).
+
+**Why this couldn't just use a LanceDB `where()` clause like `market_id` does:**
+`pubDate` on `news_article_cohere` is stored as an RFC 2822 string ("Sun, 02 Aug 2026
+07:00:00 GMT") -- not directly comparable as a range filter (the day-of-week prefix
+breaks lexical/string ordering), so the date filter had to be applied client-side in
+Python after fetching results, which is exactly what creates the post-filter-after-top-k
+problem. `digest`'s `digest_s3_key` prefix (`digest/YYYY-MM-DD/...`) IS string-comparable
+and could in principle be pushed into a real `where()`, but wasn't -- implemented the same
+post-filter way for consistency, inheriting the same bug there too. `registry`/`comments`
+have no reliable per-chunk date field at all -- date filtering doesn't apply to them,
+this was left explicit, not simulated.
+
+**Fix actually applied (2026-08-29) -- NOT a bigger pool.** The first candidate fix
+considered (fetch a larger pool, e.g. k=50-100, before filtering) was explicitly rejected
+by the user mid-design: that's still a top-k cut before filtering, just a more generous
+one -- doesn't remove the bug class, just makes it less likely to trigger. The real fix:
+`search_source` (`retrieval/query.py` and the notebook) no longer calls `.limit()` at
+all -- it returns every row matching its `.where()` clauses (market_id/status), ordered
+by distance, uncut. The caller (`search_with_rewrite` in the notebook) applies the date
+post-filter over that FULL set, and only then slices `[:k]` -- top-k is now strictly the
+LAST step in the pipeline, after every filter (`.where()` and post-filter alike) has
+already run, never before. Verified against the real corpus: `market_id`/`status`
+filtering via `.where()` still returns correct results (regression-checked), and the
+date-filtered path is now structurally incapable of dropping a real match that exists
+outside an arbitrary pool size, because there is no pool size -- the full filtered set is
+what gets ranked. `pubDate`'s RFC 2822 string-format issue is unchanged and still means
+the date filter itself runs as a Python post-filter, not a LanceDB `where()` -- that part
+was explicitly left as-is per the user ("nimodo haremos post-filtering en python"); the
+ISO 8601 reformat + backfill candidate from the original write-up remains a real, separate,
+not-yet-done improvement, but is no longer required to fix the top-k-before-filter bug
+itself, since post-filtering over the full set (not a truncated pool) is safe on its own.
+
+**Revisit when:** considering the ISO 8601 `pubDate` reformat (would let the date filter
+become a real `.where()` instead of a Python post-filter -- a performance/cleanliness
+improvement at this point, not a correctness fix, since correctness is already closed).
+
+---
+
+## Retrieval Ignores Structured Registry Metadata (status/end_date/resolution_date) -- Same Root Cause as the News Date-Filter Bug (found 2026-08-29, status filter CLOSED 2026-08-29, top-k threshold still open)
+
+**Context:** direct follow-up to the pre-filter vs post-filter date bug above, found the
+same day while explaining it back to the user. The user's own instinct was that Registry
+retrieval "should not even use top-k, it should be more like text2sql."
+
+**What's actually true:** text2sql is not missing. The semantic layer over the registry
+(`question`+`description` combined into one vector, closed 2026-08-20, see
+architecture_canon.md "Capa semantica de Polymarket") was built and IS live --
+`chunk_registry_item` in `lambdas/chunk_registry/handler.py:106-119` already writes
+`status`, `end_date`, `resolution_date` as metadata columns alongside the embedding, and
+`registry_cohere` in LanceDB has carried them since 2026-08-20. Nothing new needs to be
+built there.
+
+**The real bug:** `retrieval/query.py`'s `search_source()` only ever pushes `market_id`
+into LanceDB's `.where()` clause (`SCALAR_MARKET_ID_SOURCES`/`LIST_MARKET_IDS_SOURCES`
+logic, lines ~66-84). `status`/`end_date`/`resolution_date` are never read as a filter at
+all -- a question like "which Bitcoin markets are still open" runs 100% through vector
+similarity over `question+description` with zero status filtering. This is the exact same
+root cause as the News pre-filter/post-filter bug documented above, just a different
+symptom: that bug post-filters AFTER top-k truncation; this one never filters in the first
+place. Both come from the same gap -- `rewrite_query()` today only extracts
+`search_text`/`market_id`/`date_from`/`date_to`/`sources`, nothing that maps to Registry's
+structured columns.
+
+**Fix applied (2026-08-29):** `rewrite_query()` now extracts an optional `status`
+("open"/"resolved") field, and `search_source()` pushes it into `.where()` for `registry`
+only (`STATUS_FILTER_SOURCE`), combined with `market_id` via `AND` when both are present --
+no-op on the other 3 tables, same non-uniform-schema pattern `market_id` already uses.
+Verified against the real corpus: `status='open'`/`status='resolved'` both return correctly
+filtered rows via `search()` and `search_source()`, regression-checked against the
+unfiltered case. `end_date`/`resolution_date` were deliberately NOT added -- no clear use
+case distinct from the existing `date_from`/`date_to` extraction that already exists for
+News/Digest. Also folded into the same `.limit()` fix as the date-filter bug above:
+`search_source()` no longer truncates internally at all, so this status filter benefits
+from the same "filter everything first, cut to k last" ordering, not a coincidence --
+both bugs were the same root cause.
+
+**Open sub-problem, explicitly deferred by the user (2026-08-29): top-k should not always
+apply.** When a structured `.where()` filter already narrows the candidate set to a small
+number of rows, ranking that small set by cosine similarity and truncating to `k` doesn't
+save anything and risks dropping valid rows for no reason -- e.g. if `status='open' AND
+question ILIKE '%Bitcoin%'` only matches 8 rows, return all 8, don't rank-and-cut to k=5.
+Proposed mechanism (not decided): check the filtered row count first
+(`.where(...).count_rows()`), skip `.limit()` (or use a generous safety cap, not a real
+rank-and-cut) when that count is below some threshold, apply top-k normally otherwise.
+**Two open questions, explicitly unresolved -- user said "no lo se aun, iremos viendo":**
+(1) is the threshold a fixed row count or relative to the requested `k` (e.g. count <= 3*k)?
+(2) does this apply uniformly across all 4 sources, or only where a structured filter can
+exist at all (Registry via status/date, News/Digest via market_id) -- Comments never has a
+direct structured filter (links via `comment_entity_id`, not a column search_source can
+`.where()` on), so top-k would always apply there regardless.
+
+**Revisit when:** picking this up alongside the News date-filter bug -- both belong to the
+same "push structured filters into `.where()` before truncating" fix, logged together in
+`rag_query_exploracion`'s "Tuning levers" section.
+
+---
+
+## Registry-First Cascade Ported to retrieval/query.py (2026-08-29)
+
+**Context:** the Registry-first cascade design (Registry resolves free text -> exact
+market_ids first, then News/odds look up by those ids instead of independently
+re-searching) was designed and iterated entirely in the `rag_query_exploracion`
+Databricks notebook -- hybrid keyword+semantic resolve, the odds source, the TOP_N=30
+placeholder, all of it. Per the user's explicit workflow ("cuando ya lo tengamos 100%
+bien ya lo pasas al script"), it has now been ported to `retrieval/query.py` as the
+MVP for Bloque G's Gradio UI to build against.
+
+**What's in the script now:** `search_cascade()` (new entry point), `resolve_market_ids()`
+(hybrid registry resolve), `search_news_by_market_ids()`, `search_odds_by_market_ids()`
+(the new odds source, S3-only, no LanceDB), `rewrite_query()` + `_extract_json()`
+(query rewriting), `filter_news_article_by_date()`/`filter_digest_by_date()`. The older
+`search()`/`search_with_rewrite()` (parallel/independent design) were kept, not deleted --
+superseded for market-scoped questions, still there for comparison. `search_source()`
+gained a `limit` parameter (LanceDB's hidden default-10 when `.limit()` is never called
+at all was the root cause of two real bugs found this session -- see the date-filter and
+Registry-status entries above).
+
+**Verified against the real corpus (not just copied from the notebook):** both test
+cases from the notebook re-run directly against `retrieval/query.py` --
+"what happened with Bitcoin markets this week" (111 resolved market_ids via the hybrid
+keyword branch) and "how did the odds of the markets that talk about trump move in the
+last 48hrs" (30 resolved market_ids, odds snapshots matching the notebook's counts
+exactly, e.g. market 3231771 -> 6 snapshots in both places).
+
+**Still explicitly unresolved, ported as-is (not fixed during the port):**
+`REGISTRY_SEMANTIC_TOP_N = 30` remains an arbitrary, acknowledged-imperfect placeholder
+(see "Registry semantic branch cutoff" -- distance threshold and Cohere Rerank were both
+tried and failed to produce a clean cutoff). The item 9 top-k-when-filtered-set-is-small
+question is also still open. Both are tuning work, not blockers for the Gradio MVP.
+
+**Revisit when:** Bloque G's Gradio UI is built against this script and real usage
+surfaces which of these open questions actually matter in practice -- the user's stated
+plan is to branch here: Gradio work proceeds against this MVP, tuning lever calibration
+(TOP_N, reranking, the small-filtered-set top-k question) continues in parallel,
+prioritized ad hoc rather than blocking the UI.
