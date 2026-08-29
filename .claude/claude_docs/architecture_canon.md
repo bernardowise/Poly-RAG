@@ -689,6 +689,40 @@ vectorizado en Dia 6 (operacion de infraestructura, no un re-embedding, dado que
 mover vectores ya calculados a otro backend no repite el trabajo caro). OpenSearch
 Serverless sigue descartado por costo (~$700/mes, incompatible con el budget).
 
+**Mecanica real de indexacion en LanceDB (documentado 2026-08-29, decidido en
+Fase 3, 2026-08-22 -- ver `scripts/write_to_lancedb.py`):** `MIN_ROWS_FOR_INDEX
+= 5_000` -- una tabla solo recibe un indice IVF-PQ (`create_index(metric=
+"cosine")`) si cruzo ese umbral en el momento en que corrio el write; por
+debajo, LanceDB busca brute-force (exacto, no aproximado). `write_lancedb`
+(la Lambda automatica, mismo dia) deliberadamente NUNCA reindexea por ciclo
+-- el costo de reindexar escala con el tamano TOTAL de la tabla, no con
+cuantas filas son nuevas (ver docstring de `lambdas/write_lancedb/
+handler.py`). Consecuencia real, verificada 2026-08-29: de las 4 tablas, solo
+`news_article_cohere` (la fuente que crece ~700 articulos/ciclo, por lejos la
+mas grande) cruzo el umbral -- tiene indice, metrica coseno explicita.
+`registry_cohere`/`comments_cohere`/`digest_cohere` siguen sin indice (todas
+por debajo de 5,000 filas a esa fecha), buscan con la metrica DEFAULT de
+LanceDB, que es L2 (euclidiana), no coseno. El umbral en si es una decision
+de ingenieria razonable (IVF-PQ necesita volumen para formar particiones con
+sentido); el problema real esta en el codigo que CONSUME estas tablas, no en
+el umbral: cualquier busqueda que no fuerce `.metric("cosine")` explicitamente
+obtiene distancias en escalas incomparables entre tablas (coseno en las que
+tienen indice, L2 en las que no) -- bug real encontrado y corregido en
+`retrieval/query.py` (Bloque G, G1), ver tech_debt.md, "Vector Search Metric
+Mismatch Across LanceDB Tables". Cualquier codigo nuevo que busque en mas de
+una de estas 4 tablas debe forzar `.metric("cosine")` explicitamente, sin
+asumir que el default es uniforme entre tablas indexadas y no indexadas.
+
+**Correccion 2026-08-28 (verificado contra la API real, no supuesto):** "nunca
+reindexea por ciclo" describe lo que `write_lancedb` hace hoy, no un limite de
+LanceDB -- `tbl.optimize()` SI existe y agrega datos nuevos al indice existente
+sin reconstruirlo desde cero (`help(lancedb.table.LanceTable.optimize)`,
+modelado como VACUUM de Postgres). El gap real de `news_article_cohere` (>50%
+de sus filas sin indexar, ver tech_debt.md) es un paso de mantenimiento que
+falta en el codigo (nunca se llama `optimize()`), no una limitacion inherente
+del algoritmo IVF-PQ que obligue a elegir entre "nunca reindexar" o "reindexar
+todo cada vez".
+
 ### Verificado en produccion
 
 **Bootstrap del registry (2026-08-15, tras el fix de horizonte minimo de 48h):**

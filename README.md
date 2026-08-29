@@ -220,4 +220,17 @@ CLAUDE.md                  project instructions, loaded automatically every sess
 `.claude/claude_docs/architecture_canon.md` is the authoritative, current-state
 snapshot of everything above — this README is a summary of it, not a replacement.
 
+## Status
+
+The full pipeline runs end to end, unattended, on a 12-hour cycle: ingestion,
+chunking and embedding, and vector-store writes are all live in production.
+The corpus grows automatically every cycle — 1,800+ tracked markets, ~20,000
+news articles, 1,400+ trader comments, over 23,000 vectors indexed for
+semantic search.
+
+Retrieval (semantic search over the accumulated corpus) is under active
+development. A public query interface is planned next.
+
+See `.claude/claude_docs/architecture_canon.md` for the full architecture and
+design rationale.
 

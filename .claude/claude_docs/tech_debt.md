@@ -3155,3 +3155,92 @@ have made this specific incident visible without needing CloudWatch at all.
 `Status: timeout` explicitly (it currently only catches `ERROR`/`Exception`/`Traceback`
 patterns, which is what let this incident slip past a "0 errors" reading) -- not yet
 done, tracked here.
+
+---
+
+## Vector Search Metric Mismatch Across LanceDB Tables (found and fixed 2026-08-29)
+
+**Context:** building `retrieval/query.py` for Bloque G (Dia 4, G1 -- retrieval
+puro), the first real cross-table search surfaced a suspicious pattern: distances
+returned from `news_article_cohere` were consistently ~0.46-0.49, while the other 3
+tables (`registry_cohere`, `comments_cohere`, `digest_cohere`) returned ~1.1-1.3 for
+the same query. Initially misread as "news_article matches better semantically" --
+the user caught this and asked for verification instead of accepting the
+explanation at face value.
+
+**Root cause:** the 4 LanceDB tables do NOT share a search metric. Per
+`MIN_ROWS_FOR_INDEX = 5_000` (decided in `scripts/write_to_lancedb.py`, Fase 3,
+2026-08-22), only `news_article_cohere` (the fastest-growing source, ~700
+articles/cycle) has ever crossed that row threshold -- it has an IVF-PQ index built
+with `metric="cosine"` explicit. The other 3 tables are all still under 5,000 rows
+(1,838 / 1,405 / 27 respectively as of 2026-08-29), so they have no index and
+LanceDB falls back to brute-force search using its DEFAULT metric, which is L2
+(Euclidean), not cosine. `retrieval/query.py`'s `search()` never specified a metric
+on any of the 4 `.search()` calls, so each table silently used whatever it had
+available -- comparing 0.46 (cosine) against 1.2 (L2) was never a valid comparison,
+regardless of what the numbers seemed to suggest about relevance.
+
+**This is NOT a bug in the `MIN_ROWS_FOR_INDEX` threshold itself** -- that design
+(index only above 5,000 rows, since IVF-PQ needs enough rows to form meaningful
+partitions, brute-force is already exact and fast below that) is sound and was a
+deliberate Fase 3 decision. The bug is specifically in code that CONSUMES these
+tables without accounting for the asymmetry it creates: any cross-table search
+that doesn't force a metric ends up comparing incomparable numbers.
+
+**Fix:** `search_source()` in `retrieval/query.py` now calls
+`.metric("cosine")` explicitly on every `.search()`, regardless of whether the
+target table has an index -- LanceDB computes exact cosine in brute-force mode
+too, just slower (acceptable at these row counts, same reasoning as
+`MIN_ROWS_FOR_INDEX` itself). Verified: after the fix, all 4 tables returned
+distances in the same 0-2 cosine range for the same test query (0.46-0.65),
+`news_article` still closest but now a real comparison, not a metric artifact.
+
+**Also found while implementing the `market_id` metadata filter (same session):**
+the 4 tables do not share a `market_id` schema either -- `registry_cohere` and
+`news_article_cohere` have a scalar `market_id` column (direct `=` filter works);
+`digest_cohere` has `market_ids_mentioned`, a LIST column (needs
+`list_contains(...)`, `=` would silently match 0 rows forever); `comments_cohere`
+has no `market_id` column at all (links via `comment_entity_id`, a separate
+lookup through the registry -- see architecture_canon.md, "Comments" section).
+`search_source()` now branches per-source instead of applying one filter
+uniformly, and explicitly returns `[]` (not an error, not silently ignoring the
+filter) for `comments` when a `market_id` filter is requested, since that source
+genuinely cannot answer that filter with its current schema.
+
+**Also flagged, initially assumed unfixable without a full rebuild -- CORRECTED
+2026-08-28:** `news_article_cohere`'s index was built once at 9,229 rows
+(2026-08-22) and never touched again -- the table has since grown to 19,918 rows
+via `merge_insert`, so 10,689 rows (>50%) are unindexed. Doesn't break correctness
+(LanceDB searches indexed + unindexed together), but the index's speed benefit
+erodes every cycle as the unindexed fraction grows -- more and more of each query
+falls back to brute-force. The initial read (2026-08-28, in conversation, not yet
+written anywhere at the time) was that IVF-PQ has no incremental option and
+"reindex" always means a full from-scratch rebuild over the whole table, so
+avoiding a per-cycle reindex was framed as the only real choice available.
+
+**That framing was wrong -- verified directly against the installed LanceDB
+Python API (`help(lancedb.table.LanceTable.optimize)`), not assumed:**
+`tbl.optimize()` exists specifically for this, modeled after PostgreSQL's
+`VACUUM`. Its docstring: "Index: Optimizes the indices, adding new data to
+existing indices" -- it incorporates unindexed rows into the existing index
+WITHOUT a full rebuild, plus compacts small files and prunes old dataset
+versions. LanceDB's own guidance: run `optimize()` after ~100,000 added/modified
+records or ~20+ data-modification operations. `write_lancedb` calls
+`merge_insert` every cycle (a data-modification operation by that definition) but
+never calls `optimize()` -- the growing unindexed fraction is a missing
+maintenance step in this project's code, not an inherent limitation of IVF-PQ or
+a necessary consequence of avoiding full reindexes.
+
+**Real fix, not yet implemented:** add a periodic `tbl.optimize()` call --
+either inside `write_lancedb` on some cadence (e.g. every N cycles, or when
+`index_stats()`/`list_indices()` shows unindexed rows crossing a threshold), or
+as a separate low-cadence job outside the per-cycle chain. Cost is bounded by
+`optimize()`'s own incremental design (not the whole-table rebuild cost a full
+`create_index()` would carry), so this does not reintroduce the "reindex cost
+scales with table size" problem the original no-reindex-per-cycle decision was
+avoiding.
+
+**Revisit when:** any new Fase 4/Bloque G/Dia 5 code searches these tables --
+confirm it also forces `.metric("cosine")` and respects the per-source
+`market_id` schema differences documented above. Also revisit to actually
+implement the `optimize()` cadence above -- currently just diagnosed, not fixed.

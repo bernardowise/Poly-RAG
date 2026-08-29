@@ -184,6 +184,47 @@ ingestion generan y guardan en S3 (distinto del correo digest que ya recibe) --
 confirmando que hoy solo estan en raw storage, sin indexar de ninguna forma, justo
 antes de arrancar el Dia 3 del sprint.
 
+## 2026-08-28 -- IVF-PQ: algoritmo de indexacion de vectores (ANN), no de retrieval en si
+
+Es un algoritmo de indexacion cuyo proposito es acelerar el retrieval -- no son dos
+cosas separadas, es una tecnica que actua al construir el indice (build time) para
+que las busquedas (query time) sean mas rapidas despues.
+
+**Dos tecnicas combinadas (de donde sale el nombre):**
+- **IVF (Inverted File Index):** parte el espacio vectorial en clusters (via
+  k-means). Al buscar, en vez de comparar el query contra TODOS los vectores, solo
+  compara contra los clusters mas cercanos. El nombre esta prestado del indice
+  invertido clasico de busqueda de texto (palabra -> lista de documentos); aqui es
+  cluster -> lista de vectores.
+- **PQ (Product Quantization):** comprime cada vector en un codigo compacto -- lo
+  parte en sub-vectores y cuantiza cada uno contra un codebook chico. Las distancias
+  se vuelven lookups en tabla en vez de multiplicaciones reales -- mucho mas rapido y
+  con mucha menos memoria, a cambio de precision.
+
+Juntos: IVF reduce CUANTOS vectores se comparan, PQ acelera CADA comparacion
+individual. El resultado es **ANN (Approximate Nearest Neighbor)** -- aproximado, no
+exacto, a cambio de velocidad/memoria. Por eso el brute-force (sin indice) es mas
+lento pero exacto, mientras que una tabla con indice IVF-PQ es mas rapida pero
+aproximada.
+
+**Se escoge, no viene forzado -- pero en este proyecto se acepto el default sin
+comparar alternativas.** LanceDB soporta varios tipos de indice (IVF-PQ, IVF-FLAT sin
+compresion, variantes tipo HNSW en versiones mas nuevas), seleccionables con el
+parametro `index_type` en `create_index()`. El codigo de Poly-RAG
+(`scripts/write_to_lancedb.py`) llama `create_index(vector_column_name="embedding",
+metric="cosine")` sin especificar `index_type`, asi que LanceDB uso su default
+(IVF-PQ) -- una decision implicita, no una comparacion deliberada contra HNSW u otras
+opciones. Ver tech_debt.md, "Vector Search Metric Mismatch Across LanceDB Tables",
+para un bug real que broto de esta misma area (dos de las 4 tablas del proyecto no
+tienen indice todavia, por no haber cruzado `MIN_ROWS_FOR_INDEX`, y buscan con una
+metrica de distancia distinta por default -- L2 en vez de coseno -- si no se fuerza
+explicitamente).
+
+**Contexto:** surgio construyendo `retrieval/query.py` (Bloque G, Dia 4, G1), al
+investigar por que `news_article_cohere` devolvia distancias en una escala distinta
+al resto de las tablas -- llevo a explicar que es IVF-PQ, que hace, y que en este
+proyecto es un default aceptado, no una eleccion medida contra alternativas.
+
 ---
 
 # Polymarket -- conceptos de dominio
