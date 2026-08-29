@@ -3244,3 +3244,121 @@ avoiding.
 confirm it also forces `.metric("cosine")` and respects the per-source
 `market_id` schema differences documented above. Also revisit to actually
 implement the `optimize()` cadence above -- currently just diagnosed, not fixed.
+
+---
+
+## ingest_news Batch Re-Scan Race Condition (found and fixed 2026-08-29)
+
+**Context:** running a consolidated healthcheck across the 12 automatic cycles
+pending verification since 2026-08-23 (see runbook_verify_phase1_health.md), 11 of
+12 showed `markets_queried != markets_processed` (small mismatches, 1-6 markets
+short each time) in the News cycle payload -- a pattern the healthcheck runbook
+flags as suspicious (its own Paso 1 note: "si markets_processed < markets_queried,
+algun batch nunca termino o nunca se mergeo"), but `cycle_complete: true` held in
+every one of those 11 cycles, meaning the merge genuinely did complete with every
+expected batch file present. The mismatch was real but not the failure mode the
+runbook's note describes.
+
+**Root cause:** `ingest_news`'s fan-out design (see its own docstring, "PARALLEL
+FAN-OUT") already fixed one race in this area on 2026-08-16 -- `total_markets` is
+computed once by the dispatch invocation and threaded through every batch's
+payload, specifically because independent re-scans of the registry (DynamoDB Scan
+is only eventually consistent) could disagree on the total count. That fix left a
+second, narrower race untouched: while `total_markets` (a number) travelled
+through the payload, the actual MARKET LIST did not -- every batch, dispatch or
+fanned-out, still called `get_open_markets()` on its own, independently, and
+sliced its own offset out of ITS OWN scan result. `get_open_markets` filters on
+`status = open OR post_resolution_cycles_remaining > 0`, and this same Lambda
+decrements that counter for every resolved market a batch processes. If Batch A
+(processing earlier or faster) decremented a market's counter from 1 to 0, and
+Batch B's own independent scan (for a different, later offset) ran after that
+write, Batch B's scan would no longer include that market at all -- even though
+the dispatcher's original `total_markets` count, computed before Batch A's write,
+had already counted it and assigned it to some offset. That market's News search
+for the cycle simply never ran, with no error anywhere: `markets_processed` (the
+sum of every batch's own slice length) came out a few short of `markets_queried`,
+and nothing else signaled the gap. Real consequence, not just a cosmetic count
+mismatch: that specific market lost one cycle of its 4-cycle post-resolution News
+capture window, silently.
+
+**Fix:** the dispatcher (`dispatch_remaining_batches`) now receives the FULL
+`open_markets` list from its own one-time scan and includes each batch's exact
+market slice (`open_markets[offset:offset+BATCH_SIZE]`) directly in that batch's
+invoke payload. `lambda_handler` uses `event["markets"]` when present instead of
+re-scanning -- only the dispatch invocation (`mode is None`) still scans fresh,
+since it's the one establishing the cycle's frozen snapshot in the first place.
+Every batch now works off the exact same snapshot taken once at dispatch time,
+regardless of what any other concurrent batch does or how fast it runs. Payload
+cost is flat per batch (~9.5KB measured for a real 35-market slice against the
+current 1,108-market registry), independent of total registry size -- bounded by
+`BATCH_SIZE`, not by corpus growth, same design principle as the `write_lancedb`
+checkpoint-read fix from 2026-08-23.
+
+**Verified before deploying:** imported the handler locally and confirmed against
+a real registry scan that a simulated batch payload correctly used the passed
+`markets` slice without re-scanning (no Lambda invoked). Deployed via `terraform
+apply` (zip-based Lambda, ordinary path, unlike the container-image `write_lancedb`
+deploy). Confirmed live in production by downloading the actually-deployed zip
+from AWS and finding the new code in it (`last_modified` 2026-08-29T02:12:52 UTC)
+-- not just trusting `terraform plan`'s "No changes" result, which alone would not
+have distinguished "already deployed" from "stale local build directory silently
+skipped by an overly narrow -target plan."
+
+**Revisit if:** the next automatic cycle's healthcheck (Paso 1 of
+runbook_verify_phase1_health.md) still shows `markets_queried != markets_processed`
+-- would mean this fix didn't close the gap, or a different bug produces the same
+symptom.
+
+---
+
+## embed_registry Timeouts, Self-Healing, Observability Gap (found 2026-08-29, not fixed)
+
+**Context:** same consolidated healthcheck across 12 pending cycles (see previous
+entry) also swept CloudWatch Logs across all 8 Phase 2 Lambdas for the range. All
+showed exactly 12 invocations (matching the 12 cycles) with zero errors, except
+`embed_registry`: 15 invocations (3 extra, from Lambda's automatic async retries)
+and 2 real `Status: timeout` events, in 2 separate cycles (2026-08-23T12:00 and
+2026-08-25T12:00 UTC).
+
+**What actually happened, per CloudWatch:** in both cases, the FIRST invocation of
+that cycle hit the Lambda's 120s timeout exactly, immediately following an
+`INIT_START` (cold start). Lambda's automatic retry for async (`InvocationType=
+Event`) invocations then ran again, minutes later, and succeeded quickly (10.8s
+and 15.1s respectively) -- except the 2026-08-25T12:00 cycle needed a SECOND retry
+(the first retry also timed out at 120s) before the third attempt finally
+succeeded. Both cycles' downstream chain (`embed_news_article`, `digest_metrics`,
+`write_lancedb`) still shows exactly 12/12 invocations with no errors -- the chain
+self-healed both times, no data loss, no broken cycle.
+
+**Root cause: NOT confirmed, initial hypothesis ruled out by counter-evidence.**
+First guess was the same unbounded-checkpoint-read pattern that caused the real
+`write_lancedb` timeout on 2026-08-23 (see that entry) -- `embed_registry`'s
+`already_embedded_ids()` reads every checkpoint file ever written for its source,
+same as the other 3 embed_* Lambdas. But checking actual checkpoint counts ruled
+this out directly: `news_article` has 47 checkpoint files (the most of any
+source) and shows zero timeouts in this same window, while `registry` (17
+checkpoint files, far fewer) is the one that timed out -- if checkpoint volume
+were the driver, `news_article` should fail first, not `registry`. The more
+plausible remaining explanation, NOT verified against real evidence (the handler
+emits no progress/debug logging, so there's no way to see where it was stuck):
+Bedrock/Cohere throttling during `embed_texts`'s retry loop
+(`MAX_RETRIES=6`, exponential backoff up to 60s cap -- `2+4+8+16+32=62s` of sleep
+alone before the final attempt, plausible to exhaust 120s combined with real
+per-attempt latency) -- consistent with this project's two prior real Cohere
+daily-quota outages (see "Embedding Model Choice"/Phase 2 Embedding Bootstrap
+entries), and with both incidents happening on a cold start specifically.
+
+**Not fixed -- explicit decision, not an oversight:** the chain self-heals via
+Lambda's own retry mechanism, so there is no user-facing failure or data loss to
+fix urgently. The real gap is observability, not correctness: `embed_registry`
+(and likely all 4 embed_* Lambdas, since they share the same mechanism per
+embed_digest's docstring) has no progress logging, so if this happens again there
+is still no way to see where it stalls. Adding structured progress logging (e.g.
+per-batch start/end, per Bedrock call attempt/backoff) would let a future incident
+be diagnosed instead of only inferred from timing/cold-start correlation, as this
+one was.
+
+**Revisit if:** this recurs -- especially if it starts happening on WARM
+invocations too (would rule out the cold-start correlation entirely and point
+elsewhere), or if a future occurrence doesn't self-heal within Lambda's 2 automatic
+retries (would actually break a cycle's chain, unlike both observed instances).
