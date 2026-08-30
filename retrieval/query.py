@@ -22,10 +22,19 @@ corpus before landing here):
   distributions -- see architecture_canon.md, Retrieval section).
 - search_cascade(): current, correct design for market-scoped questions
   (see its docstring below) -- Registry resolves free text to exact
-  market_ids FIRST, then News/odds look up by those ids instead of
+  market_ids FIRST, then News/odds/Comments look up by those ids instead of
   re-searching independently. Digest stays independent (cycle-scoped, not
-  market-scoped). Comments is out of scope for both designs (no market_id
-  column on comments_cohere).
+  market-scoped).
+
+Comments (2026-08-30): comments_cohere has no scalar market_id column (it
+groups by comment_entity_id, an Event/Series id shared by up to 49 markets
+-- see architecture_canon.md, "Comments" section), but it DOES carry
+market_ids_mentioned, a LIST column added 2026-08-30 (chunk_comments,
+backfilled for all pre-existing rows -- see tech_debt.md, "Comments Not in
+Retrieval Cascade") that captures exactly which markets each comment
+thread applies to. This makes Comments filterable by market_id via
+list_contains(), same mechanism Digest's market_ids_mentioned already used
+-- Comments is no longer out of scope for either design.
 """
 
 import json
@@ -80,14 +89,12 @@ def embed_query(text):
 # know each source's real column, or it either errors (column doesn't
 # exist) or silently returns 0 rows (comparing = against a list column).
 # registry/news_article: scalar market_id, direct equality.
-# digest: market_ids_mentioned is a LIST column -- needs list_contains, not =.
-# comments: has NO market_id column at all (it links via comment_entity_id,
-# a separate lookup through the registry -- see architecture_canon.md,
-# "Comments" section). Filtering comments by market_id is out of scope for
-# G1 -- skipped explicitly (not silently ignored) rather than faked.
+# digest/comments: market_ids_mentioned is a LIST column -- needs
+# list_contains, not =. Comments gained this column 2026-08-30 (previously
+# had no market_id linkage at all in LanceDB -- see module docstring).
 SCALAR_MARKET_ID_SOURCES = {"registry", "news_article"}
-LIST_MARKET_IDS_SOURCES = {"digest": "market_ids_mentioned"}
-NO_MARKET_ID_FILTER_SOURCES = {"comments"}
+LIST_MARKET_IDS_SOURCES = {"digest": "market_ids_mentioned", "comments": "market_ids_mentioned"}
+NO_MARKET_ID_FILTER_SOURCES = set()
 
 # status ("open"/"resolved") only exists as a column on registry_cohere --
 # the other 3 tables don't carry it, so a status filter is a no-op there,
@@ -168,7 +175,7 @@ FILTER_SCHEMA_DOC = """Available sources and their supported filters:
 - registry: 1 vector per market (question+description). Filters: market_id (exact) and status ("open" or "resolved", exact). No reliable date filter.
 - news_article: full news article chunks. Filter: market_id (exact) and pubDate (real publish date).
 - digest: 1 narrative chunk per cycle (every 12h). Filter: market_id (searches inside a list, not exact match) and cycle date.
-- comments: trader comments grouped by entity. Does NOT support filtering by individual market_id nor a reliable date field.
+- comments: trader comments grouped by entity. Filter: market_id (searches inside a list, not exact match, one comment thread can apply to many markets). No reliable date field.
 - odds: price/volume time-series snapshots per market (S3, not a LanceDB vector table -- no
   semantic search, exact structured lookup only). Filter: market_id (exact) and snapshot
   timestamp (real event time, ISO 8601, directly range-comparable). Use this source when the
@@ -191,8 +198,16 @@ def _extract_json(text):
     return json.loads(text.strip())
 
 
-def rewrite_query(question):
+def rewrite_query(question, history_text=None):
+    """history_text (added 2026-08-30, for Gradio's conversational mode):
+    plain text of prior turns ("User: ...\\nAssistant: ..."), used so a
+    context-dependent follow-up ("what about last month?") can be resolved
+    into a self-contained search_text/date_from/date_to in THIS one call,
+    instead of needing a separate LLM call to "contextualize" the question
+    first (cheaper -- one Bedrock call per turn for rewriting, not two).
+    None/omitted keeps this exactly the single-turn behavior it always had."""
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    history_block = f"\nConversation so far, for resolving context-dependent references only (the LATEST user message below is what you're actually rewriting):\n{history_text}\n" if history_text else ""
     system_prompt = f"""You prepare queries for a semantic retrieval system over a
 corpus of Polymarket prediction markets, news articles, trader comments, and cycle
 digests.
@@ -200,7 +215,7 @@ digests.
 Today's real date (UTC): {today_utc}
 
 {FILTER_SCHEMA_DOC}
-
+{history_block}
 Given a natural-language question, decide:
 1. search_text: the text to embed for semantic search (can be the same as the
    original question, or rewritten if it helps).
@@ -408,6 +423,29 @@ def search_news_by_market_ids(market_ids, date_from=None, date_to=None):
     return filter_news_article_by_date(rows, date_from, date_to)
 
 
+def search_comments_by_market_ids(market_ids):
+    """Step of the cascade: Comments as a lookup by Registry's resolved
+    market_ids, via market_ids_mentioned (LIST column, added 2026-08-30 --
+    see module docstring). One comment thread (shared_event/shared_series)
+    can apply to many markets at once, so this is an OR of list_contains()
+    across all resolved ids, not a single equality/IN check like News'
+    scalar market_id. No date filter -- comments has no reliable per-chunk
+    date field (see FILTER_SCHEMA_DOC)."""
+    if not market_ids:
+        return []
+    db = get_db()
+    table_name = "comments_cohere"
+    if table_name not in db.list_tables().tables:
+        return []
+    tbl = db.open_table(table_name)
+    clauses = " OR ".join(f"list_contains(market_ids_mentioned, '{m}')" for m in market_ids)
+    rows = tbl.search().where(clauses).to_list()
+    for r in rows:
+        r["_source"] = "comments"
+        r.pop("embedding", None)
+    return rows
+
+
 def search_odds_by_market_ids(market_ids, date_from=None, date_to=None):
     """Step of the cascade: odds is not a LanceDB table -- direct S3 lookup
     per market_id, snapshots filtered by timestamp (already ISO 8601, real
@@ -439,15 +477,15 @@ def search_odds_by_market_ids(market_ids, date_from=None, date_to=None):
     return results
 
 
-def search_cascade(question, digest_k=5):
+def search_cascade(question, digest_k=5, history_text=None):
     """New entry point: Registry-first cascade, the correct architecture
     for market-scoped questions -- replaces the parallel/independent design
     in search()/search_with_rewrite(). Digest stays independent (cycle-
-    scoped, not market-scoped). Comments is out of scope (no market_id
-    column)."""
-    rewritten = rewrite_query(question)
+    scoped, not market-scoped). history_text: see rewrite_query's docstring
+    -- optional, only used for conversational follow-up resolution."""
+    rewritten = rewrite_query(question, history_text=history_text)
 
-    targets = rewritten.get("sources") or ["registry", "news_article", "digest"]
+    targets = rewritten.get("sources") or ["registry", "news_article", "digest", "comments"]
     status = rewritten.get("status")
     date_from, date_to = rewritten.get("date_from"), rewritten.get("date_to")
     market_id = rewritten.get("market_id")
@@ -458,22 +496,30 @@ def search_cascade(question, digest_k=5):
     # already given directly, in which case skip the semantic resolve step).
     market_ids = [market_id] if market_id else []
     registry_rows = []
-    if "registry" in targets or "news_article" in targets or "odds" in targets:
+    if "registry" in targets or "news_article" in targets or "odds" in targets or "comments" in targets:
         resolved_ids, registry_rows = resolve_market_ids(
             rewritten["search_text"], keywords=rewritten.get("keywords"), status=status
         )
         if not market_id:
             market_ids = resolved_ids
     # Always expose registry_rows when computed, even if the rewrite only
-    # asked for "odds"/"news_article" -- it's the market_id -> question text
-    # lookup every other source needs for readable output, not just an
-    # internal step gated behind the user explicitly asking for "registry".
+    # asked for "odds"/"news_article"/"comments" -- it's the market_id ->
+    # question text lookup every other source needs for readable output,
+    # not just an internal step gated behind the user explicitly asking
+    # for "registry".
     if registry_rows:
         results["registry"] = registry_rows
 
     # Step: News, lookup by market_ids + date, not independent search.
     if "news_article" in targets:
         results["news_article"] = search_news_by_market_ids(market_ids, date_from, date_to)
+
+    # Step: Comments, lookup by market_ids via market_ids_mentioned -- not
+    # independent semantic search either (comments text is short/noisy,
+    # see architecture_canon.md, "Chunking de Comments" -- an exact
+    # market_id link is more reliable than similarity here).
+    if "comments" in targets:
+        results["comments"] = search_comments_by_market_ids(market_ids)
 
     # Step: odds, S3 lookup by market_ids + timestamp, not a LanceDB table.
     if "odds" in targets:

@@ -95,15 +95,30 @@ def comment_group_key(comment, entity_map):
 
 
 def chunk_comments(comments, entity_map, cycle_started_at):
+    """market_ids_mentioned (added 2026-08-30): the union of market_ids of
+    every comment folded into a group, carried onto every chunk written for
+    that group -- makes comments_cohere filterable by market_id via
+    list_contains(), same mechanism digest_cohere's market_ids_mentioned
+    already uses (see retrieval/query.py, LIST_MARKET_IDS_SOURCES). This is
+    metadata riding alongside the chunk, NOT the embedded text -- the vector
+    computed by embed_comments is unaffected, only what's queryable
+    afterward changes. See tech_debt.md, "Comments Not in Retrieval Cascade"
+    for the full design discussion and the schema-evolution risk this
+    required checking before deploying (LanceDB errors on merge_insert when
+    a new row has a field the existing table schema doesn't -- see the
+    Fase 3 _lineage/cycle_key precedent in session_ledger.md, 2026-08-22)."""
     groups = defaultdict(list)
+    group_market_ids = defaultdict(set)
     for comment in comments:
         key = comment_group_key(comment, entity_map)
         text = (comment.get("text") or "").strip()
         if text:
             groups[key].append(text)
+            group_market_ids[key].update(comment.get("market_ids") or [])
 
     chunks = []
     for (link_type, entity_key), texts in groups.items():
+        market_ids_mentioned = sorted(group_market_ids[(link_type, entity_key)])
         buffer, buffer_len, part = [], 0, 0
         for text in texts:
             if buffer and buffer_len + len(text) > MAX_COMMENT_CHUNK_CHARS:
@@ -112,6 +127,7 @@ def chunk_comments(comments, entity_map, cycle_started_at):
                     "link_type": link_type,
                     "comment_entity_id": entity_key,
                     "cycle_started_at": cycle_started_at,
+                    "market_ids_mentioned": market_ids_mentioned,
                     "text": "\n\n".join(buffer),
                 })
                 buffer, buffer_len = [], 0
@@ -124,6 +140,7 @@ def chunk_comments(comments, entity_map, cycle_started_at):
                 "link_type": link_type,
                 "comment_entity_id": entity_key,
                 "cycle_started_at": cycle_started_at,
+                "market_ids_mentioned": market_ids_mentioned,
                 "text": "\n\n".join(buffer),
             })
     return chunks

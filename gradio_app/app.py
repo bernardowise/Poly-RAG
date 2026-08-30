@@ -16,18 +16,31 @@ Context sent to the LLM is capped per source (see MAX_PER_SOURCE below) --
 the cascade can resolve 100+ market_ids for a broad query like "Bitcoin"
 (see tech_debt.md), and passing all of that raw text to the synthesis call
 would blow past a reasonable context/cost budget for a single answer.
-"""
+
+MULTI-TURN (added 2026-08-30, LangChain on top of the existing boto3
+cascade): retrieval/query.py stays pure boto3 -- LangChain (ChatBedrock)
+is scoped to the synthesis call and conversation memory ONLY, here in this
+file, per the design discussed with the user. gr.ChatInterface manages
+chat history natively (list of {"role","content"} dicts); that history is
+used two ways per turn: (1) as plain text passed into
+search_cascade(history_text=...), so a follow-up like "what about last
+month" can resolve against the prior turn's topic in retrieval's existing
+rewrite_query() call (no extra Bedrock call needed for that -- see its
+docstring), and (2) as LangChain messages prepended to the synthesis call,
+so the model actually remembers what it already said. Verified: without
+history "what about last month" resolves with no topic; with history it
+correctly picks up the prior turn's subject (see tech_debt.md for the
+concrete before/after)."""
 
 import json
 import os
 import sys
 
-import boto3
-from botocore.config import Config
+import gradio as gr
+from langchain_aws import ChatBedrock
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import gradio as gr
 
 from retrieval.query import search_cascade
 
@@ -41,13 +54,25 @@ MAX_PER_SOURCE = {
     "news_article": 15,
     "digest": 3,
     "odds": 10,  # markets, not snapshots -- all snapshots for each kept market are sent
+    "comments": 15,
 }
 
-bedrock = boto3.client(
-    "bedrock-runtime",
+llm = ChatBedrock(
+    model_id=SYNTHESIS_MODEL_ID,
     region_name="us-east-1",
-    config=Config(retries={"max_attempts": 3}, max_pool_connections=10),
+    max_tokens=1000,
 )
+
+# Editable from the UI (see the "System prompt" accordion below) -- this is
+# just the starting default, not the only prompt ever used. Lets the user
+# try different phrasings live without redeploying.
+DEFAULT_SYSTEM_PROMPT = """You are Poly-RAG's assistant, answering questions about
+Polymarket prediction markets using retrieved context (market data, news
+coverage, odds movement, cycle digests, trader comments). Answer
+conversationally and directly, grounded ONLY in the provided context -- do
+not invent facts not present in it. If the context doesn't contain enough
+information to answer, say so plainly instead of guessing. Cite specific
+markets by their question text when relevant, not just their id."""
 
 
 def _truncate_results(results):
@@ -104,39 +129,65 @@ def _context_to_text(results):
             preview = (r.get("text") or "")[:500].replace("\n", " ")
             parts.append(f"- {preview}")
 
+    comment_rows = results.get("comments", [])
+    if comment_rows:
+        parts.append("\nTRADER COMMENTS:")
+        for r in comment_rows:
+            preview = (r.get("text") or "")[:400].replace("\n", " ")
+            parts.append(f"- (entity {r.get('comment_entity_id')}, {r.get('link_type')}) {preview}")
+
     return "\n".join(parts) if parts else "No relevant data found in the corpus."
 
 
-def synthesize_answer(question, results):
+def synthesize_answer(question, results, system_prompt=DEFAULT_SYSTEM_PROMPT, lc_history=None):
+    """lc_history: list of LangChain HumanMessage/AIMessage from prior turns
+    (see _gradio_history_to_langchain below) -- prepended between the
+    system prompt and this turn's question+context, so the model actually
+    remembers what it already said, not just what was retrieved this turn."""
     context_text = _context_to_text(_truncate_results(results))
-
-    system_prompt = """You are Poly-RAG's assistant, answering questions about
-Polymarket prediction markets using retrieved context (market data, news
-coverage, odds movement, cycle digests). Answer conversationally and
-directly, grounded ONLY in the provided context -- do not invent facts not
-present in it. If the context doesn't contain enough information to answer,
-say so plainly instead of guessing. Cite specific markets by their question
-text when relevant, not just their id."""
-
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "system": system_prompt,
-        "messages": [{
-            "role": "user",
-            "content": f"Question: {question}\n\nRetrieved context:\n{context_text}",
-        }],
-    })
-    response = bedrock.invoke_model(modelId=SYNTHESIS_MODEL_ID, body=body)
-    payload = json.loads(response["body"].read())
-    return payload["content"][0]["text"]
+    messages = [SystemMessage(content=system_prompt)]
+    if lc_history:
+        messages.extend(lc_history)
+    messages.append(HumanMessage(content=f"Question: {question}\n\nRetrieved context:\n{context_text}"))
+    response = llm.invoke(messages)
+    return response.content
 
 
-def ask(question):
-    if not question or not question.strip():
+def _gradio_history_to_text(history):
+    """gr.ChatInterface's history is a list of {"role","content"} dicts --
+    flattened to plain text for search_cascade's history_text (used only to
+    resolve context-dependent follow-ups in rewrite_query, see its
+    docstring in retrieval/query.py)."""
+    if not history:
+        return None
+    lines = [f"{'User' if h['role'] == 'user' else 'Assistant'}: {h['content']}" for h in history]
+    return "\n".join(lines)
+
+
+def _gradio_history_to_langchain(history):
+    """Same history, converted to LangChain message objects for the
+    synthesis call's actual conversational memory."""
+    if not history:
+        return None
+    return [
+        HumanMessage(content=h["content"]) if h["role"] == "user" else AIMessage(content=h["content"])
+        for h in history
+    ]
+
+
+def chat(message, history, system_prompt):
+    """gr.ChatInterface's fn -- message: this turn's text, history: prior
+    turns (list of {"role","content"} dicts, managed by Gradio itself, not
+    us). Returns (answer, debug_info) since debug_output is wired as an
+    additional_output below."""
+    if not message or not message.strip():
         return "Ask a question about Polymarket markets, news, or odds movement.", "{}"
-    results, rewritten, market_ids = search_cascade(question)
-    answer = synthesize_answer(question, results)
+
+    history_text = _gradio_history_to_text(history)
+    lc_history = _gradio_history_to_langchain(history)
+
+    results, rewritten, market_ids = search_cascade(message, history_text=history_text)
+    answer = synthesize_answer(message, results, system_prompt or DEFAULT_SYSTEM_PROMPT, lc_history=lc_history)
     debug_info = json.dumps({
         "query_rewriting": rewritten,
         "resolved_market_ids": market_ids,
@@ -148,15 +199,24 @@ def ask(question):
 
 
 with gr.Blocks(title="Poly-RAG") as demo:
-    gr.Markdown("# Poly-RAG\nAsk about Polymarket prediction markets, news coverage, or odds movement.")
-    question_input = gr.Textbox(label="Question", placeholder="e.g. how did Bitcoin markets move this week?")
-    ask_button = gr.Button("Ask")
-    answer_output = gr.Markdown(label="Answer")
-    with gr.Accordion("Debug: retrieval details", open=False):
+    gr.Markdown("# Poly-RAG\nAsk about Polymarket prediction markets, news coverage, or odds movement. "
+                "Conversational -- follow-up questions like \"what about last month?\" resolve against prior turns.")
+    with gr.Accordion("System prompt (editable -- try different phrasings without redeploying)", open=False):
+        system_prompt_input = gr.Textbox(
+            value=DEFAULT_SYSTEM_PROMPT,
+            label="System prompt",
+            lines=8,
+        )
+        reset_prompt_button = gr.Button("Reset to default")
+        reset_prompt_button.click(fn=lambda: DEFAULT_SYSTEM_PROMPT, outputs=system_prompt_input)
+    with gr.Accordion("Debug: retrieval details (last turn)", open=False):
         debug_output = gr.Code(label="Query rewriting + resolved market_ids", language="json")
 
-    ask_button.click(fn=ask, inputs=question_input, outputs=[answer_output, debug_output])
-    question_input.submit(fn=ask, inputs=question_input, outputs=[answer_output, debug_output])
+    gr.ChatInterface(
+        fn=chat,
+        additional_inputs=[system_prompt_input],
+        additional_outputs=[debug_output],
+    )
 
 
 if __name__ == "__main__":

@@ -154,6 +154,44 @@ AskUserQuestion) que bloquea cualquier intento de usarlo, siempre -- a diferenci
 hooks de Lambda/Agent/archivos nuevos, este NO tiene prefijo de autorizacion que lo
 desbloquee. El bloqueo es incondicional por diseno.
 
+## Antes de correr un proceso largo en segundo plano, optimizar por eficiencia real
+
+**Regla dura de eficiencia, no de seguridad -- generalizable, no atada a un mecanismo
+especifico.** Antes de lanzar CUALQUIER proceso que va a correr un tiempo significativo en
+segundo plano (backfills, migraciones, loops de escritura, llamadas API repetidas,
+procesamiento batch, lo que sea), disenarlo por la forma mas eficiente real de hacerlo, no
+por la mas rapida/simple de escribir. Esto aplica sin importar el mecanismo concreto --
+consolidar N llamadas en una sola cuando el sistema lo soporte es UN caso particular de esta
+regla, no la regla en si.
+
+**Por que:** incidente real 2026-08-30. Un backfill de 1,524 filas en LanceDB
+(`comments_cohere`) se escribio como 1,524 llamadas individuales a `tbl.update()`, una por
+fila, cuando el mismo resultado se podia lograr en una sola escritura batch -- tardo **~84
+minutos** (5,048.6s medido) para un volumen de dato trivial. El costo real no vino del
+tamano del dato sino de la forma elegida para escribirlo (formato columnar versionado, cada
+`update()` individual dispara su propia transaccion de red completa). Ademas el script no
+tenia ninguna senal de progreso pollable desde el diseno inicial -- el usuario tuvo que
+preguntar el estado varias veces sin poder ver progreso real, y con razon se quejo de la
+falta de ETA y de comunicacion antes de ejecutar. Es un ejemplo real de la regla, no la regla
+completa -- el mismo error de fondo (elegir el camino mas facil de escribir en vez del mas
+eficiente de correr) aplica igual a llamadas API repetidas en loop, procesamiento de
+archivos uno por uno cuando hay paralelismo disponible, o cualquier otro proceso largo.
+
+**Como aplicar, en general:**
+1. Antes de comprometerse a un proceso largo, medir el costo real de UNA unidad de trabajo
+   (no asumir, no inventar un numero) -- una escritura de prueba, una llamada de prueba,
+   lo que aplique -- y usar eso para decidir el mecanismo, no la primera forma que se le
+   ocurra a uno de escribir el loop.
+2. Preferir el mecanismo mas eficiente que el sistema realmente soporte (batch, paralelismo,
+   una API mas apropiada) sobre el mas simple de codear, cuando la diferencia de costo real
+   sea significativa.
+3. Si el proceso de verdad va a tardar (por diseno del sistema, no por eleccion propia),
+   construir visibilidad de progreso pollable DESDE EL DISENO INICIAL -- no agregarla
+   despues de que el usuario tenga que preguntar.
+4. Dar una estimacion de tiempo ANTES de ejecutar, basada en una medicion real -- si no se
+   puede medir de antemano, decirlo explicitamente ("no tengo un ETA confiable todavia") en
+   vez de dar un numero con falsa confianza.
+
 ## Timezone Convention
 
 Two clocks, deliberately. The split exists because the pipeline's day and the user's day
