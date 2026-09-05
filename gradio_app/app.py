@@ -705,7 +705,7 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
         render=False,
     )
 
-    with gr.Accordion("Model parameters", open=False):
+    with gr.Accordion("Model parameters", open=True):
         reasoning_input = gr.Checkbox(
             value=False,
             label="Reasoning (extended thinking)",
@@ -755,9 +755,9 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
     # each turn, kept out of the way of the conversation itself ---
     gr.Markdown("---")
     metrics_panel.render()
-    with gr.Accordion("Session metrics (all turns)", open=False):
+    with gr.Accordion("Session metrics (all turns)", open=True):
         metrics_table.render()
-    with gr.Accordion("Debug: raw JSON (last turn)", open=False):
+    with gr.Accordion("Debug: raw JSON (last turn)", open=True):
         debug_output.render()
 
 
