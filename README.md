@@ -237,13 +237,26 @@ de-duplicated, bounded by a configurable token budget), a per-turn metrics
 panel (latency, token usage, estimated cost), an optional in-line LLM-judge
 scoring the answer (faithfulness, answer relevancy, context relevance), and
 opt-out per-turn logging of every interaction to S3 for later evaluation.
+Deploys are automatic: a GitHub Action flattens `gradio_app/` + `retrieval/`
+and pushes to the Space on every push to `main`.
 
-A separate Phase 4 (`rag_eval`) — a fixed set of temporal, verifiable
-questions scored each cycle against programmatically-computed ground truth,
-plus a longitudinal drift judge over the stored history — is designed but
-not yet built. It is where the canonical `ragas` library runs, in an
-isolated environment reading the S3 session logs (`ragas` cannot coexist
-with the `langchain-aws` pin the retrieval path needs).
+**Phase 4 (SQL layer)** — `scripts/build_sql_parquet.py` flattens the
+registry and the odds time-series into SQL-queryable Parquet on S3
+(`sql/markets.parquet`, `sql/odds_snapshots/YYYY-MM.parquet`), so retrieval
+can answer aggregate / ranking / point questions ("top 10 markets by volume
+last week") that semantic search structurally cannot. The one-off
+retroactive run is done (2,643 markets, 201,692 snapshot rows); DuckDB reads
+it straight from S3. Still to build: the per-cycle Lambda that refreshes it,
+chained after `write_lancedb`, and the text-to-SQL route in
+`retrieval/query.py` that turns a natural-language question into a guarded
+`SELECT`.
+
+**Phase 5 (`rag_eval`)** — a fixed set of temporal, verifiable questions
+scored each cycle against programmatically-computed ground truth, plus a
+longitudinal drift judge over the stored history — is designed but not yet
+built. It is where the canonical `ragas` library runs, in an isolated
+environment reading the S3 session logs (`ragas` cannot coexist with the
+`langchain-aws` pin the retrieval path needs).
 
 See `.claude/claude_docs/architecture_canon.md` for the full architecture and
 design rationale.

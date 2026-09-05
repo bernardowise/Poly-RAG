@@ -3828,3 +3828,61 @@ still not done. The optional "Evaluate answer (LLM judge)" checkbox adds a NEW
 latency source (~5 sequential Bedrock calls: claim decomposition + 3 generated
 questions embedded one-by-one + context-relevance grading) that stacks on top of
 retrieval + synthesis when enabled -- off by default for exactly this reason.
+
+---
+
+## Phase 4 SQL Layer -- Frozen Snapshot + Missing text-to-SQL Route (2026-09-05)
+
+**Context:** the retrieval cascade resolves a question to `market_id`s semantically,
+then looks up news/comments/odds by those ids. It has NO path for aggregate /
+ranking / count questions -- "show me the top 10 markets by volume last week"
+returned "I don't have volume data in the retrieved context" because volume lives
+only in `odds/<market_id>.json` (one file per market, ~2,600 of them) with no
+index or column the retrieval can `ORDER BY`. Same failure family as the News
+date-filter and Registry-status bugs: the cascade assumes every question has a
+semantic entry point.
+
+**What was built (2026-09-05):** Phase 4, the SQL layer. `scripts/build_sql_parquet.py`
+(one-off) flattens the registry (DynamoDB) and the odds time-series into
+SQL-queryable Parquet on S3:
+- `sql/markets.parquet` -- one row per registry market (2,643 rows)
+- `sql/odds_snapshots/YYYY-MM.parquet` -- one row per (market_id, snapshot),
+  partitioned by snapshot month (15 partitions, 201,692 rows). `outcomePrices`
+  (a JSON string) is split into `yes_price`/`no_price` doubles plus
+  `outcome_prices_raw`. `clob_backfill` rows have NULL volume/volume24hr/liquidity.
+DuckDB reads `s3://.../sql/odds_snapshots/*.parquet` + `sql/markets.parquet`
+straight from S3 via `httpfs` and runs joins/aggregates/window functions in ~2s.
+Phase renumbering: Phase 4 = SQL layer, Phase 5 = `rag_eval` (was "Phase 4") --
+Phase 4 goes first because `rag_eval` will include SQL questions in its eval set.
+
+**Debt 1 -- the Parquet is a frozen snapshot.** `build_sql_parquet.py` is a
+manual one-off. The Parquet on S3 reflects the corpus as of 2026-09-05 22:42 UTC
+and does not update. A Lambda `build_sql_parquet` chained after `write_lancedb`
+(Phase 4, before Phase 5) needs to be built -- likely a container-image Lambda
+like `write_lancedb` (DuckDB/pyarrow footprint), rewriting only `markets.parquet`
+plus the current month's `odds_snapshots` partition each cycle. Terraform + IAM +
+its own ECR repo. Per CLAUDE.md it is verified at the next automatic cycle, never
+by invoking `write_lancedb` or the chain manually.
+
+**Debt 2 -- no text-to-SQL route in the cascade yet.** The Parquet exists but
+`retrieval/query.py` cannot reach it. Still to build: `rewrite_query` emits a
+`needs_sql` flag; `text_to_sql(question, schema_doc)` -> one Claude call ->
+a `SELECT`; `run_sql()` -> DuckDB against S3 with NON-DESTRUCTIVE guardrails
+(reject anything not starting with `SELECT`/`WITH`; no `INSERT`/`UPDATE`/`DELETE`/
+`CREATE`/`DROP`/`ATTACH`/`COPY ... TO`/`INSTALL`/`PRAGMA`; force a `LIMIT`;
+query timeout -- the user explicitly wants permissive-but-not-destructive, since
+DuckDB reads Parquet read-only anyway). `search_cascade` runs the SQL branch when
+`needs_sql` is set; any `market_id`s in the result feed the existing
+news/comments/odds lookups so structured and semantic sources cross-reference.
+Then: `duckdb` in the Space's `requirements.txt` (resolve its dep tree in
+isolation first, same as was done for `ragas`), and the Space IAM user
+(`poly-rag-hf-spaces-readonly`) needs `s3:GetObject` + `s3:ListBucket` scoped to
+`sql/*`.
+
+**Note on the "743 markets" scare (2026-09-05):** a mid-session
+`table.scan(Select='COUNT')['Count']` returned 743 because it counts one
+unpaginated scan page, not the total. The full paginated scan is 2,643 markets,
+which matches the 2,643 `odds/*.json` files exactly -- no phantom purge, nothing
+lost. Always paginate a DynamoDB count.
+
+**Revisit when:** next session -- Lambda first, then the text-to-SQL route.
