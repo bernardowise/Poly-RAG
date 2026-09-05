@@ -335,11 +335,35 @@ def _guard_sql(sql):
     """Non-destructive guardrails on a generated query. Returns a cleaned SQL
     string or raises ValueError. Not a security sandbox -- DuckDB opens the
     Parquet read-only -- just a stop against a generated statement doing
-    something other than a single read."""
-    s = sql.strip().rstrip(";").strip()
+    something other than a single read.
+
+    The model sometimes wraps the query in prose ("Looking at the query I
+    ran, ...") despite being told not to -- same failure mode as JSON in
+    code fences elsewhere. So if the text doesn't start with SELECT/WITH,
+    try to carve out the SQL: the first line that starts with SELECT or WITH
+    through the end (or the next blank line / trailing prose)."""
+    s = sql.strip()
+    if s.startswith("```"):
+        s = s.split("```", 2)[1]
+        if s.lstrip().lower().startswith("sql"):
+            s = s.lstrip()[3:]
+        s = s.split("```", 1)[0]
+    s = s.strip()
     low = s.lower()
     if not (low.startswith("select") or low.startswith("with")):
-        raise ValueError(f"generated SQL is not a SELECT/WITH: {s[:120]!r}")
+        import re
+        m = re.search(r"(?im)^\s*(select|with)\b", s)
+        if not m:
+            raise ValueError(f"generated SQL has no SELECT/WITH: {s[:120]!r}")
+        s = s[m.start():].strip()
+        # cut trailing prose after the statement: stop at a blank line that
+        # is followed by a line not looking like SQL continuation.
+        parts = s.split("\n\n", 1)
+        if len(parts) == 2 and not re.match(r"(?i)^\s*(select|from|where|group|order|limit|join|and|or|union|having|\)|--)", parts[1]):
+            s = parts[0].strip()
+        low = s.lower()
+    s = s.rstrip(";").strip()
+    low = s.lower()
     if ";" in s:
         raise ValueError("generated SQL has multiple statements")
     for kw in _SQL_FORBIDDEN:
@@ -375,7 +399,9 @@ Rules:
 - Return m.question alongside any market_id so the result is human-readable.
 - Compute date ranges yourself from today's date for relative phrases.
 
-Respond with ONLY the SQL, no prose, no code fence."""
+Your entire response must be the SQL statement and nothing else. Do not
+explain it, do not describe what it does, do not use a code fence. The first
+word of your response must be SELECT or WITH."""
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 600,
@@ -695,8 +721,14 @@ def search_cascade(question, digest_k=5, history_text=None):
     # narrowed `sources`) -- SQL augments the cascade, it doesn't replace it.
     market_ids = [market_id] if market_id else []
     if rewritten.get("needs_sql"):
-        sql = text_to_sql(question, history_text=history_text)
-        sql_result = run_sql(sql)
+        try:
+            sql = text_to_sql(question, history_text=history_text)
+            sql_result = run_sql(sql)
+        except Exception as exc:  # noqa: BLE001 -- text_to_sql / _guard_sql
+            # a rejected or unparseable generated query must not kill the
+            # whole cascade -- report it and let the semantic sources run.
+            sql_result = {"sql": None, "columns": [], "rows": [],
+                          "error": f"{type(exc).__name__}: {exc}"}
         results["sql"] = sql_result
         if not sql_result["error"]:
             sql_ids = [
