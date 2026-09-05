@@ -295,7 +295,11 @@ def synthesize_answer(question, context_text, lc_history, reasoning, temperature
 #   context_relevance  -- fraction of retrieved context relevant to the question
 # --------------------------------------------------------------------------
 JUDGE_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-JUDGE_EMBED_MODEL_ID = "cohere.embed-english-v3"  # in-region, sync single-text embed for the relevancy step
+# Reuse the exact embed model + call shape retrieval/query.py already uses --
+# it is the only Cohere model the Space's IAM user is authorized for
+# (global.cohere.embed-v4:0, foundation-model + inference-profile). Using
+# cohere.embed-english-v3 here got AccessDeniedException in production.
+JUDGE_EMBED_MODEL_ID = "global.cohere.embed-v4:0"
 
 _judge_bedrock = None
 _judge_embed_bedrock = None
@@ -312,9 +316,33 @@ def _get_judge_clients():
     return _judge_bedrock, _judge_embed_bedrock
 
 
+def _extract_judge_json(text):
+    """Pull a JSON object out of a judge response. Handles code fences and
+    leading/trailing prose -- falls back to the first {...} span. Raises
+    ValueError (not a bare JSONDecodeError) with the raw text attached so a
+    caller's error message is actionable."""
+    t = text.strip()
+    if t.startswith("```"):
+        inner = t[3:]
+        if inner.lstrip().startswith("json"):
+            inner = inner.lstrip()[4:]
+        t = inner.split("```", 1)[0].strip() if "```" in inner else inner.strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        start, end = t.find("{"), t.rfind("}")
+        if 0 <= start < end:
+            try:
+                return json.loads(t[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+    raise ValueError(f"judge did not return JSON; raw: {text[:200]!r}")
+
+
 def _judge_call(prompt, max_tokens=700):
     """One Bedrock Claude call, returns parsed JSON. Raises on unparseable
-    output -- the caller catches and records the metric as null."""
+    output -- the caller catches and records the metric as null with the
+    raw text in the error."""
     client, _ = _get_judge_clients()
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -323,17 +351,24 @@ def _judge_call(prompt, max_tokens=700):
         "messages": [{"role": "user", "content": prompt}],
     })
     resp = client.invoke_model(modelId=JUDGE_MODEL_ID, body=body)
-    text = json.loads(resp["body"].read())["content"][0]["text"].strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1].lstrip("json").strip() if "```" in text[3:] else text.strip("`")
-    return json.loads(text)
+    text = json.loads(resp["body"].read())["content"][0]["text"]
+    return _extract_judge_json(text)
 
 
 def _embed_one(text):
+    """Same call shape as retrieval/query.py's embed_query -- Cohere Embed v4
+    via the cross-region inference profile, input_type=search_query, response
+    at embeddings.float[0]."""
     _, client = _get_judge_clients()
-    body = json.dumps({"texts": [text[:2000]], "input_type": "search_query"})
+    body = json.dumps({
+        "texts": [text[:2000]],
+        "input_type": "search_query",
+        "embedding_types": ["float"],
+    })
     resp = client.invoke_model(modelId=JUDGE_EMBED_MODEL_ID, body=body)
-    return json.loads(resp["body"].read())["embeddings"][0]
+    payload = json.loads(resp["body"].read())
+    emb = payload["embeddings"]
+    return emb["float"][0] if isinstance(emb, dict) else emb[0]
 
 
 def _cosine(a, b):
@@ -650,6 +685,26 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
     )
     session_state = gr.State({"session_id": None, "buffer": [], "turn": 0, "rows": []})
 
+    # Metrics components are CREATED here (so they can be wired as
+    # additional_outputs of the ChatInterface below) but RENDERED later,
+    # after the chat, via .render() inside the post-chat layout block.
+    metrics_panel = gr.Markdown(value="_Metrics for the latest turn appear here._", render=False)
+    metrics_table = gr.Dataframe(
+        headers=["turn", "question", "latency ms", "window tok", "cost $",
+                 "faithful", "ans relev", "ctx relev"],
+        datatype=["number", "str", "number", "number", "number", "str", "str", "str"],
+        row_count=(0, "dynamic"),
+        column_count=(8, "fixed"),
+        interactive=False,
+        wrap=True,
+        render=False,
+    )
+    debug_output = gr.Code(
+        label="rewriting / market_ids / latency / tokens / cost / window / judge",
+        language="json",
+        render=False,
+    )
+
     with gr.Accordion("Model parameters", open=False):
         reasoning_input = gr.Checkbox(
             value=False,
@@ -687,22 +742,6 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
             outputs=temperature_input,
         )
 
-    metrics_panel = gr.Markdown(label="Last turn")
-
-    with gr.Accordion("Session metrics (all turns)", open=False):
-        metrics_table = gr.Dataframe(
-            headers=["turn", "question", "latency ms", "window tok", "cost $",
-                     "faithful", "ans relev", "ctx relev"],
-            datatype=["number", "str", "number", "number", "number", "str", "str", "str"],
-            row_count=(0, "dynamic"),
-            column_count=(8, "fixed"),
-            interactive=False,
-            wrap=True,
-        )
-
-    with gr.Accordion("Debug: raw JSON (last turn)", open=False):
-        debug_output = gr.Code(label="rewriting / market_ids / latency / tokens / cost / window / judge", language="json")
-
     gr.ChatInterface(
         fn=chat,
         additional_inputs=[
@@ -711,6 +750,15 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
         ],
         additional_outputs=[metrics_panel, metrics_table, debug_output, session_state],
     )
+
+    # --- metrics, rendered below the chat: what an evaluator reads after
+    # each turn, kept out of the way of the conversation itself ---
+    gr.Markdown("---")
+    metrics_panel.render()
+    with gr.Accordion("Session metrics (all turns)", open=False):
+        metrics_table.render()
+    with gr.Accordion("Debug: raw JSON (last turn)", open=False):
+        debug_output.render()
 
 
 if __name__ == "__main__":
