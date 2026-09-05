@@ -250,9 +250,14 @@ the per-cycle `build_sql_parquet` Lambda — chained after `write_lancedb`,
 container-image, refreshing `markets.parquet` plus the current month's
 `odds_snapshots` partition each cycle — are both built and deployed. The
 Lambda's report email (the cycle's fourth) runs eight DuckDB smoke-test
-queries over the Parquet it just wrote. Still to build: the text-to-SQL
-route in `retrieval/query.py` that turns a natural-language question into a
-guarded `SELECT`, and `duckdb` on the Space so the app can use it.
+queries over the Parquet it just wrote. The retrieval side is live too:
+`rewrite_query` flags aggregation/ranking questions, `text_to_sql` generates
+a guarded `SELECT` (non-destructive checks, no DDL, forced `LIMIT`),
+`run_sql` runs it read-only against S3 via DuckDB, and `search_cascade`
+feeds any `market_id`s in the result into the semantic news/comments/odds
+lookups so a question like "top 10 markets by volume last week — and what's
+the news" cross-references. `duckdb` is on the Space. Still pending: verify
+the Lambda against a real automatic cycle.
 
 **Phase 5 (`rag_eval`)** — a fixed set of temporal, verifiable questions
 scored each cycle against programmatically-computed ground truth, plus a

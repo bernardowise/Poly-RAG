@@ -3829,6 +3829,19 @@ latency source (~5 sequential Bedrock calls: claim decomposition + 3 generated
 questions embedded one-by-one + context-relevance grading) that stacks on top of
 retrieval + synthesis when enabled -- off by default for exactly this reason.
 
+**Escalated to a named To-Do (2026-09-05), real production numbers:** a turn now
+runs ~30-35s end to end (measured live: retrieval ~8.7s + synthesis ~7.9s + judge
+~18s). Retrieval got heavier -- it is now `rewrite_query` (1 Bedrock call) + embed
++ LanceDB + odds S3 + `text_to_sql` (another Bedrock call, when `needs_sql`), all
+in series. The user flagged latency as a next-session priority. Concrete levers,
+roughly in impact order: (1) stream the synthesis response (`gr.ChatInterface`
+takes a generator -- biggest win on *perceived* latency); (2) the LLM judge is the
+worst absolute offender (~18s of sequential Bedrock) -- parallelize its 3 metrics,
+batch the 3 relevancy embeddings into one call, or leave it off by default (it
+already is); (3) fold `rewrite_query` + `text_to_sql` into one call, or run them
+concurrently; (4) lower `THINKING_BUDGET_TOKENS` when reasoning is on; (5) a
+per-stage circuit breaker.
+
 ---
 
 ## Phase 4 SQL Layer -- Frozen Snapshot + Missing text-to-SQL Route (2026-09-05)
@@ -3872,20 +3885,29 @@ this-cycle, which can legitimately be empty) is red and counts in
 real cycle -- next automatic cycle (00:00 / 12:00 UTC), never a manual invoke.
 Until then the Parquet on S3 is the one-off snapshot from 2026-09-05 22:42 UTC.
 
-**Debt 2 -- no text-to-SQL route in the cascade yet.** The Parquet exists but
-`retrieval/query.py` cannot reach it. Still to build: `rewrite_query` emits a
-`needs_sql` flag; `text_to_sql(question, schema_doc)` -> one Claude call ->
-a `SELECT`; `run_sql()` -> DuckDB against S3 with NON-DESTRUCTIVE guardrails
-(reject anything not starting with `SELECT`/`WITH`; no `INSERT`/`UPDATE`/`DELETE`/
-`CREATE`/`DROP`/`ATTACH`/`COPY ... TO`/`INSTALL`/`PRAGMA`; force a `LIMIT`;
-query timeout -- the user explicitly wants permissive-but-not-destructive, since
-DuckDB reads Parquet read-only anyway). `search_cascade` runs the SQL branch when
-`needs_sql` is set; any `market_id`s in the result feed the existing
-news/comments/odds lookups so structured and semantic sources cross-reference.
-Then: `duckdb` in the Space's `requirements.txt` (resolve its dep tree in
-isolation first, same as was done for `ragas`), and the Space IAM user
-(`poly-rag-hf-spaces-readonly`) needs `s3:GetObject` + `s3:ListBucket` scoped to
-`sql/*`.
+**Debt 2 -- CLOSED 2026-09-05 (same day).** The text-to-SQL route is built,
+deployed to the Space, and verified against the real corpus (`15ebe6d` +
+`29bdc6c`). `rewrite_query` emits `needs_sql`; `text_to_sql()` = one Claude
+call -> a DuckDB `SELECT` over `sql/markets.parquet` + `sql/odds_snapshots/*.parquet`;
+`_guard_sql()` rejects non-SELECT / multi-statement / DDL/COPY/PRAGMA/INSTALL
+(word-boundary checked so `created_at` is fine) and injects a `LIMIT`;
+`run_sql()` runs it read-only against S3 and never raises. `search_cascade`
+runs the branch when `needs_sql` and any `market_id` column in the result
+seeds the semantic news/comments/odds lookups. `search_registry_by_ids()`
+added so SQL-sourced ids still get `market_id -> question`. `duckdb==1.5.5`
+in `requirements.txt` (dep tree verified clean against the pins -- nothing
+like the `ragas` mess). Space IAM extended with `sql/*` on ListBucket +
+GetObject. A production bug found in Turn 1: the model wrapped the SQL in
+prose despite the prompt, `_guard_sql`'s `ValueError` propagated and killed
+the whole cascade -- fixed three ways: prompt hardened, `_guard_sql` now
+carves the SELECT/WITH out of surrounding prose, and `search_cascade` wraps
+`text_to_sql` in try/except so a bad query reports `results["sql"].error`
+and the semantic sources still run.
+
+**Open tuning (not urgent):** the model sometimes generates `SUM(volume)`
+for a time window instead of `MAX(volume)` (volume is cumulative lifetime,
+not per-cycle). `SQL_SCHEMA_DOC` already carries an explicit note against
+this; may need more reinforcement.
 
 **Note on the "743 markets" scare (2026-09-05):** a mid-session
 `table.scan(Select='COUNT')['Count']` returned 743 because it counts one
@@ -3893,6 +3915,8 @@ unpaginated scan page, not the total. The full paginated scan is 2,643 markets,
 which matches the 2,643 `odds/*.json` files exactly -- no phantom purge, nothing
 lost. Always paginate a DynamoDB count.
 
-**Revisit when:** (1) verify the `build_sql_parquet` Lambda at the next
-automatic cycle -- email #4 with 8 populated smoke-test tables, no red;
-(2) then Debt 2, the text-to-SQL route in `retrieval/query.py`, still open.
+**Revisit when:** verify the `build_sql_parquet` Lambda at the next automatic
+cycle -- email #4 with 8 populated smoke-test tables, no red;
+`aws logs tail /aws/lambda/poly-rag-build-sql-parquet` and a fresh
+`LastModified` on `sql/*.parquet`. Debts 1 and 2 are both closed; only this
+end-to-end cycle verification remains.
