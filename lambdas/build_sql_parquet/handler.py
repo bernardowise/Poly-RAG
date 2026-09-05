@@ -193,7 +193,123 @@ def _put_parquet(df, key):
     return buf.tell()
 
 
-def _send_report(cycle_started_at, month, n_markets, n_odds_rows, n_files, size_markets, size_odds, elapsed_s):
+# --------------------------------------------------------------------------
+# smoke-test queries -- run against the Parquet this Lambda just wrote, via
+# DuckDB reading straight from S3. The report email carries their results so
+# a human can tell from the inbox that the SQL layer is actually queryable
+# end to end, not just that a file got written. Any query that errors or
+# returns an unexpectedly empty result is rendered in red.
+# --------------------------------------------------------------------------
+MARKETS_URI = f"read_parquet('s3://{S3_BUCKET}/{OUT_MARKETS}')"
+ODDS_URI = f"read_parquet('s3://{S3_BUCKET}/{OUT_ODDS_PREFIX}*.parquet')"
+
+
+def _duckdb_conn():
+    import duckdb
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("SET s3_region='us-east-1';")
+    cr = boto3.Session().get_credentials().get_frozen_credentials()
+    con.execute(f"SET s3_access_key_id='{cr.access_key}';")
+    con.execute(f"SET s3_secret_access_key='{cr.secret_key}';")
+    if cr.token:
+        con.execute(f"SET s3_session_token='{cr.token}';")
+    return con
+
+
+def _top10_by_volume(where_clause, label):
+    return (label, f"""
+        SELECT o.market_id, m.question, MAX(o.volume) AS max_volume
+        FROM {ODDS_URI} o
+        LEFT JOIN {MARKETS_URI} m USING (market_id)
+        WHERE o.source = 'cycle'{where_clause}
+        GROUP BY o.market_id, m.question
+        ORDER BY max_volume DESC
+        LIMIT 10
+    """)
+
+
+def run_smoke_queries(cycle_started_at, month):
+    """Returns a list of (label, columns, rows, error) tuples."""
+    cycle_day = cycle_started_at[:10]
+    queries = [
+        _top10_by_volume(f" AND o.timestamp LIKE '{cycle_started_at[:13]}%'", "Top 10 by volume -- this cycle"),
+        _top10_by_volume(f" AND o.timestamp >= (DATE '{cycle_day}' - INTERVAL 7 DAY)::VARCHAR", "Top 10 by volume -- last 7 days"),
+        _top10_by_volume(f" AND o.timestamp LIKE '{month}%'", "Top 10 by volume -- month to date"),
+        _top10_by_volume("", "Top 10 by volume -- all time"),
+        ("Market count by status", f"SELECT status, COUNT(*) AS n FROM {MARKETS_URI} GROUP BY status ORDER BY n DESC"),
+        ("Latest snapshot per source", f"SELECT source, MAX(timestamp) AS latest_ts, COUNT(*) AS n FROM {ODDS_URI} GROUP BY source"),
+        ("Total odds_snapshots rows (all partitions)", f"SELECT COUNT(*) AS total_rows FROM {ODDS_URI}"),
+        ("Biggest yes_price swing -- month to date", f"""
+            WITH c AS (
+              SELECT market_id, timestamp, yes_price,
+                ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY timestamp)      AS rn_f,
+                ROW_NUMBER() OVER (PARTITION BY market_id ORDER BY timestamp DESC) AS rn_l
+              FROM {ODDS_URI} WHERE source='cycle' AND timestamp LIKE '{month}%'
+            )
+            SELECT f.market_id, m.question,
+                   ROUND(f.yes_price, 3) AS first_yes,
+                   ROUND(l.yes_price, 3) AS last_yes,
+                   ROUND(l.yes_price - f.yes_price, 3) AS swing
+            FROM c f JOIN c l USING (market_id)
+            LEFT JOIN {MARKETS_URI} m USING (market_id)
+            WHERE f.rn_f = 1 AND l.rn_l = 1
+            ORDER BY ABS(l.yes_price - f.yes_price) DESC
+            LIMIT 10
+        """),
+    ]
+    out = []
+    con = None
+    try:
+        con = _duckdb_conn()
+        for label, sql in queries:
+            try:
+                cur = con.execute(sql)
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+                out.append((label, cols, rows, None))
+            except Exception as exc:  # noqa: BLE001 -- one bad query must not kill the report
+                out.append((label, [], [], f"{type(exc).__name__}: {exc}"))
+    except Exception as exc:  # noqa: BLE001 -- DuckDB/httpfs setup failed entirely
+        out.append(("DuckDB connection", [], [], f"{type(exc).__name__}: {exc}"))
+    finally:
+        if con is not None:
+            con.close()
+    return out
+
+
+# "this cycle" can legitimately be empty (Lambda ran before this cycle's
+# snapshots landed, or a cycle with no volume rows) -- an empty result there
+# is informational, not a failure. Every other query returning 0 rows IS a
+# real problem.
+EMPTY_OK = {"Top 10 by volume -- this cycle"}
+
+
+def _render_query_block(label, cols, rows, error):
+    if error:
+        return (f"<h3 style='color:#c00'>{label}</h3>"
+                f"<pre style='color:#c00'>{error}</pre>")
+    if not rows:
+        color = "#888" if label in EMPTY_OK else "#c00"
+        note = "0 rows (ok -- cycle snapshots may not be in yet)" if label in EMPTY_OK else "0 rows returned (unexpected)"
+        return (f"<h3 style='color:{color}'>{label}</h3>"
+                f"<p style='color:{color}'>{note}</p>")
+    head = "".join(f"<th>{c}</th>" for c in cols)
+    body = ""
+    for r in rows:
+        body += "<tr>" + "".join(f"<td>{'' if v is None else v}</td>" for v in r) + "</tr>"
+    return (f"<h3>{label}</h3>"
+            f"<table border='1' cellpadding='4' cellspacing='0'>"
+            f"<tr>{head}</tr>{body}</table>")
+
+
+def _send_report(cycle_started_at, month, n_markets, n_odds_rows, n_files,
+                 size_markets, size_odds, elapsed_s, smoke_results):
+    smoke_html = "".join(_render_query_block(*t) for t in smoke_results)
+    n_failed = sum(1 for label, _, rows, err in smoke_results
+                   if err or (not rows and label not in EMPTY_OK))
+    status_line = (f"<p style='color:#c00'><b>{n_failed} smoke query(ies) failed or empty</b></p>"
+                   if n_failed else "<p style='color:#080'><b>all smoke queries OK</b></p>")
     html = f"""
     <html><body style="font-family: monospace; font-size: 13px;">
     <h2>Poly-RAG Phase 4 (build_sql_parquet) -- {cycle_started_at}</h2>
@@ -202,8 +318,11 @@ def _send_report(cycle_started_at, month, n_markets, n_odds_rows, n_files, size_
       <tr><td>sql/markets.parquet</td><td>{n_markets:,}</td><td>{size_markets/1024:,.0f} KB</td></tr>
       <tr><td>sql/odds_snapshots/{month}.parquet</td><td>{n_odds_rows:,}</td><td>{size_odds/1024:,.0f} KB</td></tr>
     </table>
-    <p>{n_files:,} odds/*.json read (filtered to month {month}).</p>
-    <h3>Total time: {elapsed_s:.1f}s</h3>
+    <p>{n_files:,} odds/*.json read (filtered to month {month}). Write time: {elapsed_s:.1f}s</p>
+    <hr>
+    <h2>SQL smoke test (DuckDB over s3://.../sql/*.parquet)</h2>
+    {status_line}
+    {smoke_html}
     </body></html>
     """
     ses.send_email(
@@ -231,8 +350,13 @@ def lambda_handler(event, context):
 
     elapsed_s = time.time() - started
 
+    # Query the Parquet we just wrote -- proves the SQL layer is queryable
+    # end to end, not just that a file landed. Best-effort: a smoke-test
+    # failure is reported in the email, never raised.
+    smoke_results = run_smoke_queries(cycle_started_at, month)
+
     _send_report(cycle_started_at, month, len(markets), len(odds_df), n_files,
-                 size_markets, size_odds, elapsed_s)
+                 size_markets, size_odds, elapsed_s, smoke_results)
 
     if RAG_EVAL_LAMBDA_NAME:
         lam.invoke(
@@ -248,5 +372,7 @@ def lambda_handler(event, context):
         "odds_rows": len(odds_df),
         "odds_files_read": n_files,
         "elapsed_s": round(elapsed_s, 1),
+        "smoke_failed": sum(1 for label, _, rows, err in smoke_results
+                            if err or (not rows and label not in EMPTY_OK)),
         "rag_eval_invoked": bool(RAG_EVAL_LAMBDA_NAME),
     }

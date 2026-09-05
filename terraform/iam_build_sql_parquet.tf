@@ -29,10 +29,14 @@ data "aws_iam_policy_document" "build_sql_parquet_permissions" {
 
   statement {
     # Read every odds/<market_id>.json to rebuild the current month's
-    # odds_snapshots partition. Read-only against odds/.
+    # odds_snapshots partition, and read sql/*.parquet back for the
+    # in-email DuckDB smoke-test queries.
     effect    = "Allow"
     actions   = ["s3:GetObject"]
-    resources = ["${aws_s3_bucket.poly_rag_data.arn}/odds/*"]
+    resources = [
+      "${aws_s3_bucket.poly_rag_data.arn}/odds/*",
+      "${aws_s3_bucket.poly_rag_data.arn}/sql/*",
+    ]
   }
 
   statement {
