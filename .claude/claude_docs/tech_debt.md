@@ -3789,3 +3789,31 @@ surfaces which of these open questions actually matter in practice -- the user's
 plan is to branch here: Gradio work proceeds against this MVP, tuning lever calibration
 (TOP_N, reranking, the small-filtered-set top-k question) continues in parallel,
 prioritized ad hoc rather than blocking the UI.
+
+---
+
+## Latency Management for Gradio Synthesis -- Not Yet Addressed (2026-09-05)
+
+**Issue:** `gradio_app/app.py`'s synthesis call has no explicit latency management --
+no timeout tuning, no streaming (the UI waits for the full response before showing
+anything), and no user-facing indication of expected wait time. This becomes more
+relevant now that "Reasoning" (extended thinking) is a user-toggleable option --
+enabling it adds real, unbounded-feeling latency (the model spends tokens on an
+internal `thinking` block before producing the final answer, on top of the retrieval
+cascade's own latency: query rewriting + embedding + LanceDB search + odds S3 lookups
++ the synthesis call itself).
+
+**Not measured yet:** no real latency numbers have been captured for either mode
+(reasoning on vs off), unlike other parts of this project where a real measurement
+preceded any design decision (see CLAUDE.md, "Antes de correr un proceso largo en
+segundo plano, optimizar por eficiencia real").
+
+**Candidate directions (not decided):** streaming the synthesis response token-by-token
+(Gradio's ChatInterface supports generator functions for this); a visible "thinking..."
+state distinct from the final answer while reasoning is enabled; a timeout/circuit
+breaker if any single stage of the cascade takes too long; possibly capping
+`THINKING_BUDGET_TOKENS` lower than the current 1024 (Bedrock's minimum) if measured
+latency proves it matters more than reasoning quality for this use case.
+
+**Revisit when:** picking up performance/UX work on the Gradio MVP -- flagged
+explicitly by the user as a pending concern, not yet actioned.

@@ -102,11 +102,14 @@ def chunk_comments(comments, entity_map, cycle_started_at):
     already uses (see retrieval/query.py, LIST_MARKET_IDS_SOURCES). This is
     metadata riding alongside the chunk, NOT the embedded text -- the vector
     computed by embed_comments is unaffected, only what's queryable
-    afterward changes. See tech_debt.md, "Comments Not in Retrieval Cascade"
-    for the full design discussion and the schema-evolution risk this
-    required checking before deploying (LanceDB errors on merge_insert when
-    a new row has a field the existing table schema doesn't -- see the
-    Fase 3 _lineage/cycle_key precedent in session_ledger.md, 2026-08-22)."""
+    afterward changes. Closes a real gap: Comments had no market_id linkage
+    in LanceDB at all until this (see retrieval/query.py's module docstring
+    and search_comments_by_market_ids, wired into search_cascade the same
+    day). Required checking a schema-evolution risk before deploying
+    (LanceDB errors on merge_insert when a new row has a field the existing
+    table schema doesn't -- see the Fase 3 _lineage/cycle_key precedent in
+    session_ledger.md, 2026-08-22, and this same incident in
+    session_ledger.md, 2026-08-30)."""
     groups = defaultdict(list)
     group_market_ids = defaultdict(set)
     for comment in comments:

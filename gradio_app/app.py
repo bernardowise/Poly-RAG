@@ -57,22 +57,42 @@ MAX_PER_SOURCE = {
     "comments": 15,
 }
 
-llm = ChatBedrock(
-    model_id=SYNTHESIS_MODEL_ID,
-    region_name="us-east-1",
-    max_tokens=1000,
-)
+THINKING_BUDGET_TOKENS = 1024  # Bedrock's minimum for Claude's extended thinking
 
-# Editable from the UI (see the "System prompt" accordion below) -- this is
-# just the starting default, not the only prompt ever used. Lets the user
-# try different phrasings live without redeploying.
-DEFAULT_SYSTEM_PROMPT = """You are Poly-RAG's assistant, answering questions about
+# Fixed system prompt -- replaced the free-text editor (2026-09-05) with
+# structured toggles (reasoning, temperature) instead, per the user's
+# request. Grounding stays ON by design: the whole point of this being RAG
+# (not a general chatbot) is answers coming from the corpus, not the
+# model's training data -- see knowledge.md/tech_debt.md for that
+# discussion. Toggles below change HOW the model reasons over that
+# context, not WHETHER it's grounded.
+SYSTEM_PROMPT = """You are Poly-RAG's assistant, answering questions about
 Polymarket prediction markets using retrieved context (market data, news
 coverage, odds movement, cycle digests, trader comments). Answer
 conversationally and directly, grounded ONLY in the provided context -- do
 not invent facts not present in it. If the context doesn't contain enough
 information to answer, say so plainly instead of guessing. Cite specific
 markets by their question text when relevant, not just their id."""
+
+
+def build_llm(reasoning, temperature):
+    """New ChatBedrock instance per call, not .bind() -- verified that
+    Bedrock's Claude requires `thinking` inside model_kwargs at
+    CONSTRUCTION time (bind()-time model_kwargs errors with "Extra inputs
+    are not permitted"), so reasoning on/off can't be toggled via bind().
+    Also verified a real Anthropic/Bedrock constraint: temperature can only
+    be 1 when thinking is enabled (ValidationException otherwise) -- the UI
+    enforces this by disabling the temperature slider while reasoning is on
+    (see the gr.Blocks wiring below), this is defense in depth."""
+    kwargs = {
+        "model_id": SYNTHESIS_MODEL_ID,
+        "region_name": "us-east-1",
+        "max_tokens": 2000 if reasoning else 1000,  # thinking needs headroom beyond its own budget
+        "temperature": 1 if reasoning else temperature,
+    }
+    if reasoning:
+        kwargs["model_kwargs"] = {"thinking": {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}}
+    return ChatBedrock(**kwargs)
 
 
 def _truncate_results(results):
@@ -139,18 +159,30 @@ def _context_to_text(results):
     return "\n".join(parts) if parts else "No relevant data found in the corpus."
 
 
-def synthesize_answer(question, results, system_prompt=DEFAULT_SYSTEM_PROMPT, lc_history=None):
+def _extract_text(content):
+    """response.content is a plain string normally, but a LIST of typed
+    blocks ({"type": "thinking", ...}, {"type": "text", ...}) when
+    reasoning/extended thinking is enabled -- verified live against
+    Bedrock. Only the "text" block is the actual answer to show."""
+    if isinstance(content, str):
+        return content
+    text_blocks = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(text_blocks) if text_blocks else str(content)
+
+
+def synthesize_answer(question, results, lc_history=None, reasoning=False, temperature=0.7):
     """lc_history: list of LangChain HumanMessage/AIMessage from prior turns
     (see _gradio_history_to_langchain below) -- prepended between the
     system prompt and this turn's question+context, so the model actually
     remembers what it already said, not just what was retrieved this turn."""
     context_text = _context_to_text(_truncate_results(results))
-    messages = [SystemMessage(content=system_prompt)]
+    messages = [SystemMessage(content=SYSTEM_PROMPT)]
     if lc_history:
         messages.extend(lc_history)
     messages.append(HumanMessage(content=f"Question: {question}\n\nRetrieved context:\n{context_text}"))
+    llm = build_llm(reasoning, temperature)
     response = llm.invoke(messages)
-    return response.content
+    return _extract_text(response.content)
 
 
 def _gradio_history_to_text(history):
@@ -175,10 +207,12 @@ def _gradio_history_to_langchain(history):
     ]
 
 
-def chat(message, history, system_prompt):
+def chat(message, history, reasoning, temperature):
     """gr.ChatInterface's fn -- message: this turn's text, history: prior
     turns (list of {"role","content"} dicts, managed by Gradio itself, not
-    us). Returns (answer, debug_info) since debug_output is wired as an
+    us). reasoning/temperature: from the toggles below, see build_llm's
+    docstring for the real Bedrock constraints behind them. Returns
+    (answer, debug_info) since debug_output is wired as an
     additional_output below."""
     if not message or not message.strip():
         return "Ask a question about Polymarket markets, news, or odds movement.", "{}"
@@ -187,13 +221,15 @@ def chat(message, history, system_prompt):
     lc_history = _gradio_history_to_langchain(history)
 
     results, rewritten, market_ids = search_cascade(message, history_text=history_text)
-    answer = synthesize_answer(message, results, system_prompt or DEFAULT_SYSTEM_PROMPT, lc_history=lc_history)
+    answer = synthesize_answer(message, results, lc_history=lc_history, reasoning=reasoning, temperature=temperature)
     debug_info = json.dumps({
         "query_rewriting": rewritten,
         "resolved_market_ids": market_ids,
         "result_counts": {
             source: len(rows) for source, rows in results.items()
         },
+        "reasoning_enabled": reasoning,
+        "temperature": 1 if reasoning else temperature,
     }, indent=2)
     return answer, debug_info
 
@@ -201,20 +237,28 @@ def chat(message, history, system_prompt):
 with gr.Blocks(title="Poly-RAG") as demo:
     gr.Markdown("# Poly-RAG\nAsk about Polymarket prediction markets, news coverage, or odds movement. "
                 "Conversational -- follow-up questions like \"what about last month?\" resolve against prior turns.")
-    with gr.Accordion("System prompt (editable -- try different phrasings without redeploying)", open=False):
-        system_prompt_input = gr.Textbox(
-            value=DEFAULT_SYSTEM_PROMPT,
-            label="System prompt",
-            lines=8,
+    with gr.Accordion("Model parameters", open=False):
+        reasoning_input = gr.Checkbox(
+            value=False,
+            label="Reasoning (extended thinking)",
+            info="Lets the model think step-by-step before answering. Forces temperature to 1 (Bedrock/Anthropic requirement) and adds latency -- see tech_debt.md, pending latency management.",
         )
-        reset_prompt_button = gr.Button("Reset to default")
-        reset_prompt_button.click(fn=lambda: DEFAULT_SYSTEM_PROMPT, outputs=system_prompt_input)
+        temperature_input = gr.Slider(
+            minimum=0.0, maximum=1.0, value=0.7, step=0.1,
+            label="Temperature",
+            info="Disabled while Reasoning is on -- Bedrock requires temperature=1 when extended thinking is enabled.",
+        )
+        reasoning_input.change(
+            fn=lambda r: gr.update(interactive=not r, value=1.0 if r else 0.7),
+            inputs=reasoning_input,
+            outputs=temperature_input,
+        )
     with gr.Accordion("Debug: retrieval details (last turn)", open=False):
         debug_output = gr.Code(label="Query rewriting + resolved market_ids", language="json")
 
     gr.ChatInterface(
         fn=chat,
-        additional_inputs=[system_prompt_input],
+        additional_inputs=[reasoning_input, temperature_input],
         additional_outputs=[debug_output],
     )
 

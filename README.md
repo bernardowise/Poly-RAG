@@ -228,8 +228,10 @@ The corpus grows automatically every cycle — 1,800+ tracked markets, ~20,000
 news articles, 1,400+ trader comments, over 23,000 vectors indexed for
 semantic search.
 
-Retrieval (semantic search over the accumulated corpus) is under active
-development. A public query interface is planned next.
+Retrieval (semantic search over the accumulated corpus, correlating market
+data, news, odds history, and trader comments) is live in a public,
+conversational Gradio MVP with real multi-turn memory:
+https://huggingface.co/spaces/bernardolw/poly-rag
 
 See `.claude/claude_docs/architecture_canon.md` for the full architecture and
 design rationale.

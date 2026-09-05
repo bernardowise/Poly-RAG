@@ -1,1 +1,5 @@
 boto3>=1.34
+gradio==6.26.0
+lancedb==0.37.1
+langchain-aws==1.7.4
+langchain-core==1.6.1
