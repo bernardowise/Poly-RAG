@@ -440,8 +440,8 @@ resource "aws_lambda_function" "write_lancedb" {
   role          = aws_iam_role.write_lancedb_role.arn
   package_type  = "Image"
   image_uri     = "${aws_ecr_repository.write_lancedb.repository_url}:latest"
-  # Terminal stage of the whole cycle -- invokes nothing further, but sends
-  # the cycle's third checkpoint email (see handler.py). Per-cycle write is 4
+  # No longer terminal (2026-09-05): after sending its Phase 3 checkpoint
+  # email it invokes build_sql_parquet (Phase 4). Per-cycle write is 4
   # sources x a few hundred rows each -- 35s measured 2026-08-23 against the
   # real corpus after fixing load_vectors to scope by cycle instead of
   # reading the whole checkpoint history (see tech_debt.md) -- generous
@@ -451,9 +451,40 @@ resource "aws_lambda_function" "write_lancedb" {
 
   environment {
     variables = {
-      S3_BUCKET     = aws_s3_bucket.poly_rag_data.bucket
-      SES_SENDER    = "bernardolw@gmail.com"
-      SES_RECIPIENT = "bernardolw@gmail.com"
+      S3_BUCKET                     = aws_s3_bucket.poly_rag_data.bucket
+      SES_SENDER                    = "bernardolw@gmail.com"
+      SES_RECIPIENT                 = "bernardolw@gmail.com"
+      BUILD_SQL_PARQUET_LAMBDA_NAME = aws_lambda_function.build_sql_parquet.function_name
+    }
+  }
+}
+
+# Phase 4 (SQL layer) -- the project's second container-image Lambda
+# (2026-09-05). Chained after write_lancedb: refreshes sql/markets.parquet
+# and the current month's sql/odds_snapshots/YYYY-MM.parquet on S3 so
+# retrieval/query.py's text-to-SQL route has fresh data. Terminal for now;
+# invokes rag_eval (Phase 5) once that Lambda exists. image_uri points at an
+# image that must already be in ECR (see lambdas/build_sql_parquet/Dockerfile,
+# pushed manually via docker/aws ecr, not by terraform).
+resource "aws_lambda_function" "build_sql_parquet" {
+  function_name = "poly-rag-build-sql-parquet"
+  role          = aws_iam_role.build_sql_parquet_role.arn
+  package_type  = "Image"
+  image_uri     = "${aws_ecr_repository.build_sql_parquet.repository_url}:latest"
+  # Reads ~2,600 odds/*.json in a 32-worker thread pool + one registry scan;
+  # the one-off equivalent measured ~13-16s. 300s timeout is generous
+  # headroom, not a tight budget. 1024MB: pandas/pyarrow building a
+  # ~50k-row DataFrame for the current month's partition.
+  timeout     = 300
+  memory_size = 1024
+
+  environment {
+    variables = {
+      S3_BUCKET      = aws_s3_bucket.poly_rag_data.bucket
+      REGISTRY_TABLE = "poly-rag-market-registry"
+      SES_SENDER     = "bernardolw@gmail.com"
+      SES_RECIPIENT  = "bernardolw@gmail.com"
+      # RAG_EVAL_LAMBDA_NAME set when Phase 5 exists -- empty = terminal stage.
     }
   }
 }

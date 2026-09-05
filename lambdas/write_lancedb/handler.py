@@ -79,10 +79,14 @@ LANCEDB_URI = f"s3://{S3_BUCKET}/lancedb/"
 MODEL_LABEL = "cohere"
 SES_SENDER = os.environ.get("SES_SENDER", "bernardolw@gmail.com")
 SES_RECIPIENT = os.environ.get("SES_RECIPIENT", "bernardolw@gmail.com")
+# Phase 4 (SQL layer) -- write_lancedb invokes it as its last act
+# (2026-09-05). Empty means Phase 4 isn't wired yet and this stays terminal.
+BUILD_SQL_PARQUET_LAMBDA_NAME = os.environ.get("BUILD_SQL_PARQUET_LAMBDA_NAME", "")
 
 SOURCES = ["registry", "comments", "digest", "news_article"]
 
 ses = boto3.client("ses")
+lam = boto3.client("lambda")
 
 STALE_FIELDS = ("_lineage", "cycle_key", "cycle_number", "cycle_started_at")
 
@@ -276,8 +280,21 @@ def lambda_handler(event, context):
     # reasoning as the Fase 1/Fase 2 split.
     send_report(cycle_started_at, results, elapsed_s)
 
+    # Phase 4 (SQL layer, 2026-09-05): refresh the SQL-queryable Parquet on
+    # S3. Async, after the Phase 3 email -- a Phase 4 failure never rolls
+    # back the LanceDB write that already succeeded.
+    sql_invoked = False
+    if BUILD_SQL_PARQUET_LAMBDA_NAME:
+        lam.invoke(
+            FunctionName=BUILD_SQL_PARQUET_LAMBDA_NAME,
+            InvocationType="Event",
+            Payload=json.dumps({"cycle_started_at": cycle_started_at}).encode("utf-8"),
+        )
+        sql_invoked = True
+
     return {
         "cycle_started_at": cycle_started_at,
         "results": results,
         "report_sent": True,
+        "build_sql_parquet_invoked": sql_invoked,
     }

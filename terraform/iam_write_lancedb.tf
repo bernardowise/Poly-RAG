@@ -60,6 +60,14 @@ data "aws_iam_policy_document" "write_lancedb_permissions" {
     actions   = ["ses:SendEmail", "ses:SendRawEmail"]
     resources = ["*"]
   }
+
+  statement {
+    # write_lancedb invokes build_sql_parquet (Phase 4) as its last act
+    # (2026-09-05), after the Phase 3 report email is sent.
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [aws_lambda_function.build_sql_parquet.arn]
+  }
 }
 
 resource "aws_iam_role_policy" "write_lancedb_permissions" {

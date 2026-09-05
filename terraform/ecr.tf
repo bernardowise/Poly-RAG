@@ -30,3 +30,32 @@ resource "aws_ecr_lifecycle_policy" "write_lancedb" {
     }]
   })
 }
+
+# ECR repo for build_sql_parquet (Phase 4, SQL layer -- 2026-09-05). Second
+# container-image Lambda in the project, same reason as write_lancedb:
+# pandas + pyarrow together are near Lambda's 250MB zip/Layer limit. Image
+# pushed manually via docker/aws ecr, not by terraform.
+resource "aws_ecr_repository" "build_sql_parquet" {
+  name                 = "poly-rag-build-sql-parquet"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "build_sql_parquet" {
+  repository = aws_ecr_repository.build_sql_parquet.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "keep last 5 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 5
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
