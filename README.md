@@ -228,10 +228,22 @@ The corpus grows automatically every cycle — 1,800+ tracked markets, ~20,000
 news articles, 1,400+ trader comments, over 23,000 vectors indexed for
 semantic search.
 
-Retrieval (semantic search over the accumulated corpus, correlating market
-data, news, odds history, and trader comments) is live in a public,
-conversational Gradio MVP with real multi-turn memory:
-https://huggingface.co/spaces/bernardolw/poly-rag
+Retrieval (a Registry-first cascade over the accumulated corpus, correlating
+market data, news, odds history, and trader comments) is live in a public
+Gradio app: https://huggingface.co/spaces/bernardolw/poly-rag — built as an
+evaluation instrument rather than a consumer chatbot. It carries a sliding
+context window (the full retrieved context of prior turns, merged and
+de-duplicated, bounded by a configurable token budget), a per-turn metrics
+panel (latency, token usage, estimated cost), an optional in-line LLM-judge
+scoring the answer (faithfulness, answer relevancy, context relevance), and
+opt-out per-turn logging of every interaction to S3 for later evaluation.
+
+A separate Phase 4 (`rag_eval`) — a fixed set of temporal, verifiable
+questions scored each cycle against programmatically-computed ground truth,
+plus a longitudinal drift judge over the stored history — is designed but
+not yet built. It is where the canonical `ragas` library runs, in an
+isolated environment reading the S3 session logs (`ragas` cannot coexist
+with the `langchain-aws` pin the retrieval path needs).
 
 See `.claude/claude_docs/architecture_canon.md` for the full architecture and
 design rationale.

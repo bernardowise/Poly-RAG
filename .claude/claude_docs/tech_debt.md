@@ -3817,3 +3817,14 @@ latency proves it matters more than reasoning quality for this use case.
 
 **Revisit when:** picking up performance/UX work on the Gradio MVP -- flagged
 explicitly by the user as a pending concern, not yet actioned.
+
+**Partial update (2026-09-05, Deploy 1/2):** per-turn latency is now *measured* and
+surfaced in the UI (a live panel breaks it into retrieval / synthesis / judge /
+total ms, plus an accumulating per-session table), and every logged turn writes
+`latency_ms` to `s3://.../evals/live_sessions/`. This closes the "no real latency
+numbers captured" gap for ad-hoc use -- but the actual UX fixes (streaming, a
+distinct thinking state, a circuit breaker, capping `THINKING_BUDGET_TOKENS`) are
+still not done. The optional "Evaluate answer (LLM judge)" checkbox adds a NEW
+latency source (~5 sequential Bedrock calls: claim decomposition + 3 generated
+questions embedded one-by-one + context-relevance grading) that stacks on top of
+retrieval + synthesis when enabled -- off by default for exactly this reason.
