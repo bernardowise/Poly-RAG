@@ -1,0 +1,56 @@
+name: Sync Gradio app to Hugging Face Space
+
+# One-line deploy: `git push origin main`. This Action builds the flattened
+# Space layout (see .github/space/build.sh) from gradio_app/ + retrieval/
+# and pushes it to huggingface.co/spaces/bernardolw/poly-rag. Nothing else
+# from the repo is uploaded.
+#
+# Requires a repo secret HF_TOKEN (a Hugging Face write token):
+#   Settings -> Secrets and variables -> Actions -> New repository secret.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gradio_app/**"
+      - "retrieval/**"
+      - "requirements.txt"
+      - ".github/space/**"
+      - ".github/workflows/sync-space.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-space
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build flattened Space layout
+        run: bash .github/space/build.sh "$RUNNER_TEMP/space"
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "HF_TOKEN secret is not set -- add it in repo Settings > Secrets > Actions" >&2
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/space"
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add space "https://bernardolw:${HF_TOKEN}@huggingface.co/spaces/bernardolw/poly-rag"
+          git add -A
+          git commit -q -m "sync from ${GITHUB_SHA::7}: ${GITHUB_REF_NAME}"
+          # force: the Space history is generated, not authored -- this repo is the source of truth
+          git push -f space HEAD:main
