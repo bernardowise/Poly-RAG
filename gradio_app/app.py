@@ -63,6 +63,7 @@ MAX_PER_SOURCE = {
     "digest": 3,
     "odds": 10,  # markets, not snapshots -- all snapshots for each kept market are sent
     "comments": 15,
+    "sql": 50,   # result rows from the text-to-SQL branch sent to synthesis
 }
 
 DEFAULT_CONTEXT_BUDGET = 10_000  # tokens: chat transcript + retained retrieved context, combined
@@ -95,13 +96,20 @@ def _approx_tokens(text):
 # --------------------------------------------------------------------------
 def _truncate_results(results):
     """Caps each source's result list/dict to MAX_PER_SOURCE. odds is a dict
-    (market_id -> snapshots), the other sources are lists."""
+    (market_id -> snapshots), sql is a dict ({sql, columns, rows, error}),
+    the other sources are lists."""
     truncated = {}
     for source, rows in results.items():
         cap = MAX_PER_SOURCE.get(source)
         if source == "odds":
             items = list(rows.items())[:cap] if cap else list(rows.items())
             truncated[source] = dict(items)
+        elif source == "sql":
+            # dict with its own shape -- cap the row list, keep the rest
+            r = dict(rows)
+            if cap and isinstance(r.get("rows"), list):
+                r["rows"] = r["rows"][:cap]
+            truncated[source] = r
         else:
             truncated[source] = rows[:cap] if cap else rows
     return truncated
@@ -136,6 +144,12 @@ def _merge_results(retained, current):
             combined = dict(retained.get("odds", {}))
             combined.update(current.get("odds", {}))
             merged["odds"] = combined
+            continue
+        if source == "sql":
+            # a SQL result is one query per turn -- the current turn's wins
+            # outright, no row-level merge (rows are aggregates, not
+            # dedup-able corpus items).
+            merged["sql"] = current.get("sql") or retained.get("sql")
             continue
         seen = {}
         for row in retained.get(source, []):
@@ -192,12 +206,39 @@ def _context_to_text(results):
             preview = (r.get("text") or "")[:400].replace("\n", " ")
             parts.append(f"- (entity {r.get('comment_entity_id')}, {r.get('link_type')}) {preview}")
 
+    sql_res = results.get("sql")
+    if sql_res:
+        parts.append("\nSQL QUERY RESULT (computed over the full markets / odds tables):")
+        parts.append(f"query: {sql_res.get('sql', '').strip()}")
+        if sql_res.get("error"):
+            parts.append(f"ERROR: {sql_res['error']}")
+        else:
+            cols = sql_res.get("columns", [])
+            rows = sql_res.get("rows", [])
+            parts.append(" | ".join(cols))
+            for r in rows[:50]:
+                parts.append(" | ".join(
+                    f"{r.get(c)}" if not isinstance(r.get(c), float) else f"{r.get(c):.4g}"
+                    for c in cols
+                ))
+            if len(rows) > 50:
+                parts.append(f"... ({len(rows)} rows total)")
+
     return "\n".join(parts) if parts else "No relevant data found in the corpus."
 
 
 def _count_results(results):
-    """Per-source item counts for the debug/log payload. odds counts markets."""
-    return {s: (len(rows) if not isinstance(rows, dict) else len(rows)) for s, rows in results.items()}
+    """Per-source item counts for the debug/log payload. odds counts
+    markets; sql counts result rows (or reports its error)."""
+    out = {}
+    for s, rows in results.items():
+        if s == "sql":
+            out[s] = f"error: {rows['error']}" if rows.get("error") else len(rows.get("rows", []))
+        elif isinstance(rows, dict):
+            out[s] = len(rows)
+        else:
+            out[s] = len(rows)
+    return out
 
 
 # --------------------------------------------------------------------------

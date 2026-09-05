@@ -240,9 +240,18 @@ Given a natural-language question, decide:
    generic concepts (don't include e.g. "markets", "events", "developments").
    Empty list if the question has no clear literal keyword (e.g. a purely
    conceptual question like "what markets are close to 50/50").
+7. needs_sql: true if answering the question requires AGGREGATION, RANKING,
+   COUNTING, or a computed comparison over many markets or many odds snapshots
+   -- things semantic search cannot do. Examples that need SQL: "top 10 markets
+   by volume last week", "how many markets resolved YES in September", "which
+   market had the biggest price swing between two cycles", "average liquidity of
+   open Bitcoin markets". Examples that do NOT need SQL (plain retrieval is
+   enough): "how did the Bitcoin market move last week" (one/few named markets),
+   "what news was there about the Fed", "what are traders saying about X". When
+   in doubt, false.
 
 Respond with ONLY valid JSON, no extra text, in exactly this shape:
-{{"search_text": "...", "market_id": null, "date_from": null, "date_to": null, "sources": null, "status": null, "keywords": []}}"""
+{{"search_text": "...", "market_id": null, "date_from": null, "date_to": null, "sources": null, "status": null, "keywords": [], "needs_sql": false}}"""
 
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
@@ -254,10 +263,170 @@ Respond with ONLY valid JSON, no extra text, in exactly this shape:
     payload = json.loads(response["body"].read())
     text = payload["content"][0]["text"]
     try:
-        return _extract_json(text)
+        parsed = _extract_json(text)
     except json.JSONDecodeError:
         print("RAW MODEL OUTPUT (failed to parse as JSON):", repr(text))
         raise
+    parsed.setdefault("needs_sql", False)  # older prompt / model omission
+    return parsed
+
+
+# --------------------------------------------------------------------------
+# text-to-SQL route (2026-09-05). For AGGREGATION / RANKING / COUNTING
+# questions that the semantic cascade structurally cannot answer -- see
+# tech_debt.md "Phase 4 SQL Layer". Reads the Parquet that build_sql_parquet
+# (Phase 4 Lambda) writes to s3://<bucket>/sql/ via DuckDB, in-process, no
+# server. Guardrails are NON-DESTRUCTIVE by design (DuckDB reads Parquet
+# read-only anyway): the point is to keep a generated query from doing
+# something surprising, not to sandbox a hostile one.
+# --------------------------------------------------------------------------
+SQL_MARKETS_URI = f"read_parquet('s3://{S3_BUCKET}/sql/markets.parquet')"
+SQL_ODDS_URI = f"read_parquet('s3://{S3_BUCKET}/sql/odds_snapshots/*.parquet')"
+SQL_ROW_CAP = 200          # hard LIMIT injected if a generated query has none
+
+SQL_SCHEMA_DOC = f"""Two tables, both read from Parquet on S3 (DuckDB):
+
+markets  -- one row per prediction market (from the registry)
+  market_id                         VARCHAR   (join key)
+  question                          VARCHAR   (the market's title)
+  description                       VARCHAR
+  status                            VARCHAR   ('open' | 'resolved')
+  resolution_source                 VARCHAR
+  created_at, first_seen, last_updated, end_date, resolution_date  VARCHAR (ISO 8601)
+  final_outcome                     VARCHAR   (JSON string, e.g. '["1", "0"]' when resolved, NULL otherwise)
+  comment_entity_type, comment_entity_id, comment_link_type  VARCHAR
+  post_resolution_cycles_remaining  BIGINT
+
+odds_snapshots  -- one row per (market_id, snapshot). ~200k rows, all monthly
+                   partitions unioned by the '*' in the path.
+  market_id           VARCHAR   (join key -> markets.market_id)
+  timestamp           VARCHAR   (ISO 8601, directly range-comparable as text)
+  source              VARCHAR   ('cycle' = a 12h tracked snapshot with volume;
+                                 'clob_backfill' = pre-tracking price history,
+                                  volume/volume24hr/liquidity are NULL there)
+  yes_price, no_price DOUBLE    (0..1, the two binary outcome prices)
+  outcome_prices_raw  VARCHAR   (original JSON string, for multi-outcome markets)
+  volume, volume24hr, liquidity  DOUBLE  (USD; only on source='cycle' rows.
+                                          volume is CUMULATIVE lifetime volume,
+                                          not per-cycle -- for "volume over a
+                                          time window" use MAX(volume) within
+                                          the window, or MAX minus MIN for the
+                                          delta, NEVER SUM.)
+
+Reference these tables in FROM as:
+  {SQL_MARKETS_URI} AS m
+  {SQL_ODDS_URI} AS o
+
+Notes:
+- For "by volume" questions filter `o.source = 'cycle'` (clob_backfill has no volume).
+- timestamp is text; a date range is `o.timestamp >= '2026-09-01' AND o.timestamp < '2026-10-01'`.
+- Always LEFT JOIN markets onto odds (some odds market_ids predate the current
+  registry) and return m.question so the answer is readable.
+"""
+
+_SQL_FORBIDDEN = (
+    "insert", "update", "delete", "drop", "create", "alter", "attach", "detach",
+    "copy", "install", "load", "pragma", "set ", "export", "import", "call",
+    "vacuum", "checkpoint",
+)
+
+
+def _guard_sql(sql):
+    """Non-destructive guardrails on a generated query. Returns a cleaned SQL
+    string or raises ValueError. Not a security sandbox -- DuckDB opens the
+    Parquet read-only -- just a stop against a generated statement doing
+    something other than a single read."""
+    s = sql.strip().rstrip(";").strip()
+    low = s.lower()
+    if not (low.startswith("select") or low.startswith("with")):
+        raise ValueError(f"generated SQL is not a SELECT/WITH: {s[:120]!r}")
+    if ";" in s:
+        raise ValueError("generated SQL has multiple statements")
+    for kw in _SQL_FORBIDDEN:
+        # word-ish boundary check so 'created_at' doesn't trip 'create'
+        idx = low.find(kw)
+        while idx != -1:
+            before = low[idx - 1] if idx > 0 else " "
+            after = low[idx + len(kw)] if idx + len(kw) < len(low) else " "
+            if not before.isalnum() and before != "_" and not after.isalnum() and after != "_":
+                raise ValueError(f"generated SQL contains forbidden keyword {kw!r}")
+            idx = low.find(kw, idx + 1)
+    import re
+    if not re.search(r"\blimit\b", low):
+        s = f"{s}\nLIMIT {SQL_ROW_CAP}"
+    return s
+
+
+def text_to_sql(question, history_text=None):
+    """One Claude call: natural-language question -> a single DuckDB SELECT
+    against the markets / odds_snapshots Parquet. Returns the SQL string
+    (already guard-checked)."""
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    history_block = f"\nConversation so far (for resolving references like 'those markets' only):\n{history_text}\n" if history_text else ""
+    system_prompt = f"""You translate a natural-language question into ONE DuckDB SQL
+query over the schema below. Today's real date (UTC): {today_utc}.
+
+{SQL_SCHEMA_DOC}
+{history_block}
+Rules:
+- Output ONE statement, a SELECT (or WITH ... SELECT). No semicolons, no DDL,
+  no PRAGMA/SET/COPY/INSTALL -- read only.
+- Always include an explicit LIMIT (<= {SQL_ROW_CAP}).
+- Return m.question alongside any market_id so the result is human-readable.
+- Compute date ranges yourself from today's date for relative phrases.
+
+Respond with ONLY the SQL, no prose, no code fence."""
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 600,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": question}],
+    })
+    response = bedrock.invoke_model(modelId=QUERY_REWRITE_MODEL_ID, body=body)
+    text = json.loads(response["body"].read())["content"][0]["text"].strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.lstrip().lower().startswith("sql"):
+            text = text.lstrip()[3:]
+        text = text.split("```", 1)[0]
+    return _guard_sql(text)
+
+
+_sql_con = None
+
+
+def _get_sql_con():
+    global _sql_con
+    if _sql_con is None:
+        import duckdb
+        con = duckdb.connect()
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute("SET s3_region='us-east-1';")
+        cr = boto3.Session().get_credentials().get_frozen_credentials()
+        con.execute(f"SET s3_access_key_id='{cr.access_key}';")
+        con.execute(f"SET s3_secret_access_key='{cr.secret_key}';")
+        if cr.token:
+            con.execute(f"SET s3_session_token='{cr.token}';")
+        _sql_con = con
+    return _sql_con
+
+
+def run_sql(sql):
+    """Execute a guard-checked SELECT against the Phase 4 Parquet. Returns
+    {"sql": str, "columns": [...], "rows": [ {...}, ... ], "error": str|None}.
+    Never raises -- a failure is reported in the return value so the cascade
+    and the synthesis layer can surface it instead of 500-ing."""
+    try:
+        con = _get_sql_con()
+        # DuckDB has no per-statement timeout knob (statement_timeout is a
+        # Postgres-ism); the Parquet is ~2MB total and the Lambda/Space both
+        # cap wall time upstream, so an unbounded query here is not a real risk.
+        cur = con.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        return {"sql": sql, "columns": cols, "rows": rows, "error": None}
+    except Exception as exc:  # noqa: BLE001 -- report, never raise into retrieval
+        return {"sql": sql, "columns": [], "rows": [], "error": f"{type(exc).__name__}: {exc}"}
 
 
 def filter_news_article_by_date(rows, date_from, date_to):
@@ -403,6 +572,31 @@ def resolve_market_ids(search_text, keywords=None, status=None):
     return [r["market_id"] for r in merged], merged
 
 
+def search_registry_by_ids(market_ids):
+    """Plain .where() lookup of registry rows by exact market_id -- used
+    when the ids came from the text-to-SQL branch or a direct market_id
+    (not from resolve_market_ids' semantic pass), so downstream sources
+    still get market_id -> question for readable output. Returns the same
+    row shape resolve_market_ids' semantic branch does (minus the
+    embedding), preserving the input id order."""
+    if not market_ids:
+        return []
+    db = get_db()
+    table_name = f"registry_{MODEL_LABEL}"
+    if table_name not in db.list_tables().tables:
+        return []
+    tbl = db.open_table(table_name)
+    id_list = ", ".join(f"'{m}'" for m in market_ids)
+    rows = tbl.search().where(f"market_id IN ({id_list})").to_list()
+    by_id = {}
+    for r in rows:
+        r["_source"] = "registry"
+        r["_match_type"] = "id_lookup"
+        r.pop("embedding", None)
+        by_id[str(r["market_id"])] = r
+    return [by_id[m] for m in market_ids if m in by_id]
+
+
 def search_news_by_market_ids(market_ids, date_from=None, date_to=None):
     """Step of the cascade: News as a lookup by Registry's resolved
     market_ids, not an independent semantic search. No embedding/similarity
@@ -492,21 +686,47 @@ def search_cascade(question, digest_k=5, history_text=None):
 
     results = {}
 
-    # Step 1: Registry resolves market_ids (unless a specific market_id was
-    # already given directly, in which case skip the semantic resolve step).
+    # Step 0: text-to-SQL branch (2026-09-05). If the rewrite flagged the
+    # question as aggregation/ranking/counting, run one generated SELECT
+    # against the Phase 4 Parquet first. Its rows go into results["sql"];
+    # any market_id column in the output seeds the semantic lookups below,
+    # so "top 10 markets by volume last week -- and what's the news"
+    # cross-references. The semantic sources still run (unless the rewrite
+    # narrowed `sources`) -- SQL augments the cascade, it doesn't replace it.
     market_ids = [market_id] if market_id else []
+    if rewritten.get("needs_sql"):
+        sql = text_to_sql(question, history_text=history_text)
+        sql_result = run_sql(sql)
+        results["sql"] = sql_result
+        if not sql_result["error"]:
+            sql_ids = [
+                str(row["market_id"]) for row in sql_result["rows"]
+                if row.get("market_id") is not None
+            ]
+            if sql_ids and not market_id:
+                market_ids = list(dict.fromkeys(sql_ids))  # dedup, keep order
+
+    # Step 1: Registry resolves market_ids semantically -- SKIPPED when a
+    # market_id was given directly or Step 0's SQL already produced the set.
     registry_rows = []
-    if "registry" in targets or "news_article" in targets or "odds" in targets or "comments" in targets:
+    needs_downstream = (
+        "registry" in targets or "news_article" in targets
+        or "odds" in targets or "comments" in targets
+    )
+    if not market_ids and needs_downstream:
         resolved_ids, registry_rows = resolve_market_ids(
             rewritten["search_text"], keywords=rewritten.get("keywords"), status=status
         )
-        if not market_id:
-            market_ids = resolved_ids
+        market_ids = resolved_ids
+    elif market_ids and needs_downstream:
+        # ids came from SQL / a direct market_id -- still fetch their
+        # registry rows so downstream sources have market_id -> question
+        # for readable output (search_registry_by_ids is a plain .where()).
+        registry_rows = search_registry_by_ids(market_ids)
+
     # Always expose registry_rows when computed, even if the rewrite only
     # asked for "odds"/"news_article"/"comments" -- it's the market_id ->
-    # question text lookup every other source needs for readable output,
-    # not just an internal step gated behind the user explicitly asking
-    # for "registry".
+    # question text lookup every other source needs for readable output.
     if registry_rows:
         results["registry"] = registry_rows
 
