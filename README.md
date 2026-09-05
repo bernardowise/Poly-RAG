@@ -240,16 +240,19 @@ opt-out per-turn logging of every interaction to S3 for later evaluation.
 Deploys are automatic: a GitHub Action flattens `gradio_app/` + `retrieval/`
 and pushes to the Space on every push to `main`.
 
-**Phase 4 (SQL layer)** — `scripts/build_sql_parquet.py` flattens the
-registry and the odds time-series into SQL-queryable Parquet on S3
-(`sql/markets.parquet`, `sql/odds_snapshots/YYYY-MM.parquet`), so retrieval
-can answer aggregate / ranking / point questions ("top 10 markets by volume
-last week") that semantic search structurally cannot. The one-off
-retroactive run is done (2,643 markets, 201,692 snapshot rows); DuckDB reads
-it straight from S3. Still to build: the per-cycle Lambda that refreshes it,
-chained after `write_lancedb`, and the text-to-SQL route in
-`retrieval/query.py` that turns a natural-language question into a guarded
-`SELECT`.
+**Phase 4 (SQL layer)** — the registry and the odds time-series, flattened
+into SQL-queryable Parquet on S3 (`sql/markets.parquet`,
+`sql/odds_snapshots/YYYY-MM.parquet`), so retrieval can answer aggregate /
+ranking / point questions ("top 10 markets by volume last week") that
+semantic search structurally cannot. The one-off retroactive run
+(`scripts/build_sql_parquet.py`, 2,643 markets, 201,692 snapshot rows) and
+the per-cycle `build_sql_parquet` Lambda — chained after `write_lancedb`,
+container-image, refreshing `markets.parquet` plus the current month's
+`odds_snapshots` partition each cycle — are both built and deployed. The
+Lambda's report email (the cycle's fourth) runs eight DuckDB smoke-test
+queries over the Parquet it just wrote. Still to build: the text-to-SQL
+route in `retrieval/query.py` that turns a natural-language question into a
+guarded `SELECT`, and `duckdb` on the Space so the app can use it.
 
 **Phase 5 (`rag_eval`)** — a fixed set of temporal, verifiable questions
 scored each cycle against programmatically-computed ground truth, plus a

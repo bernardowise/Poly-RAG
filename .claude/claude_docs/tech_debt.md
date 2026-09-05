@@ -3855,14 +3855,22 @@ straight from S3 via `httpfs` and runs joins/aggregates/window functions in ~2s.
 Phase renumbering: Phase 4 = SQL layer, Phase 5 = `rag_eval` (was "Phase 4") --
 Phase 4 goes first because `rag_eval` will include SQL questions in its eval set.
 
-**Debt 1 -- the Parquet is a frozen snapshot.** `build_sql_parquet.py` is a
-manual one-off. The Parquet on S3 reflects the corpus as of 2026-09-05 22:42 UTC
-and does not update. A Lambda `build_sql_parquet` chained after `write_lancedb`
-(Phase 4, before Phase 5) needs to be built -- likely a container-image Lambda
-like `write_lancedb` (DuckDB/pyarrow footprint), rewriting only `markets.parquet`
-plus the current month's `odds_snapshots` partition each cycle. Terraform + IAM +
-its own ECR repo. Per CLAUDE.md it is verified at the next automatic cycle, never
-by invoking `write_lancedb` or the chain manually.
+**Debt 1 -- CLOSED 2026-09-05 (same day).** The Lambda `build_sql_parquet` is
+built and deployed (`lambdas/build_sql_parquet/`, `025c815`): a container-image
+Lambda (2nd in the project, `write_lancedb`'s pattern), chained after
+`write_lancedb` via async `lambda.invoke`. Per cycle it rewrites
+`sql/markets.parquet` (whole registry) and ONLY the current month's
+`sql/odds_snapshots/YYYY-MM.parquet` -- past months are immutable. Its report
+email (the cycle's 4th) also runs 8 DuckDB smoke-test queries over
+`s3://.../sql/*.parquet` and renders them as tables (`6a9cf19`): top 10 by
+volume for this cycle / last 7 days / month to date / all time, plus count by
+status, latest snapshot per source, total `odds_snapshots` rows, biggest
+`yes_price` swing -- any query that errors or returns 0 rows (except
+this-cycle, which can legitimately be empty) is red and counts in
+`smoke_failed`. Terraform: ECR repo + 5-image lifecycle, dedicated IAM role,
+`write_lancedb` env var + `lambda:InvokeFunction`. NOT yet verified against a
+real cycle -- next automatic cycle (00:00 / 12:00 UTC), never a manual invoke.
+Until then the Parquet on S3 is the one-off snapshot from 2026-09-05 22:42 UTC.
 
 **Debt 2 -- no text-to-SQL route in the cascade yet.** The Parquet exists but
 `retrieval/query.py` cannot reach it. Still to build: `rewrite_query` emits a
@@ -3885,4 +3893,6 @@ unpaginated scan page, not the total. The full paginated scan is 2,643 markets,
 which matches the 2,643 `odds/*.json` files exactly -- no phantom purge, nothing
 lost. Always paginate a DynamoDB count.
 
-**Revisit when:** next session -- Lambda first, then the text-to-SQL route.
+**Revisit when:** (1) verify the `build_sql_parquet` Lambda at the next
+automatic cycle -- email #4 with 8 populated smoke-test tables, no red;
+(2) then Debt 2, the text-to-SQL route in `retrieval/query.py`, still open.
