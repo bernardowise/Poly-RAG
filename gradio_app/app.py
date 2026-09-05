@@ -277,16 +277,150 @@ def synthesize_answer(question, context_text, lc_history, reasoning, temperature
 
 
 # --------------------------------------------------------------------------
-# RAGAS live evaluation -- Deploy 2 stub. Wired end-to-end (checkbox ->
-# chat() -> here -> debug panel + log record) but returns a not-implemented
-# marker until `ragas` lands in requirements.txt.
+# LLM-judge live evaluation (Deploy 2). Reference-free, in-line, no new
+# dependencies -- three artisanal judges built the same way rewrite_query
+# and send_digest's executive_summary are: a Bedrock Claude call with a
+# structured prompt and JSON output, plus Cohere embeddings (already on the
+# Space) for the relevancy cosine step. This is deliberately NOT the ragas
+# library -- ragas cannot coexist with langchain-aws==1.7.4 in one env (its
+# ChatVertexAI import breaks against modern langchain-community). The
+# canonical ragas run lives in the isolated Phase 4 (evals/), reading these
+# same turns back from s3://.../evals/live_sessions/. These scores are for
+# tracking drift within this system over time, where self-consistency
+# matters more than matching public ragas benchmarks.
+#
+# Metrics (all 0..1, higher is better):
+#   faithfulness       -- claims in the answer supported by the context
+#   answer_relevancy   -- how directly the answer addresses the question
+#   context_relevance  -- fraction of retrieved context relevant to the question
 # --------------------------------------------------------------------------
-def ragas_evaluate(question, context_text, answer):
-    """Reference-free RAGAS scoring (faithfulness, answer_relevancy,
-    context_relevance) with a Bedrock evaluator. Deploy 2 -- not yet
-    implemented. Returns a dict with a 'status' key so the caller can show
-    'pending' rather than fake scores."""
-    return {"status": "not_implemented_deploy_2"}
+JUDGE_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+JUDGE_EMBED_MODEL_ID = "cohere.embed-english-v3"  # in-region, sync single-text embed for the relevancy step
+
+_judge_bedrock = None
+_judge_embed_bedrock = None
+
+
+def _get_judge_clients():
+    """Lazy boto3 clients for the judge -- separate from retrieval/query.py's
+    so a judge failure never touches the retrieval path."""
+    global _judge_bedrock, _judge_embed_bedrock
+    if _judge_bedrock is None:
+        import boto3
+        _judge_bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+        _judge_embed_bedrock = _judge_bedrock
+    return _judge_bedrock, _judge_embed_bedrock
+
+
+def _judge_call(prompt, max_tokens=700):
+    """One Bedrock Claude call, returns parsed JSON. Raises on unparseable
+    output -- the caller catches and records the metric as null."""
+    client, _ = _get_judge_clients()
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}],
+    })
+    resp = client.invoke_model(modelId=JUDGE_MODEL_ID, body=body)
+    text = json.loads(resp["body"].read())["content"][0]["text"].strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1].lstrip("json").strip() if "```" in text[3:] else text.strip("`")
+    return json.loads(text)
+
+
+def _embed_one(text):
+    _, client = _get_judge_clients()
+    body = json.dumps({"texts": [text[:2000]], "input_type": "search_query"})
+    resp = client.invoke_model(modelId=JUDGE_EMBED_MODEL_ID, body=body)
+    return json.loads(resp["body"].read())["embeddings"][0]
+
+
+def _cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _judge_faithfulness(question, context_text, answer):
+    """Decompose the answer into atomic claims, mark each supported/not by
+    the context. Score = supported / total (1.0 if the answer makes no
+    checkable factual claims)."""
+    prompt = (
+        "You are grading whether an answer is faithful to its retrieved context.\n\n"
+        f"CONTEXT:\n{context_text[:6000]}\n\n"
+        f"QUESTION: {question}\n\nANSWER:\n{answer}\n\n"
+        "Break the ANSWER into atomic factual claims. For each, decide if it is "
+        "directly supported by the CONTEXT (not by outside knowledge). Respond with "
+        'ONLY JSON: {"claims": [{"claim": "...", "supported": true/false}], '
+        '"n_claims": int, "n_supported": int}. If the answer makes no checkable '
+        'factual claims, return {"claims": [], "n_claims": 0, "n_supported": 0}.'
+    )
+    r = _judge_call(prompt)
+    n = int(r.get("n_claims", 0))
+    if n == 0:
+        return 1.0, r
+    return round(int(r.get("n_supported", 0)) / n, 3), r
+
+
+def _judge_answer_relevancy(question, answer):
+    """Generate questions the answer would be a good answer to, embed each,
+    cosine against the real question, average. Low when the answer is
+    evasive or off-topic."""
+    prompt = (
+        "Given this ANSWER, write 3 distinct questions that this answer would "
+        "directly and completely address. Respond with ONLY JSON: "
+        '{"questions": ["...", "...", "..."]}.\n\n'
+        f"ANSWER:\n{answer}"
+    )
+    r = _judge_call(prompt, max_tokens=400)
+    gen_qs = r.get("questions", [])[:3]
+    if not gen_qs:
+        return None, r
+    q_vec = _embed_one(question)
+    sims = [_cosine(q_vec, _embed_one(gq)) for gq in gen_qs]
+    return round(sum(sims) / len(sims), 3), {"generated_questions": gen_qs, "cosines": [round(s, 3) for s in sims]}
+
+
+def _judge_context_relevance(question, context_text):
+    """Fraction of the retrieved context (by line/item) that is relevant to
+    answering the question. Low = retrieval pulled in noise."""
+    prompt = (
+        "You are grading whether retrieved context is relevant to a question.\n\n"
+        f"QUESTION: {question}\n\nRETRIEVED CONTEXT (line-numbered):\n"
+        + "\n".join(f"{i}: {ln}" for i, ln in enumerate(context_text.split("\n")[:120]) if ln.strip())
+        + "\n\nCount how many non-empty lines are relevant to answering the question "
+        '(directly or as useful supporting detail). Respond with ONLY JSON: '
+        '{"n_relevant": int, "n_total": int}.'
+    )
+    r = _judge_call(prompt)
+    total = int(r.get("n_total", 0))
+    if total == 0:
+        return None, r
+    return round(int(r.get("n_relevant", 0)) / total, 3), r
+
+
+def llm_judge_evaluate(question, context_text, answer):
+    """Run the three judges. Each metric is independently best-effort -- a
+    failure records null for that metric and an 'errors' list, never raises
+    into the chat flow. Returns a dict:
+      {faithfulness, answer_relevancy, context_relevance, details, errors}
+    """
+    out = {"faithfulness": None, "answer_relevancy": None, "context_relevance": None,
+           "details": {}, "errors": []}
+    for name, fn in [
+        ("faithfulness", lambda: _judge_faithfulness(question, context_text, answer)),
+        ("answer_relevancy", lambda: _judge_answer_relevancy(question, answer)),
+        ("context_relevance", lambda: _judge_context_relevance(question, context_text)),
+    ]:
+        try:
+            score, detail = fn()
+            out[name] = score
+            out["details"][name] = detail
+        except Exception as exc:  # noqa: BLE001 -- judge must never break chat
+            out["errors"].append(f"{name}: {type(exc).__name__}: {exc}")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -311,14 +445,45 @@ def _gradio_history_to_langchain(history):
 # --------------------------------------------------------------------------
 # main turn handler
 # --------------------------------------------------------------------------
-def chat(message, history, reasoning, temperature, retain_context, context_budget, run_ragas, log_session, state):
+def _fmt_score(v):
+    return f"{v:.2f}" if isinstance(v, (int, float)) else "n/a"
+
+
+def _panel_markdown(turn_idx, latency_ms, tokens, cost_usd, window_state, judge_scores):
+    """Formatted one-glance panel (b) for the current turn."""
+    lat = latency_ms
+    tok = tokens
+    over = " OVER" if tok["window_over_budget"] else ""
+    lines = [
+        f"### Turn {turn_idx}",
+        f"**Latency** retrieval {lat['retrieval']} ms | synthesis {lat['synthesis']} ms | "
+        f"judge {lat['judge']} ms | **total {lat['total']} ms**",
+        f"**Tokens** retrieved {tok['retrieved_context']} | history {tok['chat_history']} | "
+        f"answer {tok['answer']} | window {tok['window_total']}/{tok['window_budget']}{over}",
+        f"**Cost (est)** ${cost_usd:.5f}",
+        f"**Window** live turns {window_state['live_turns']} | evicted this turn {window_state['evicted_this_turn']}",
+    ]
+    if judge_scores:
+        lines.append(
+            f"**LLM judge** faithfulness {_fmt_score(judge_scores.get('faithfulness'))} | "
+            f"answer relevancy {_fmt_score(judge_scores.get('answer_relevancy'))} | "
+            f"context relevance {_fmt_score(judge_scores.get('context_relevance'))}"
+        )
+        if judge_scores.get("errors"):
+            lines.append(f"_judge errors: {'; '.join(judge_scores['errors'])}_")
+    return "\n\n".join(lines)
+
+
+def chat(message, history, reasoning, temperature, retain_context, context_budget, run_judge, log_session, state):
     """gr.ChatInterface fn. `state` is our gr.State dict:
-    {"session_id": str|None, "buffer": list, "turn": int}. Returns
-    (answer, debug_json, state) -- debug_output and state are additional
-    outputs wired below."""
-    state = state or {"session_id": None, "buffer": [], "turn": 0}
+    {"session_id": str|None, "buffer": list, "turn": int, "rows": list}.
+    Returns (answer, panel_md, table_rows, debug_json, state) -- the last
+    four are additional outputs wired below."""
+    state = state or {"session_id": None, "buffer": [], "turn": 0, "rows": []}
+    state.setdefault("rows", [])
     if not message or not message.strip():
-        return "Ask a question about Polymarket markets, news, or odds movement.", "{}", state
+        return ("Ask a question about Polymarket markets, news, or odds movement.",
+                "", state["rows"], "{}", state)
 
     state["turn"] += 1
     turn_idx = state["turn"]
@@ -350,13 +515,13 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
     answer = synthesize_answer(message, context_text, lc_history, reasoning, temperature)
     synthesis_ms = int((time.perf_counter() - t1) * 1000)
 
-    # --- RAGAS (opt-in) ---
-    ragas_ms = 0
-    ragas_scores = None
-    if run_ragas:
+    # --- LLM judge (opt-in) ---
+    judge_ms = 0
+    judge_scores = None
+    if run_judge:
         t2 = time.perf_counter()
-        ragas_scores = ragas_evaluate(message, context_text, answer)
-        ragas_ms = int((time.perf_counter() - t2) * 1000)
+        judge_scores = llm_judge_evaluate(message, context_text, answer)
+        judge_ms = int((time.perf_counter() - t2) * 1000)
 
     # --- update the sliding buffer ---
     exchange_text = f"User: {message}\nAssistant: {answer}"
@@ -402,15 +567,15 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
     latency_ms = {
         "retrieval": retrieval_ms,
         "synthesis": synthesis_ms,
-        "ragas": ragas_ms,
-        "total": retrieval_ms + synthesis_ms + ragas_ms,
+        "judge": judge_ms,
+        "total": retrieval_ms + synthesis_ms + judge_ms,
     }
     flags = {
         "reasoning": reasoning,
         "temperature": 1 if reasoning else temperature,
         "retain_context": retain_context,
         "context_budget": budget,
-        "run_ragas": run_ragas,
+        "run_judge": run_judge,
         "log_session": log_session,
     }
     window_state = {
@@ -437,11 +602,25 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
             "tokens": tokens,
             "estimated_cost_usd": cost_usd,
             "flags": flags,
-            "ragas_scores": ragas_scores,
+            "llm_judge_scores": judge_scores,
             "window_state": window_state,
         }
         ok = log_turn(state["session_id"], record)
         log_status = f"written ({state['session_id']})" if ok else "WRITE FAILED"
+
+    # --- (b) formatted panel + (c) accumulating per-session table ---
+    panel_md = _panel_markdown(turn_idx, latency_ms, tokens, cost_usd, window_state, judge_scores)
+    js = judge_scores or {}
+    state["rows"].append([
+        turn_idx,
+        (message[:60] + "...") if len(message) > 60 else message,
+        latency_ms["total"],
+        tokens["window_total"],
+        round(cost_usd, 5),
+        _fmt_score(js.get("faithfulness")),
+        _fmt_score(js.get("answer_relevancy")),
+        _fmt_score(js.get("context_relevance")),
+    ])
 
     debug_info = json.dumps({
         "session_id": state["session_id"],
@@ -453,11 +632,11 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
         "tokens": tokens,
         "estimated_cost_usd": cost_usd,
         "window_state": window_state,
-        "ragas_scores": ragas_scores,
+        "llm_judge_scores": judge_scores,
         "log_session": log_status,
         "flags": flags,
     }, indent=2, default=str)
-    return answer, debug_info, state
+    return answer, panel_md, state["rows"], debug_info, state
 
 
 with gr.Blocks(title="Poly-RAG eval") as demo:
@@ -469,7 +648,7 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
         "**Sessions are logged to S3 for quality evaluation by default.** Turn off "
         "*Log this session* below if you don't want your turns recorded."
     )
-    session_state = gr.State({"session_id": None, "buffer": [], "turn": 0})
+    session_state = gr.State({"session_id": None, "buffer": [], "turn": 0, "rows": []})
 
     with gr.Accordion("Model parameters", open=False):
         reasoning_input = gr.Checkbox(
@@ -492,10 +671,10 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
             label="Context window budget (tokens)",
             info="Sliding-window cap counting chat transcript + retained retrieved context together. Whole oldest turns are dropped when exceeded. Only applies when Retained context is on.",
         )
-        run_ragas_input = gr.Checkbox(
+        run_judge_input = gr.Checkbox(
             value=False,
-            label="Evaluate answer (RAGAS)",
-            info="Reference-free RAGAS scoring per turn (Bedrock evaluator, +3-4 model calls). Deploy 2 -- currently returns 'pending'.",
+            label="Evaluate answer (LLM judge)",
+            info="Reference-free in-line scoring per turn -- three artisanal Bedrock judges (faithfulness, answer relevancy, context relevance), ~5 model calls, adds latency. NOT the ragas library (ragas cannot coexist with langchain-aws); the canonical ragas run is the separate Phase 4 over the S3 session logs.",
         )
         log_session_input = gr.Checkbox(
             value=True,
@@ -508,16 +687,29 @@ with gr.Blocks(title="Poly-RAG eval") as demo:
             outputs=temperature_input,
         )
 
-    with gr.Accordion("Debug: retrieval + metrics (last turn)", open=True):
-        debug_output = gr.Code(label="rewriting / market_ids / latency / tokens / cost / window", language="json")
+    metrics_panel = gr.Markdown(label="Last turn")
+
+    with gr.Accordion("Session metrics (all turns)", open=False):
+        metrics_table = gr.Dataframe(
+            headers=["turn", "question", "latency ms", "window tok", "cost $",
+                     "faithful", "ans relev", "ctx relev"],
+            datatype=["number", "str", "number", "number", "number", "str", "str", "str"],
+            row_count=(0, "dynamic"),
+            column_count=(8, "fixed"),
+            interactive=False,
+            wrap=True,
+        )
+
+    with gr.Accordion("Debug: raw JSON (last turn)", open=False):
+        debug_output = gr.Code(label="rewriting / market_ids / latency / tokens / cost / window / judge", language="json")
 
     gr.ChatInterface(
         fn=chat,
         additional_inputs=[
             reasoning_input, temperature_input, retain_context_input,
-            context_budget_input, run_ragas_input, log_session_input, session_state,
+            context_budget_input, run_judge_input, log_session_input, session_state,
         ],
-        additional_outputs=[debug_output, session_state],
+        additional_outputs=[metrics_panel, metrics_table, debug_output, session_state],
     )
 
 
