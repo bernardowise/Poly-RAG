@@ -366,6 +366,16 @@ def _guard_sql(sql):
     low = s.lower()
     if ";" in s:
         raise ValueError("generated SQL has multiple statements")
+    # Structural sanity: a truncated generation (model hit max_tokens
+    # mid-query) leaves an unbalanced quote or paren -- e.g. cut off at
+    # "FROM read_parquet('s3://poly-rag". Reject it here instead of letting
+    # the LIMIT-injection below staple "\nLIMIT 200" onto broken SQL and
+    # ship it to DuckDB (real production failure 2026-09-06: ParserException
+    # "unterminated quoted string").
+    if s.count("'") % 2 != 0:
+        raise ValueError("generated SQL has an unbalanced single quote (likely truncated)")
+    if s.count("(") != s.count(")"):
+        raise ValueError("generated SQL has unbalanced parentheses (likely truncated)")
     for kw in _SQL_FORBIDDEN:
         # word-ish boundary check so 'created_at' doesn't trip 'create'
         idx = low.find(kw)
@@ -404,7 +414,10 @@ explain it, do not describe what it does, do not use a code fence. The first
 word of your response must be SELECT or WITH."""
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 600,
+        # 600 was too tight: a CTE + LEFT JOIN + aggregation query with the
+        # two long read_parquet('s3://...') URIs spelled out runs past it and
+        # the generation gets cut mid-string (production failure 2026-09-06).
+        "max_tokens": 1500,
         "system": system_prompt,
         "messages": [{"role": "user", "content": question}],
     })

@@ -135,14 +135,22 @@ def _merge_results(retained, current):
     """Merge the current turn's retrieved results into the retained buffer,
     de-duplicating by _row_id. retained/current are both dicts of the same
     shape search_cascade returns (lists per source, plus odds as a
-    market_id -> snapshots dict). Current-turn rows win on a key clash (they
-    reflect the latest state of the corpus)."""
+    market_id -> snapshots dict).
+
+    The current turn's rows come FIRST in each merged list and win on a key
+    clash -- they reflect the latest corpus state AND the question actually
+    being asked now. Retained rows from earlier turns follow. This ordering
+    matters because the synthesis prompt (and the judges) cap the rendered
+    context: with retained-first, a long carryover could bury this turn's
+    fresh chunks past the cap -- the shape of the 2026-09-06 bug where a
+    follow-up answered from stale context two turns running."""
     merged = {}
     sources = set(retained) | set(current)
     for source in sources:
         if source == "odds":
-            combined = dict(retained.get("odds", {}))
-            combined.update(current.get("odds", {}))
+            combined = dict(current.get("odds", {}))
+            for mid, snaps in retained.get("odds", {}).items():
+                combined.setdefault(mid, snaps)
             merged["odds"] = combined
             continue
         if source == "sql":
@@ -152,10 +160,10 @@ def _merge_results(retained, current):
             merged["sql"] = current.get("sql") or retained.get("sql")
             continue
         seen = {}
-        for row in retained.get(source, []):
-            seen[_row_id(source, row)] = row
         for row in current.get(source, []):
             seen[_row_id(source, row)] = row
+        for row in retained.get(source, []):
+            seen.setdefault(_row_id(source, row), row)
         merged[source] = list(seen.values())
     return merged
 
@@ -425,7 +433,12 @@ def _judge_faithfulness(question, context_text, answer):
     checkable factual claims)."""
     prompt = (
         "You are grading whether an answer is faithful to its retrieved context.\n\n"
-        f"CONTEXT:\n{context_text[:6000]}\n\n"
+        # One turn's context is already bounded by MAX_PER_SOURCE; 6000 chars
+        # used to cut it off after ~15 news previews, so an answer citing a
+        # later-retrieved article read as unsupported. 16000 covers a full
+        # turn; the model's own reply cap (max_tokens on _judge_call) is the
+        # real limit, not the prompt size.
+        f"CONTEXT:\n{context_text[:16000]}\n\n"
         f"QUESTION: {question}\n\nANSWER:\n{answer}\n\n"
         "Break the ANSWER into atomic factual claims. For each, decide if it is "
         "directly supported by the CONTEXT (not by outside knowledge). Respond with "
@@ -465,7 +478,7 @@ def _judge_context_relevance(question, context_text):
     prompt = (
         "You are grading whether retrieved context is relevant to a question.\n\n"
         f"QUESTION: {question}\n\nRETRIEVED CONTEXT (line-numbered):\n"
-        + "\n".join(f"{i}: {ln}" for i, ln in enumerate(context_text.split("\n")[:120]) if ln.strip())
+        + "\n".join(f"{i}: {ln}" for i, ln in enumerate(context_text.split("\n")[:200]) if ln.strip())
         + "\n\nCount how many non-empty lines are relevant to answering the question "
         '(directly or as useful supporting detail). Respond with ONLY JSON: '
         '{"n_relevant": int, "n_total": int}.'
@@ -586,6 +599,16 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
     context_text = _context_to_text(merged)
     context_tokens = _approx_tokens(context_text)
 
+    # This turn's own retrieved context, standalone (no retained buffer).
+    # The faithfulness / context-relevance judges score against THIS, not
+    # `merged`: "is the answer grounded in what THIS retrieval pulled" and
+    # "how much of THIS turn's retrieval is on-topic" -- retained context
+    # from earlier turns is noise for both questions, and (production bug
+    # 2026-09-06) when the merge overflows the judge's own prompt cap it
+    # buries this turn's fresh chunks under stale ones, so a correct answer
+    # citing a just-retrieved article scored 0.00 faithfulness.
+    turn_context_text = _context_to_text(current_capped)
+
     # --- synthesis ---
     t1 = time.perf_counter()
     answer = synthesize_answer(message, context_text, lc_history, reasoning, temperature)
@@ -596,7 +619,7 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
     judge_scores = None
     if run_judge:
         t2 = time.perf_counter()
-        judge_scores = llm_judge_evaluate(message, context_text, answer)
+        judge_scores = llm_judge_evaluate(message, turn_context_text, answer)
         judge_ms = int((time.perf_counter() - t2) * 1000)
 
     # --- update the sliding buffer ---
@@ -607,10 +630,10 @@ def chat(message, history, reasoning, temperature, retain_context, context_budge
             "turn": turn_idx, "kind": "exchange",
             "text": exchange_text, "tokens": _approx_tokens(exchange_text), "results": None,
         })
-        this_ctx_text = _context_to_text(current_capped)
         state["buffer"].append({
             "turn": turn_idx, "kind": "context",
-            "text": this_ctx_text, "tokens": _approx_tokens(this_ctx_text), "results": current_capped,
+            "text": turn_context_text, "tokens": _approx_tokens(turn_context_text),
+            "results": current_capped,
         })
         state["buffer"], evicted = _apply_window(state["buffer"], budget)
     else:
