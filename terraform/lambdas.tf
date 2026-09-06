@@ -441,13 +441,16 @@ resource "aws_lambda_function" "write_lancedb" {
   package_type  = "Image"
   image_uri     = "${aws_ecr_repository.write_lancedb.repository_url}:latest"
   # No longer terminal (2026-09-05): after sending its Phase 3 checkpoint
-  # email it invokes build_sql_parquet (Phase 4). Per-cycle write is 4
-  # sources x a few hundred rows each -- 35s measured 2026-08-23 against the
-  # real corpus after fixing load_vectors to scope by cycle instead of
-  # reading the whole checkpoint history (see tech_debt.md) -- generous
-  # headroom under the 120s timeout, not a tight budget.
-  timeout     = 120
-  memory_size = 512
+  # email it invokes build_sql_parquet (Phase 4), then runs the index
+  # optimize() pass. 2048MB (up from 512, 2026-09-06): optimize() on
+  # news_article_cohere (~37K rows) exhausted 512MB and got OOM-killed
+  # every cycle from 2026-09-03 on, which also killed the Phase 3 email
+  # and the Phase 4 invoke that ran before it -- the merge_insert itself
+  # already peaked at 512/512MB on the last healthy run (2026-09-02). The
+  # data merge always completed; only the post-write steps were lost. See
+  # write_lancedb/handler.py run_optimize docstring.
+  timeout     = 300
+  memory_size = 2048
 
   environment {
     variables = {

@@ -97,27 +97,31 @@ route) were diagnosed and fixed by switching to `global.cohere.embed-v4:0`.
 
 **Phase 3 (write to LanceDB) is also built and connected, same day
 (2026-08-22):** `embed_news_article` invokes `digest_metrics` (see below), which
-invokes `write_lancedb`, the true last stage of the whole cycle — it merges
-each source's new rows into its LanceDB table (`registry_cohere`,
-`comments_cohere`, `digest_cohere`, `news_article_cohere`) and invokes nothing
-further. `write_lancedb` is this project's only container-image Lambda
-(LanceDB's real dependency footprint is 339MB unzipped, over Lambda's 250MB
-zip/Layer limit), deployed via its own ECR repo. It deliberately does not
-rebuild the vector index every cycle — only `merge_insert`s new rows — since
-index-rebuild cost scales with the table's total size, not how many rows are
-new; index maintenance is a separate, lower-cadence concern.
+invokes `write_lancedb` — it merges each source's new rows into its LanceDB
+table (`registry_cohere`, `comments_cohere`, `digest_cohere`,
+`news_article_cohere`), then invokes `build_sql_parquet` (Phase 4).
+`write_lancedb` is a container-image Lambda (LanceDB's real dependency footprint
+is 339MB unzipped, over Lambda's 250MB zip/Layer limit), deployed via its own
+ECR repo. It never rebuilds the vector index — `merge_insert`s new rows, then
+runs `optimize()` as a maintenance pass (which folds new rows into the existing
+index incrementally). That `optimize()` pass runs *last*, after the Phase 3
+email and the Phase 4 invoke: `optimize()` on the big table can exhaust memory,
+and `Runtime.OutOfMemory` is uncatchable and would truncate the rest of the
+handler (it did, silently, for ~6 cycles from 2026-09-03 — see
+`.claude/claude_docs/tech_debt.md`, "write_lancedb OOM on optimize()"; the
+fix was 2048MB of memory plus this reordering).
 
 Every embedding Lambda writes cost/latency/token rows to
-`poly-rag-embedding-metrics`. Each phase sends its own checkpoint email, three
+`poly-rag-embedding-metrics`. Each phase sends its own checkpoint email, four
 total, landing at genuinely different times so each phase's real wall-clock
 duration is measurable from the gaps between their timestamps: `send_digest`
 (Phase 1's market-content digest), `digest_metrics` (split out of
-`embed_news_article` 2026-08-22 so the Lambda that embeds isn't also the one
-that reports — a plain cost/latency/tokens report covering both Phase 1 and
-Phase 2), and `write_lancedb` (added 2026-08-23, a per-source
-status/before/after/written/missing table for Phase 3). The three-email
-pattern means a human can tell which phase succeeded or failed straight from
-the inbox, no CloudWatch needed for the common case.
+`embed_news_article` 2026-08-22 — a cost/latency/tokens report covering
+Phases 1 and 2), `write_lancedb` (a per-source status/before/after/written/
+missing table for Phase 3), and `build_sql_parquet` (Phase 4 — Parquet
+sizes plus eight DuckDB smoke-test queries over the tables it just wrote).
+The per-phase emails mean a human can tell which phase succeeded or failed
+straight from the inbox, no CloudWatch needed for the common case.
 
 **Data flow, per cycle:**
 1. **Registry** (DynamoDB, `poly-rag-market-registry`) — one item per market, updated

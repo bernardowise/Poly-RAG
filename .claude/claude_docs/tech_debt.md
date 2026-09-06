@@ -3292,6 +3292,17 @@ discipline as the `ingest_news` regression fix's verification earlier this
 session. Will self-verify further at the next automatic cycle (00:00 UTC) via
 the report email's new `optimize()` column.
 
+**Correction (2026-09-06):** the 2026-08-29 measurement covered *time* (13.3s),
+not *memory*. `optimize()` on `news_article_cohere` (~37.5K rows by 2026-09-03)
+exhausted `write_lancedb`'s 512MB and OOM-killed the process every cycle from
+2026-09-03 on, which also killed the Phase 3 email and the Phase 4 invoke that
+ran after it -- see "write_lancedb OOM on optimize()" below. Still called every
+cycle, but now: memory raised to 2048MB, and the `optimize()` pass moved to
+AFTER the email and the Phase 4 invoke (its own `optimize_all()` function),
+with the report-email `optimize()` column removed. "Cheap enough to run every
+cycle" holds for wall-clock; it needed a memory ceiling and a safe position in
+the handler sequence too.
+
 ---
 
 ## ingest_news Batch Re-Scan Race Condition (found and fixed 2026-08-29)
@@ -3920,3 +3931,54 @@ cycle -- email #4 with 8 populated smoke-test tables, no red;
 `aws logs tail /aws/lambda/poly-rag-build-sql-parquet` and a fresh
 `LastModified` on `sql/*.parquet`. Debts 1 and 2 are both closed; only this
 end-to-end cycle verification remains.
+
+---
+
+## write_lancedb OOM on optimize() -- Phase 3 chain broke silently for ~6 cycles (2026-09-06)
+
+**Symptom (user-reported):** the cycle's checkpoint emails had been arriving
+incomplete for "several cycles" -- only #1 (Phase 1 digest) and #2 (Phase 2
+metrics) landed, never #3 (Phase 3 write_lancedb) or #4 (Phase 4 SQL layer).
+The Space kept working fine the whole time.
+
+**Root cause:** `write_lancedb`'s per-cycle flow is `merge_insert` (writes the
+data) -> `tbl.optimize()` (IVF-PQ index maintenance) -> `send_report()` (email
+#3) -> `lam.invoke(build_sql_parquet)` (Phase 4). `optimize()` on
+`news_article_cohere` (~37.5K rows) exhausted the Lambda's 512MB and got
+`Runtime.OutOfMemory`-killed every cycle from 2026-09-03 00:58 UTC on -- the
+last healthy run (2026-09-02 12:46 UTC) already peaked at 512/512MB, the corpus
+grew and crossed the line. `Runtime.OutOfMemory` kills the whole process; it is
+NOT a Python exception, so `run_optimize`'s try/except never saw it, and it also
+killed the `send_report` and `lam.invoke` calls that ran after it. Async
+invocation -> Lambda auto-retried 2x -> 3 STARTs per cycle, same RequestId, all
+OOM. `build_sql_parquet` never ran once (no log group).
+
+**Data was never at risk.** The `merge_insert` (step 1) always completed --
+verified by cross-checking checkpoint `chunk_id`s from 2026-09-03 on against the
+4 LanceDB tables: 0 missing across registry/comments/digest/news_article. Only
+the post-write steps (email #3, Phase 4, `optimize()`) were lost. The Space
+never noticed because retrieval reads the tables and the tables had everything.
+
+**Fix 1 (one-off, done 2026-09-06):** `tbl.optimize()` run by hand on all 4
+tables (news_article 17.9s with enough RAM -- confirms it's a memory ceiling,
+not a time one). `scripts/build_sql_parquet.py --apply` re-run: `sql/*.parquet`
+back in sync with the corpus through cycle 2026-09-06 00:00 UTC.
+
+**Fix 2 (deployed 2026-09-06):** (A) `write_lancedb` memory 512 -> 2048MB,
+timeout 120 -> 300s. (B) `optimize()` pulled out of `write_source()` into a
+separate `optimize_all()` pass that runs AFTER `send_report()` AND
+`lam.invoke(build_sql_parquet)`, so a future OOM here still leaves the emails
+and Phase 4 done. (C) `optimize_all()` is per-table in try/except, only for
+tables a source wrote this cycle. The email #3 table dropped its `optimize()`
+column (now a note that it runs separately; timings in CloudWatch).
+
+**Broader lesson:** any per-cycle step that can OOM must sit AFTER the
+irreversible/downstream-triggering work (emails, chained invokes), never
+before -- `Runtime.OutOfMemory` is uncatchable and silently truncates the
+rest of the handler. This is the same shape as the CLAUDE.md rule about
+ordering long/risky work, applied to a Lambda handler's internal sequence.
+
+**Revisit when:** next automatic cycle (00:00 / 12:00 UTC) -- emails #3 and #4
+both land, `write_lancedb` logs show 1 invocation, no OOM, `Max Memory Used`
+well under 2048, and `/aws/lambda/poly-rag-build-sql-parquet` finally has a
+log group.

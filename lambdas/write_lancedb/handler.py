@@ -161,15 +161,19 @@ def run_optimize(tbl):
     """Folds any unindexed rows into the table's existing vector index
     (or no-ops if the table has no index yet, still under
     MIN_ROWS_FOR_INDEX -- see scripts/write_to_lancedb.py) plus compacts
-    small files and prunes old versions. Measured 2026-08-29 (one-off,
-    all 4 tables): 2.4-13.3s even against a table with a 7-day backlog of
-    ~10,700 unindexed rows -- well under this Lambda's 120s timeout, so
-    called every cycle rather than on some N-cycle cadence (see
-    tech_debt.md, "Vector Search Metric Mismatch..." entry for the full
-    reasoning and the LanceDB guidance this measurement revises).
-    Wrapped in try/except: optimize() is maintenance, not correctness --
-    a failure here should never block the actual data write that already
-    succeeded above it."""
+    small files and prunes old versions.
+
+    Runs as a SEPARATE PASS after the Phase 3 email and the Phase 4 invoke
+    (2026-09-06): `optimize()` on news_article_cohere (~37K rows) exhausted
+    this Lambda's 512MB and got OOM-killed every cycle from 2026-09-03 on --
+    and Runtime.OutOfMemory kills the whole process, it is NOT a Python
+    exception the try/except below can catch, so it also killed send_report
+    and the build_sql_parquet invoke that came after it. Fixed two ways:
+    memory raised to 2048MB (terraform), and this pass moved to the very
+    end so even a future OOM here leaves the emails and Phase 4 already
+    done. The data merge_insert already succeeded before this runs -- this
+    is pure index maintenance, never correctness. Measured 2026-08-29 with
+    enough RAM: 2.4-17.9s across all 4 tables."""
     started = time.time()
     try:
         tbl.optimize()
@@ -209,29 +213,38 @@ def write_source(db, source, cycle_started_at):
             .when_not_matched_insert_all()
             .execute(rows))
         after = tbl.count_rows()
-        optimize_ms = run_optimize(tbl)
         return {"source": source, "status": "merged", "before": before, "after": after,
-                "written": len(rows), "missing": len(missing), "optimize_ms": optimize_ms}
+                "written": len(rows), "missing": len(missing)}
     else:
         tbl = db.create_table(table_name, data=rows)
         after = tbl.count_rows()
-        optimize_ms = run_optimize(tbl)
         return {"source": source, "status": "created", "after": after,
-                "written": len(rows), "missing": len(missing), "optimize_ms": optimize_ms}
+                "written": len(rows), "missing": len(missing)}
+
+
+def optimize_all(db, results):
+    """Separate maintenance pass -- run AFTER the Phase 3 email and the
+    Phase 4 invoke (see run_optimize's docstring). Only touches tables a
+    source actually wrote to this cycle. Best-effort per table."""
+    out = {}
+    for r in results:
+        if r.get("status") not in ("merged", "created"):
+            continue
+        source = r["source"]
+        try:
+            tbl = db.open_table(f"{source}_{MODEL_LABEL}")
+            out[source] = run_optimize(tbl)
+        except Exception as exc:  # noqa: BLE001 -- one table's failure must not stop the rest
+            print(f"optimize {source}: {type(exc).__name__}: {exc}")
+            out[source] = None
+    return out
 
 
 def build_report_html(cycle_started_at, results, elapsed_s):
-    def optimize_cell(r):
-        ms = r.get("optimize_ms")
-        if ms is None:
-            return "-" if "optimize_ms" not in r else "failed"
-        return f"{ms:,}ms"
-
     rows_html = "".join(
         f"<tr><td>{r['source']}</td><td>{r['status']}</td>"
         f"<td>{r.get('before', '-')}</td><td>{r.get('after', '-')}</td>"
-        f"<td>{r.get('written', 0):,}</td><td>{r.get('missing', 0):,}</td>"
-        f"<td>{optimize_cell(r)}</td></tr>"
+        f"<td>{r.get('written', 0):,}</td><td>{r.get('missing', 0):,}</td></tr>"
         for r in results
     )
     return f"""
@@ -239,9 +252,11 @@ def build_report_html(cycle_started_at, results, elapsed_s):
     <h2>Poly-RAG Fase 3 (write_lancedb) -- {cycle_started_at}</h2>
     <table border="1" cellpadding="4" cellspacing="0">
       <tr><th>source</th><th>status</th><th>rows before</th><th>rows after</th>
-          <th>written</th><th>missing</th><th>optimize()</th></tr>
+          <th>written</th><th>missing</th></tr>
       {rows_html}
     </table>
+    <p>index optimize() runs as a separate pass after this email (see
+       run_optimize docstring) -- its timings are in the CloudWatch logs, not here.</p>
     <h3>Total time: {elapsed_s:.1f}s</h3>
     </body></html>
     """
@@ -292,9 +307,17 @@ def lambda_handler(event, context):
         )
         sql_invoked = True
 
+    # Index maintenance LAST (2026-09-06): optimize() on the big tables can
+    # exhaust memory and Runtime.OutOfMemory kills the process outright --
+    # not a catchable exception. By running it only here, a future OOM still
+    # leaves the Phase 3 email and the Phase 4 invoke above already done.
+    # See run_optimize's docstring for the incident this fixes.
+    optimize_results = optimize_all(db, results)
+
     return {
         "cycle_started_at": cycle_started_at,
         "results": results,
         "report_sent": True,
         "build_sql_parquet_invoked": sql_invoked,
+        "optimize_results": optimize_results,
     }
