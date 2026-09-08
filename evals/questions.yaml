@@ -1,0 +1,100 @@
+# Poly-RAG Phase 5 -- fixed RAG-eval question set.
+#
+# The eval runs every cycle, chained after Phase 4. Each question is run
+# COLD (mode A1): no conversation history, history_text=None, lc_history=[].
+# They are thematically independent on purpose -- chaining their history
+# would add "did the follow-up resolve the referent" noise to questions
+# that have no referent to resolve. Conversational follow-ups are a
+# documented later extension (mode A3), not this set.
+#
+# There is NO vertical/topic filter anywhere in this project -- the
+# ingestion verifiability filter is the only gate, so sports/esports
+# markets with an official scoreline are legitimately in the corpus. The
+# ground truth reflects the corpus AS IS; questions that would otherwise
+# have hundreds of correct answers (q2, q6) are framed as "how many + tell
+# me about the top N by volume" so the answer is bounded and scoreable.
+#
+# Scoring is RAGAS only (no home-grown market_id-recall check -- a real
+# user asks for prose about markets, not a list of ids; scoring for id
+# recall optimises the wrong behaviour). "Did it get the right markets" is
+# already inside answer_correctness / factual_correctness against the GT
+# text.
+#
+# Per question:
+#   id          -- stable key, used in results JSON and the longitudinal judge
+#   horizon     -- human label for what temporal window it stresses
+#   question    -- the exact text sent to the cascade (verbatim, every cycle)
+#   gt          -- which ground_truth.py function computes the deterministic
+#                  answer for this cycle (relative to cycle_started_at = T)
+#   score       -- RAGAS metrics computed for this question:
+#                    faithfulness        reference-free -- claims in the
+#                                        answer supported by retrieved context
+#                    answer_correctness  answer vs GT text (factual overlap +
+#                                        semantic similarity)
+#                    factual_correctness atomic-claim precision/recall/F1 of
+#                                        the answer against the GT text
+#                    context_precision   are the relevant retrieved chunks
+#                                        ranked high, given the GT
+#                    context_recall      does retrieved context cover what the
+#                                        GT says it should
+#                  q4 has no single canonical answer, so it keeps only
+#                  faithfulness + the context_* metrics (its GT text is the
+#                  real comment evidence).
+#   rolling     -- true if its GT window slides with T (the longitudinal
+#                  judge checks the window rolls correctly cycle to cycle);
+#                  false if it is a fixed point or a this-cycle snapshot
+
+version: 1
+
+questions:
+  - id: q1_bitcoin_24h
+    horizon: "last 24h -- fresh retrieval, short rolling window"
+    question: "How did the odds of Bitcoin markets move in the last 24 hours?"
+    gt: gt_q1_bitcoin_24h
+    score: [faithfulness, answer_correctness, factual_correctness, context_precision, context_recall]
+    rolling: true
+
+  - id: q2_resolved_7d
+    horizon: "past 7 days -- rolling window, resolution_date, count + detail"
+    question: "How many markets resolved in the past 7 days? Of those, tell me about the 5 highest-volume ones -- what each was about and how it resolved."
+    gt: gt_q2_resolved_7d
+    score: [faithfulness, answer_correctness, factual_correctness, context_precision, context_recall]
+    rolling: true
+
+  - id: q3_dem2028_15d
+    horizon: "last 15 days -- a large long-horizon field of related markets"
+    question: "How has the 2028 Democratic presidential nomination field moved over the last 15 days? Who is leading now, and who gained or lost the most ground?"
+    gt: gt_q3_dem2028_15d
+    score: [faithfulness, answer_correctness, factual_correctness, context_precision, context_recall]
+    rolling: true
+    # HARDCODED to the ~51 "Will <candidate> win the 2028 Democratic
+    # presidential nomination?" markets (all one Polymarket Event,
+    # comment_entity_id 30829). The GT is the full field's leaderboard at T
+    # plus each candidate's 15-day delta -- stable set every cycle, only the
+    # prices move. If this Event is ever restructured, update the LIKE
+    # pattern in gt_q3.
+
+  - id: q4_lake_america_comments
+    horizon: "fixed historical point -- deep corpus retrieval, not recent"
+    question: "What were traders saying about the Lake America / Lake Ontario renaming markets around August 27, 2026?"
+    gt: gt_q4_lake_america_comments
+    score: [faithfulness, context_precision, context_recall]
+    rolling: false
+    # HARDCODED to the Lake America markets around 2026-08-27 (dense comment
+    # coverage, verified present in the corpus). If those markets are ever
+    # purged, pick another past event with dense comments and update the
+    # window + market_ids in gt_q4.
+
+  - id: q5_moved_most_this_cycle
+    horizon: "current cycle -- digest / top_volatility"
+    question: "What moved the most this cycle?"
+    gt: gt_q5_moved_most_this_cycle
+    score: [faithfulness, answer_correctness, factual_correctness, context_precision, context_recall]
+    rolling: false
+
+  - id: q6_closest_to_5050
+    horizon: "current state -- no time window, count + detail"
+    question: "How many currently-open markets are within 5 points of 50/50? Of those, tell me about the 5 with the highest volume."
+    gt: gt_q6_closest_to_5050
+    score: [faithfulness, answer_correctness, factual_correctness, context_precision, context_recall]
+    rolling: false
