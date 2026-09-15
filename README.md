@@ -70,8 +70,30 @@ ingest_polymarket --invoke--> ingest_news --invoke--> ingest_comments --invoke--
                                                      v
                                               write_lancedb
                                     (Phase 3 -- per-cycle merge_insert into
-                                     each source's LanceDB table, terminal)
+                                     each source's LanceDB table)
+                                                     |
+                                                     v
+                                           build_sql_parquet
+                                    (Phase 4 -- refreshes sql/markets.parquet
+                                     + this month's sql/odds_snapshots/*.parquet,
+                                     runs 8 DuckDB smoke-test queries)
+                                                     |
+                                                     v
+                                                rag_eval
+                                    (Phase 5 -- scores a fixed question set
+                                     against ground truth via evals/judge.py's
+                                     Bedrock LLM judges -- faithfulness,
+                                     answer_correctness, context_recall --
+                                     writes a drift report, terminal)
 ```
+
+**Phase 5 (`rag_eval`)** scores a fixed set of temporal, verifiable
+questions against programmatically-computed ground truth each cycle.
+`evals/judge.py` holds the home-grown Bedrock LLM judges (faithfulness,
+answer_correctness, context_recall) that replaced an earlier RAGAS-based
+scorer: see `.claude/claude_docs/tech_debt.md` for why -- no Bedrock batch
+API made RAGAS cost ~70s per question-metric pair, versus 3-4 calls per
+question end to end with the home-grown judges.
 
 Only `ingest_polymarket` has its own EventBridge trigger. Every other stage is
 invoked directly by the one before it (`lambda.invoke`), threading a single
